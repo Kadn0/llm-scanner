@@ -22,6 +22,7 @@ import gradio as gr
 import requests
 
 import analyst_report
+from download_utils import exception_message, is_permanent_error, response_error
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
@@ -1263,6 +1264,8 @@ def _download_worker(ref):
         try:
             with requests.post(f"{OLLAMA}/api/pull", json={"model": ref, "stream": True},
                                stream=True, timeout=(10, 120)) as r:
+                if r.status_code >= 400:
+                    raise ValueError(response_error(r, f"Pulling {ref}"))
                 for line in r.iter_lines():
                     if d["cancel"] or _yield_to_priority(ref):
                         break
@@ -1753,7 +1756,11 @@ def _image_download_worker(ref):
                 _set_pending(ref, False)
                 _dl_finished["count"] += 1
                 return
-        except Exception:
+        except Exception as e:
+            if is_permanent_error(e):
+                d.update(state="failed", msg=exception_message(e, "Hugging Face download"))
+                _set_pending(ref, False)
+                return
             attempt += 1
             wait = min(60, 5 * attempt)
             d.update(state="waiting", msg=f"Connection interrupted, resuming in {wait}s")
