@@ -1,0 +1,10 @@
+# Local data: chats, images, attachments, image models, downloads, backups (never committed)
+data/
+# Python environment and caches (rebuilt by install.sh from requirements.txt)
+.venv/
+__pycache__/
+.ruff_cache/
+*.pyc
+# Exports and temporary files
+*.tar.gz
+*.part
