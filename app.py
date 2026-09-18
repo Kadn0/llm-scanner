@@ -212,7 +212,7 @@ CHECK_ONLY = os.environ.get("LLM_SCANNER_CHECK") == "1"  # set while an update v
 APP_FILES = ["app.py", "analyst_report.py", "garak_runner.py", "llm-scanner.sh", "install.sh", "uninstall.sh",
              "export-data.sh", "README.md", "VERSION", "requirements.txt", "static"]
 OLLAMA_DIR = Path.home() / ".local/ollama"
-UPDATE_CHECK_INTERVAL = 3600
+UPDATE_CHECK_INTERVAL = 5 * 60
 _updates = {"checked": 0.0, "ollama": None, "garak": None, "app": None, "busy": None, "pct": None, "msg": "",
             "ok": True}
 
@@ -222,7 +222,7 @@ def _version_tuple(v):
 
 
 def check_updates(force=False):
-    """Compare installed Ollama/garak with the latest releases. Results are cached for 1 hour."""
+    """Compare installed Ollama/garak with the latest releases. Results are cached for 5 minutes."""
     if _updates.get("restarting"):
         return
     if not force and time.time() - _updates["checked"] < UPDATE_CHECK_INTERVAL:
