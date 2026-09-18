@@ -209,7 +209,7 @@ UV = str(Path.home() / ".local/bin/uv")
 APP_VERSION = (APP_DIR / "VERSION").read_text().strip() if (APP_DIR / "VERSION").exists() else "0.0.0"
 UPDATE_REPO = os.environ.get("LLM_SCANNER_REPO", "Kadn0/llm-scanner")  # GitHub repo the app updates from
 CHECK_ONLY = os.environ.get("LLM_SCANNER_CHECK") == "1"  # set while an update verifies itself on a spare port
-APP_FILES = ["app.py", "analyst_report.py", "garak_runner.py", "llm-scanner.sh", "install.sh", "uninstall.sh",
+APP_FILES = ["app.py", "download_utils.py", "analyst_report.py", "garak_runner.py", "llm-scanner.sh", "install.sh", "uninstall.sh",
              "export-data.sh", "README.md", "VERSION", "requirements.txt", "static"]
 OLLAMA_DIR = Path.home() / ".local/ollama"
 UPDATE_CHECK_INTERVAL = 5 * 60
