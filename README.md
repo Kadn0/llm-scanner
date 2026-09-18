@@ -150,5 +150,7 @@ It lists what will be deleted and asks before doing anything.
 
 ## Changelog
 
+- **1.0.2**: After an update is installed, the notice no longer keeps offering that same update during the
+  few seconds before the app restarts (applies to LLM Scanner and garak updates).
 - **1.0.1**: Test release to confirm the in-app updater works end to end. No functional changes.
 - **1.0.0**: First release.

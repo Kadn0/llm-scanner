@@ -222,6 +222,8 @@ def _version_tuple(v):
 
 def check_updates(force=False):
     """Compare installed Ollama/garak with the latest releases. Results are cached for 6 hours."""
+    if _updates.get("restarting"):
+        return
     if not force and time.time() - _updates["checked"] < UPDATE_CHECK_INTERVAL:
         return
     _updates["checked"] = time.time()
@@ -378,6 +380,13 @@ def _verify_app_candidate(folder):
                 os.killpg(p.pid, signal.SIGKILL)
 
 
+def _restart_soon(kind):
+    """The update is installed and the app restarts in a few seconds; stop offering it in the meantime."""
+    _updates[kind] = None
+    _updates["restarting"] = True
+    threading.Timer(4, lambda: subprocess.run(["systemctl", "--user", "restart", "llm-scanner"])).start()
+
+
 def _update_app():
     info = _updates["app"]
     version = info["version"]
@@ -431,7 +440,7 @@ def _update_app():
     shutil.rmtree(staging, ignore_errors=True)
     _updates["msg"] = (f"Updated to LLM Scanner {version} ({detail}). Restarting... reload the page in a few seconds. "
                        f"The previous version is saved in data/backups/{APP_VERSION}.")
-    threading.Timer(4, lambda: subprocess.run(["systemctl", "--user", "restart", "llm-scanner"])).start()
+    _restart_soon("app")
 
 
 def _run_update(kind):
@@ -488,7 +497,7 @@ def _run_update(kind):
             ok, now, detail = _verify_garak()
             if ok:
                 _updates["msg"] = detail + " Restarting the app to load it..."
-                threading.Timer(4, lambda: subprocess.run(["systemctl", "--user", "restart", "llm-scanner"])).start()
+                _restart_soon("garak")
             else:
                 _set_progress(f"Update failed its check, reinstalling garak {installed}", 92)
                 subprocess.run([UV, "pip", "install", "--python", PY, f"garak=={installed}"], check=True,
@@ -500,11 +509,12 @@ def _run_update(kind):
         _updates["msg"] = f"{kind} update failed: {e}"
     finally:
         _set_progress(None)
-        check_updates(force=True)
+        if not _updates.get("restarting"):  # a restart is coming; this old process would re-offer the same update
+            check_updates(force=True)
 
 
 def start_update(kind):
-    if _updates["busy"]:
+    if _updates["busy"] or _updates.get("restarting"):
         return update_controls()
     if _proc.get("p") and _proc["p"].poll() is None:
         _updates["ok"] = False
