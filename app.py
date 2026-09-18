@@ -212,7 +212,7 @@ CHECK_ONLY = os.environ.get("LLM_SCANNER_CHECK") == "1"  # set while an update v
 APP_FILES = ["app.py", "analyst_report.py", "garak_runner.py", "llm-scanner.sh", "install.sh", "uninstall.sh",
              "export-data.sh", "README.md", "VERSION", "requirements.txt", "static"]
 OLLAMA_DIR = Path.home() / ".local/ollama"
-UPDATE_CHECK_INTERVAL = 6 * 3600
+UPDATE_CHECK_INTERVAL = 3600
 _updates = {"checked": 0.0, "ollama": None, "garak": None, "app": None, "busy": None, "pct": None, "msg": "",
             "ok": True}
 
@@ -222,7 +222,7 @@ def _version_tuple(v):
 
 
 def check_updates(force=False):
-    """Compare installed Ollama/garak with the latest releases. Results are cached for 6 hours."""
+    """Compare installed Ollama/garak with the latest releases. Results are cached for 1 hour."""
     if _updates.get("restarting"):
         return
     if not force and time.time() - _updates["checked"] < UPDATE_CHECK_INTERVAL:
@@ -534,7 +534,7 @@ def start_update(kind):
 def _update_loop():
     while True:
         check_updates()
-        time.sleep(600)
+        time.sleep(60)
 
 
 # ---------------------------------------------------------------- installed models
@@ -2388,7 +2388,7 @@ APP_JS = (APP_DIR / "static" / "app.js").read_text(encoding="utf-8")
 # ---------------------------------------------------------------- UI
 with gr.Blocks(title="LLM Scanner") as ui:
     selected = gr.State([])
-    gr.HTML('<div class="hero"><div class="eyebrow">Local AI security &nbsp;·&nbsp; v' + APP_VERSION + '</div><h1>LLM Scanner</h1>'
+    gr.HTML('<div class="hero"><div class="eyebrow">Local AI security &nbsp;·&nbsp; Current version v' + APP_VERSION + '</div><h1>LLM Scanner</h1>'
             '<p>Download models from Hugging Face or Ollama, run them locally, and test them for '
             'vulnerabilities with garak.</p></div>')
     with gr.Row(elem_classes="update-row"):

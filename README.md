@@ -176,6 +176,7 @@ It lists what will be deleted and asks before doing anything.
 
 ## Changelog
 
+- **1.0.6**: Check for LLM Scanner, Ollama and garak updates every hour and show the current LLM Scanner version in the page header.
 - **1.0.5**: Model downloads now report permanent Ollama and Hugging Face HTTP errors instead of retrying them as interrupted connections.
 - **1.0.3**: App icon for the desktop, app launcher, dock and browser tab. The installer adds a desktop shortcut, and existing installs get the icon after updating.
 - **1.0.2**: After an update is installed, the notice no longer keeps offering that same update during the
