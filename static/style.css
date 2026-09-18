@@ -11,9 +11,16 @@ footer { display: none !important; }
 .hero .eyebrow { color:#86868b; font-size:13px; font-weight:600; letter-spacing:.08em; text-transform:uppercase; margin:0 0 10px; }
 .hero h1 { font-size:48px; line-height:1.05; font-weight:700; letter-spacing:-.025em; margin:0 0 12px; color:#f5f5f7; }
 .hero p { font-size:19px; color:#a1a1a6; margin:0; max-width:760px; line-height:1.45; }
-.statusrow { align-items:center !important; margin: 20px 0 24px; flex-wrap:wrap !important; gap:10px !important; }
-.statusrow > div:first-child { flex: 1 1 320px !important; }
-.status { display:flex; gap:10px; flex-wrap:wrap; }
+/* status bar: [Ollama control] [GPU] [RAM] ... [Unload] [Refresh] [Check for updates], activity underneath */
+.statusrow { align-items:center !important; margin:20px 0 0; flex-wrap:nowrap !important; gap:10px !important; }
+.statusrow > .status-holder { flex:1 1 auto !important; min-width:0 !important; }
+.statusrow > button { flex:0 0 auto !important; background:transparent !important; border:1px solid #2d2d2f !important;
+        color:#d1d1d6 !important; font-size:13px !important; height:32px !important; max-height:32px; padding:0 14px !important; }
+.statusrow > button:hover { background:#1d1d1f !important; color:#f5f5f7 !important; }
+.status { display:flex; gap:10px; flex-wrap:nowrap; overflow:hidden; }
+.status .pill { white-space:nowrap; flex:0 0 auto; }
+.block.activity-holder { margin:-8px 0 4px !important; } .prose.activity-holder { margin:0 !important; }
+@media (max-width: 1100px) { .statusrow { flex-wrap:wrap !important; } .status { flex-wrap:wrap; } }
 .pill { display:inline-flex; align-items:center; gap:8px; padding:7px 14px; border-radius:980px; background:#161617;
         border:1px solid #2d2d2f; font-size:13px; color:#f5f5f7; white-space:nowrap; flex-wrap:wrap; row-gap:4px; }
 .pill .muted { color:#86868b; }
@@ -160,8 +167,6 @@ button.sm { height:34px !important; max-height:34px; align-self:center; white-sp
 .ls-title { color:#f5f5f7; font-size:17px; font-weight:600; letter-spacing:-.01em; }
 .ls-detail { color:#86868b; font-size:14px; max-width:420px; overflow-wrap:anywhere; }
 @keyframes fadein { from { opacity:0; } to { opacity:1; } }
-.update-row { align-items:center !important; gap:10px !important; }
-.update-row:not(:has(.update-banner)) { display:none !important; }
 .update-banner { background:#0a1d33; border:1px solid #173a63; color:#d1e6ff; border-radius:12px; padding:10px 14px;
                  font-size:14px; margin-top:16px; }
 .update-banner b { color:#fff; }
@@ -271,7 +276,7 @@ button.row-del:hover { background:#3a1d1d url("data:image/svg+xml,%3Csvg xmlns='
 .side-toggle:hover { background-color:#2a2a2c; opacity:1; }
 
 /* activity line under the status pills */
-.activity { color:#d1d1d6; font-size:13px; margin-top:8px; padding-left:2px; }
+.activity { color:#d1d1d6; font-size:13px; padding-left:4px; }
 .activity b { color:#f5f5f7; font-weight:500; }
 .activity.idle { color:#86868b; }
 
@@ -437,15 +442,103 @@ button[role="tab"], .segmented label { transition:color .3s ease, background-col
 }
 
 /* Ollama start / stop / restart as one control */
-.ollama-controls { flex:0 0 auto !important; width:auto !important; min-width:0 !important; flex-wrap:nowrap !important;
+.statusrow > .ollama-controls, .ollama-controls { flex:0 0 auto !important; width:auto !important; min-width:0 !important;
+        flex-wrap:nowrap !important;
         gap:2px !important; align-items:center !important; align-self:center; background:#1d1d1f; border:1px solid #2d2d2f;
         border-radius:980px; padding:3px !important; }
-.ollama-controls > .oc-label-holder, .ollama-controls > .oc-label-holder * { flex:0 0 auto !important; width:auto !important;
-        min-width:0 !important; padding:0 !important; margin:0 !important; border:none !important; background:none !important; }
-.ollama-controls .oc-label { display:block; color:#86868b; font-size:12.5px; font-weight:600; letter-spacing:.02em;
-        padding:0 6px 0 12px !important; }
+.ollama-controls > .oc-label-holder, .ollama-controls > .oc-label-holder > *, .ollama-controls .oc-label-holder .prose,
+.ollama-controls .oc-label-holder .html-container { flex:0 0 auto !important; width:auto !important; min-width:0 !important;
+        padding:0 !important; margin:0 !important; border:none !important; background:none !important; }
+.ollama-controls .oc-status { display:flex; align-items:center; gap:8px; color:#f5f5f7; font-size:13px; font-weight:500;
+        white-space:nowrap; padding:0 8px 0 12px !important; }
+.ollama-controls .oc-status .dot { flex:0 0 auto; }
 .ollama-controls button { flex:0 0 auto !important; height:30px !important; max-height:30px; padding:0 14px !important;
         font-size:13px !important; border-radius:980px !important; background:transparent !important; color:#f5f5f7 !important; }
 .ollama-controls button:hover { background:#3a3a3c !important; }
 .ollama-controls button.oc-start { background:#0071e3 !important; }
 .ollama-controls button.oc-start:hover { background:#0077ed !important; }
+
+/* a group's description and probe list (Scan tab, Probes tab) */
+.probe-info { background:#161617; border:1px solid #232325; border-radius:14px; padding:14px 16px; margin-top:4px; }
+.probe-info .pi-desc { color:#d1d1d6; font-size:14px; line-height:1.5; margin:0 0 10px; }
+.probe-info .pi-count { display:flex; justify-content:space-between; gap:12px; color:#86868b; font-size:12.5px;
+        font-weight:600; letter-spacing:.02em; margin-bottom:8px; }
+.probe-info .pi-hint { font-weight:400; letter-spacing:0; }
+.probe-info .pi-list { max-height:260px; overflow-y:auto; overscroll-behavior:contain; display:flex; flex-direction:column;
+        gap:6px; padding-right:4px; }
+.probe-info .pi-row { display:flex; gap:10px; align-items:baseline; }
+.probe-info .pi-mod { flex:0 0 150px; color:#a1a1a6; font-size:12.5px; font-family:"JetBrains Mono","SF Mono",ui-monospace,monospace;
+        overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:help; }
+.probe-info .pi-chips { display:flex; flex-wrap:wrap; gap:5px; }
+.probe-info .pi-chip { background:#232325; color:#f5f5f7; border-radius:7px; padding:2px 8px; font-size:12.5px; cursor:help;
+        transition:background-color .15s ease; }
+.probe-info .pi-chip:hover { background:#0a2540; }
+.probe-list label { cursor:help; }
+/* hover explanation panel (placed by static/app.js) */
+.tip-box { position:fixed; z-index:10000; max-width:360px; background:rgba(40,40,42,.97); border:1px solid #3a3a3c;
+        border-radius:12px; padding:10px 12px; box-shadow:0 10px 30px rgba(0,0,0,.5); pointer-events:none; opacity:0;
+        transform:translateY(-3px); transition:opacity .15s ease, transform .15s ease; visibility:hidden; }
+.tip-box.show { opacity:1; transform:none; visibility:visible; }
+.tip-box .tip-title { color:#f5f5f7; font-size:13px; font-weight:600; margin-bottom:4px;
+        font-family:"JetBrains Mono","SF Mono",ui-monospace,monospace; overflow-wrap:anywhere; }
+.tip-box .tip-body { color:#d1d1d6; font-size:13px; line-height:1.45; white-space:pre-line; }
+@media (max-width: 600px) { .probe-info .pi-row { flex-direction:column; gap:4px; } .probe-info .pi-mod { flex:none; } }
+
+/* update box at the top: only shown when something can be updated (or is updating) */
+.update-box { background:#0a1a2e; border:1px solid #173a63; border-radius:16px; padding:8px 14px !important; gap:2px !important;
+        max-width:620px; margin:0 0 16px auto; animation:fadein .25s ease; }
+.update-box .update-banner { background:none; border:none; padding:6px 0; margin:0; }
+.update-box .up-item { align-items:center !important; justify-content:space-between; gap:16px !important; flex-wrap:nowrap !important;
+        padding:4px 0; border-bottom:1px solid #16304f; }
+.update-box .up-item-label { flex:1 1 auto !important; min-width:0 !important; }
+.update-box .up-item-text { display:flex; align-items:baseline; gap:12px; font-size:14px; }
+.update-box .up-name { color:#fff; font-weight:600; white-space:nowrap; }
+.update-box .up-ver { color:#9fc3ee; font-variant-numeric:tabular-nums; white-space:nowrap; }
+.update-box .up-arrow { color:#5d8fc9; margin:0 2px; }
+.update-box .up-item-text[data-tip] { cursor:help; }
+.update-box .up-actions { justify-content:flex-end; gap:8px !important; padding-top:6px; }
+.update-box .up-actions:not(:has(button:not([style*="display: none"]):not(.hidden))) { display:none !important; }
+
+/* compact status pills */
+.status .pill { gap:6px; padding:7px 13px; font-size:13px; }
+.status .pill .meter { width:34px; }
+.status .pill .lbl { margin-left:6px; }
+.status .pill .val { min-width:0; }
+.status .pill .muted { margin-left:4px; }
+.status .pill .gpu-name { margin-right:4px; }
+.status .pill[data-tip] { cursor:default; }
+.statusrow > button { min-width:0 !important; }
+.ollama-controls button.oc-stop:hover { color:#ff453a !important; background:#3a1d1d !important; }
+.ollama-controls button.oc-restart:hover { color:#ffd60a !important; background:#3a321a !important; }
+.status-holder .html-container, .activity-holder .html-container, .oc-label-holder .html-container { padding:0 !important; }
+/* header row: title on the left, update box (when shown) on the right */
+.top-row { align-items:flex-start !important; flex-wrap:nowrap !important; gap:24px !important; }
+.top-row > .hero-holder { flex:1 1 auto !important; min-width:0 !important; }
+.top-row > .update-box { flex:0 1 460px !important; margin:28px 0 0 !important; }
+@media (max-width: 900px) { .top-row { flex-wrap:wrap !important; } .top-row > .update-box { flex:1 1 100% !important; margin:0 !important; } }
+
+/* Models tab: the Downloads card and the chat card end at the same height */
+.models-row { align-items:stretch !important; }
+.models-left { display:flex !important; flex-direction:column !important; }
+.models-left > .downloads-card { flex:1 1 auto !important; }
+.models-row > .chat-card { align-self:stretch !important; position:static; display:flex !important; flex-direction:column !important; }
+.models-row > .chat-card > .chat-layout { flex:1 1 auto !important; align-items:stretch !important; }
+.models-row .chat-main { display:flex !important; flex-direction:column !important; }
+.models-row .chat-main > .chat { flex:1 1 auto !important; height:auto !important; min-height:60vh; }
+.update-box .html-container { padding:0 !important; }
+.update-box > .block:has(.html-container:empty), .update-box > .html-container:empty { display:none !important; }
+/* compact update box with a grey close (x) button in its corner */
+.top-row > .update-box { position:relative; flex:0 1 400px !important; padding:6px 36px 6px 12px !important; border-radius:14px; }
+.update-box .up-item { padding:2px 0; border-bottom:none; gap:12px !important; }
+.update-box .up-item + .up-item { border-top:1px solid #16304f; }
+.update-box .up-item-text { font-size:13px; gap:10px; }
+.update-box button:not(.up-close) { height:26px !important; max-height:26px; padding:0 12px !important; font-size:12.5px !important; }
+.update-box .up-actions { padding-top:2px; }
+.update-box .update-banner, .update-box .up-result { font-size:13px; padding:3px 0; }
+.update-box button.up-close { position:absolute !important; top:6px; right:6px; width:24px !important; height:24px !important;
+        min-width:0 !important; padding:0 !important; border-radius:50% !important; border:none !important;
+        background:transparent url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2386868b' stroke-width='2.2' stroke-linecap='round'%3E%3Cpath d='M7 7l10 10M17 7L7 17'/%3E%3C/svg%3E") center / 13px no-repeat !important; }
+.update-box button.up-close:hover { background-color:#1d3350 !important; }
+.update-box [data-testid="status-tracker"], .statusrow [data-testid="status-tracker"] { display:none !important; }
+.ver-badge { display:inline-block; vertical-align:middle; margin-left:10px; padding:3px 10px; border-radius:980px;
+        background:#232325; color:#a1a1a6; font-size:12px; font-weight:500; letter-spacing:.01em; }

@@ -210,9 +210,11 @@ class AppPages(unittest.TestCase):
 
     # ------------------------------------------------------------ status bar
     def test_status_bar(self):
-        status = self.call("/status_controls")
-        self.assertIn("Ollama 0.34.2", status[0] if isinstance(status, (list, tuple)) else status)
-        self.assertIn("Idle", status[0] if isinstance(status, (list, tuple)) else status)
+        status, *_, ollama, activity = self.call("/status_controls")
+        self.assertIn("Ollama 0.34.2", ollama)  # shown in the control with Stop and Restart
+        self.assertIn('dot ok', ollama)
+        self.assertIn("RAM", status)
+        self.assertIn("Idle", activity)
 
     # ------------------------------------------------------------ models page: downloads
     def download(self, name, tag):
@@ -332,7 +334,9 @@ class AppPages(unittest.TestCase):
 
     # ------------------------------------------------------------ scan page
     def test_scan_page(self):
-        self.assertRegex(self.call("/scan_info", "OWASP Top 10 for LLMs"), r"OWASP Top 10.*\d+ probes: ")
+        info = self.call("/scan_info", "OWASP Top 10 for LLMs")
+        self.assertRegex(info, r"OWASP Top 10.*\d+ probes in \d+ families")
+        self.assertIn('data-tip-title="dan.DanInTheWild"', info)
         note, timeout = self.call("/model_hint", "tiny:latest")
         self.assertIn("0.3 GB model", note)
         log, _ = self.call("/run_scan", None, "Quick check", 1, 60, False)

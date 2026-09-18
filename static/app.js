@@ -49,6 +49,48 @@
   document.addEventListener('click', () => setTimeout(queueGliders, 0), true);
   setInterval(placeGliders, 1500);  // tabs rendered later (sub-tabs, lazy panels)
 
+  // Hover explanations: anything with data-tip (probes and families in a group's probe list), and every probe in the
+  // Probes tab's list (its text comes from the hidden #probe-tips element). One floating panel, so cards never clip it.
+  const tipBox = document.createElement('div');
+  tipBox.className = 'tip-box';
+  tipBox.innerHTML = '<div class="tip-title"></div><div class="tip-body"></div>';
+  document.body.appendChild(tipBox);
+  let probeTips = null;
+  let tipTimer = 0;
+  let tipFor = null;
+  const tipFrom = (el) => {
+    if (el.dataset.tip !== undefined) return [el.dataset.tipTitle || '', el.dataset.tip];
+    if (!probeTips) {
+      try { probeTips = JSON.parse(document.querySelector('#probe-tips')?.dataset.tips || '{}'); } catch (err) { probeTips = {}; }
+    }
+    const name = el.innerText.trim().split(/\s+/)[0];  // "dan.DanInTheWild   A subset of..." (probe names have no spaces)
+    return probeTips[name] ? [name, probeTips[name]] : null;
+  };
+  const hideTip = () => { clearTimeout(tipTimer); tipFor = null; tipBox.classList.remove('show'); };
+  document.addEventListener('mouseover', (e) => {
+    const el = e.target.closest('[data-tip], .probe-list label');
+    if (el === tipFor) return;
+    hideTip();
+    if (!el) return;
+    const tip = tipFrom(el);
+    if (!tip || !tip[1]) return;
+    tipFor = el;
+    tipTimer = setTimeout(() => {
+      tipBox.querySelector('.tip-title').textContent = tip[0];
+      tipBox.querySelector('.tip-body').textContent = tip[1];
+      const r = el.getBoundingClientRect();
+      tipBox.style.left = '0px';
+      tipBox.style.top = '0px';
+      tipBox.classList.add('show');
+      const w = tipBox.offsetWidth, h = tipBox.offsetHeight;
+      const left = Math.min(Math.max(8, r.left), window.innerWidth - w - 8);
+      const top = r.bottom + 8 + h < window.innerHeight ? r.bottom + 8 : Math.max(8, r.top - h - 8);
+      tipBox.style.left = `${left}px`;
+      tipBox.style.top = `${top}px`;
+    }, 250);
+  });
+  document.addEventListener('scroll', hideTip, true);
+
   // Scrolling an open dropdown list (repository, version, ...) must not scroll the page behind it, even when the
   // list is too short to scroll or has reached its end.
   document.addEventListener('wheel', (e) => {
@@ -111,6 +153,10 @@
       if (!report) return null;
       return ['Delete report?', `${report.trim()} and all of its files will be permanently deleted. This cannot be undone.`];
     }
+    if (btn.matches('.oc-stop')) {
+      return ['Stop Ollama?', 'Loaded models are unloaded, and chats, scans and model downloads that need Ollama will '
+        + 'wait until you start it again.', 'Stop Ollama'];
+    }
     if (btn.matches('.dl-del')) {
       return ['Delete download?', `${btn.dataset.ref} will be stopped and removed from downloads, and its partially downloaded data deleted. Use pause instead to continue it later.`, 'Delete download'];
     }
@@ -118,7 +164,7 @@
   };
 
   document.addEventListener('click', async (e) => {
-    const btn = e.target.closest('button.chat-del, button.row-del, button.rep-delete, button.dl-del, button.g-del');
+    const btn = e.target.closest('button.chat-del, button.row-del, button.rep-delete, button.dl-del, button.g-del, button.oc-stop');
     if (!btn) return;
     if (btn.dataset.confirmed === '1') { delete btn.dataset.confirmed; return; }  // let the confirmed click through
     e.preventDefault();

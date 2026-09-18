@@ -928,6 +928,25 @@ class ProbesAndGroups(TempDataTest):
         self.assertEqual(list(app.PRESETS)[-1], "Full scan")
         self.assertIn("Preset: OWASP Top 10 for LLMs", app.group_choices())
 
+    def test_framework_groups(self):
+        names = ["Baseline assessment", "NIST AI 600-1: Information security",
+                 "NIST AI 600-1: Information integrity and confabulation",
+                 "NIST AI 600-1: Dangerous, violent and hateful content",
+                 "NIST AI 600-1: Data privacy and intellectual property", "NIST AI 600-1: Harmful bias",
+                 "EU AI Act risk areas"]
+        for name in names:
+            probes, desc = app.PRESETS[name]
+            self.assertTrue(probes, name)
+            self.assertTrue(all(p in app.CATALOG and app.CATALOG[p]["active"] for p in probes), name)
+            self.assertFalse({p.split(".")[0] for p in probes} & app.NEEDS_ATTACKER_MODEL, name)
+            self.assertIn("not a certified compliance test", desc)
+            self.assertIn(f"Preset: {name}", app.group_choices())
+        baseline = set(app.PRESETS["Baseline assessment"][0])
+        self.assertEqual(len(baseline), 19, "every probe named in the baseline must exist in garak")
+        for name in names[1:6]:  # the baseline samples every NIST risk area
+            self.assertTrue(baseline & set(app.PRESETS[name][0]), name)
+        self.assertEqual(list(app.PRESETS)[-1], "Full scan")
+
     def test_expand_dedupes_and_ignores_unknown(self):
         probe = next(iter(app.CATALOG))
         self.assertEqual(app.expand([probe, probe, "not.a.probe"]), [probe])
@@ -957,9 +976,34 @@ class ProbesAndGroups(TempDataTest):
         new, _ = app.probes_ticked([], b, "All categories", True, [a, b])
         self.assertNotIn(b, new)
 
-    def test_scan_info(self):
-        self.assertIn("probes", app.scan_info("Quick check", []))
+    def test_scan_info_lists_every_probe_with_an_explanation(self):
+        for name, (specs, desc) in app.PRESETS.items():
+            out = app.scan_info(name, [])
+            probes = app.expand(specs) if specs else [n for n, v in app.CATALOG.items() if v["active"]]
+            self.assertIn(app.html.escape(desc), out, name)
+            self.assertIn(f"{len(probes)} probe", out, name)
+            for p in probes:
+                self.assertIn(f'data-tip-title="{p}"', out, f"{name}: {p} not listed")
         self.assertIn("Every default", app.scan_info("Full scan", []))
+        out = app.scan_info(app.CURRENT, ["dan.DanInTheWild"])
+        self.assertIn("currently selected on the Probes tab", out)
+        self.assertIn("No probes selected", app.scan_info(app.CURRENT, []))
+
+    def test_every_probe_family_is_explained(self):
+        self.assertEqual(sorted(set(v["module"] for v in app.CATALOG.values()) - set(app.MODULE_INFO)), [])
+        tip = app.probe_tip("dan.DanInTheWild")
+        self.assertIn("Do Anything Now", tip)
+        self.assertIn("Goal: Disregard the system prompt", tip)
+        self.assertEqual(app.probe_tip("not.a.probe"), "")
+        self.assertIn('data-tip="', app.probes_html(["dan.DanInTheWild"], "<b>x</b>"))
+        self.assertNotIn("<b>x</b>", app.probes_html(["dan.DanInTheWild"], "<b>x</b>"))
+
+    def test_group_info_for_presets_and_saved_groups(self):
+        self.assertIn("NIST AI 600-1", app.group_info("Preset: NIST AI 600-1: Harmful bias") + "NIST AI 600-1")
+        self.assertIn("Whether the model discriminates", app.group_info("Preset: NIST AI 600-1: Harmful bias"))
+        app.save_group("mine", ["dan.DanInTheWild"])
+        self.assertIn('Your saved group &quot;mine&quot;', app.group_info("mine"))
+        self.assertEqual(app.group_info(None), "")
 
 
 class ScanProgressTests(unittest.TestCase):
@@ -1153,13 +1197,12 @@ class Updates(unittest.TestCase):
     def test_check_updates_finds_newer_versions(self):
         with mock.patch.object(app.requests, "get", side_effect=self.fake_get), \
                 mock.patch.object(app, "ollama_up", return_value="0.34.2"):
-            app.check_updates(force=True)
+            app.check_updates()
         self.assertEqual(app._updates["ollama"], ("0.34.2", "0.99.0"))
         self.assertEqual(app._updates["garak"][1], "99.0.0")
         self.assertEqual(app._updates["app"]["version"], "9.9.9")
-        banner = app.update_banner()
-        self.assertIn("LLM Scanner 9.9.9 is available", banner)
-        self.assertNotIn("<b>notes", banner)
+        self.assertIn("9.9.9", app.update_item_html("app"))
+        self.assertNotIn("<b>notes", app.update_item_html("app"))
 
     def test_check_updates_ignores_older_and_prerelease(self):
         def get(url, **kw):
@@ -1168,14 +1211,14 @@ class Updates(unittest.TestCase):
             return FakeResponse({"tag_name": "v99.0.0", "prerelease": True})
         with mock.patch.object(app.requests, "get", side_effect=get), \
                 mock.patch.object(app, "ollama_up", return_value="0.34.2"):
-            app.check_updates(force=True)
+            app.check_updates()
         self.assertIsNone(app._updates["ollama"])
         self.assertIsNone(app._updates["garak"])
         self.assertIsNone(app._updates["app"])
 
     def test_check_updates_survives_network_errors(self):
         with mock.patch.object(app.requests, "get", side_effect=app.requests.ConnectionError("offline")):
-            app.check_updates(force=True)
+            app.check_updates()
         self.assertEqual(app.update_banner(), "")
 
     def test_update_refused_during_scan(self):
@@ -1284,6 +1327,58 @@ class AppUpdate(TempDataTest):
                 mock.patch.object(app.requests, "get", return_value=Download()):
             with self.assertRaisesRegex(RuntimeError, "labeled 9.9.9"):
                 app._update_app()
+
+
+class LeftoverCleanup(TempDataTest):
+    """clean_leftovers runs at every startup."""
+
+    def setUp(self):
+        super().setUp()
+        for name, value in (("HF_DOWNLOADS", app.DATA_DIR / "hf-downloads"),):
+            p = mock.patch.object(app, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def touch(self, path, data=b"x" * 10):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return path
+
+    def test_removes_leftovers_and_keeps_what_is_still_needed(self):
+        d = app.DATA_DIR
+        gone = [self.touch(d / ".hf-cache/models--a--b/blobs/x"), self.touch(d / "image-models/.hf-cache/y"),
+                self.touch(d / "update-staging/release.tar.gz"), self.touch(d / "tmp/selftest-1.report.jsonl"),
+                self.touch(d / "attachments/staging/abcd-notes.txt"), self.touch(d / "attachments/deleted-chat/a.png"),
+                self.touch(d / "images/removed.json"),
+                self.touch(app.HF_DOWNLOADS / (app._slug("hf.co/x/abandoned:Q4_K_M") + ".gguf.part")),
+                self.touch(app.HF_DOWNLOADS / "hf-co-x-y-q4.Modelfile"),
+                self.touch(d / "image-models/some-removed-model/model.gguf.part")]
+        blob = self.touch(d / ".hf-cache/models--c--d/blobs/abc", b"y" * 1000)  # huggingface_hub links files to blobs
+        (d / ".hf-cache/models--c--d/snapshots/1").mkdir(parents=True)
+        (d / ".hf-cache/models--c--d/snapshots/1/model.gguf").symlink_to(blob)
+        gone.append(blob)
+        paused, queued = "hf.co/x/paused:Q4_K_M", "image:z-image-turbo"
+        app._set_pending(paused, True, paused=True)
+        app._set_pending(queued, True)
+        kept = [self.touch(app.HF_DOWNLOADS / (app._slug(paused) + ".gguf.part")),
+                self.touch(app.image_model_files("z-image-turbo")["diffusion-model"].with_name("z_image_turbo-Q4_K.gguf.part")),
+                self.touch(d / "chats/live-chat.json", b"{}"), self.touch(d / "attachments/live-chat/a.png"),
+                self.touch(d / "images/kept.png"), self.touch(d / "images/kept.json")]
+        for i, v in enumerate(("1.0.0", "1.0.3", "1.0.8", "1.0.9", "1.0.10")):
+            folder = self.touch(d / f"backups/{v}/app.py").parent
+            os.utime(folder, (1000 + i, 1000 + i))
+        files, size = app.clean_leftovers()
+        for f in gone:
+            self.assertFalse(f.exists(), f)
+        for f in kept:
+            self.assertTrue(f.exists(), f)
+        self.assertEqual(sorted(p.name for p in (d / "backups").iterdir()), ["1.0.10", "1.0.8", "1.0.9"])
+        self.assertEqual(files, len(gone) + 2)  # plus the two oldest backups; linked files are counted once
+        self.assertEqual(size, 10 * (len(gone) - 1) + 1000 + 2 * 10)
+        self.assertEqual(app.clean_leftovers(), (0, 0), "a second run has nothing left to do")
+
+    def test_nothing_to_clean_on_a_fresh_install(self):
+        self.assertEqual(app.clean_leftovers(), (0, 0))
 
 
 class DesktopIntegration(unittest.TestCase):

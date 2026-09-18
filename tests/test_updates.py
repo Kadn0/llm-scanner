@@ -85,43 +85,141 @@ class UpdateState(unittest.TestCase):
 
 
 class Checking(UpdateState):
-    def test_checks_every_five_minutes(self):
-        self.assertEqual(app.UPDATE_CHECK_INTERVAL, 300)
+    def box(self):
+        """update_controls as a dict: box, message, rows/labels per kind, Update all, Dismiss."""
+        box, msg, row_app, row_ollama, row_garak, lbl_app, lbl_ollama, lbl_garak, all_btn, dismiss = app.update_controls()
+        return {"box": box["visible"], "msg": msg, "rows": {"app": row_app["visible"], "ollama": row_ollama["visible"],
+                "garak": row_garak["visible"]}, "labels": {"app": lbl_app, "ollama": lbl_ollama, "garak": lbl_garak},
+                "all": all_btn["visible"], "dismiss": dismiss["visible"]}
+
+    def test_checked_once_at_startup_then_on_request(self):
+        src = (APP_DIR / "app.py").read_text()
+        self.assertNotIn("_update_loop", src, "there must be no repeating background check")
+        self.assertIn("threading.Thread(target=check_updates", src.split('if __name__ == "__main__":')[1])
         with mock.patch.object(app.requests, "get", side_effect=app.requests.ConnectionError) as get:
-            app.check_updates()
-            self.assertEqual(get.call_count, 3)  # Ollama, garak and LLM Scanner releases
-            app.check_updates()
-            self.assertEqual(get.call_count, 3, "a second check within 5 minutes must use the cached result")
-            app._updates["checked"] -= 301
-            app.check_updates()
-            self.assertEqual(get.call_count, 6)
+            self.assertEqual(app.check_updates(), ["Ollama", "garak", "LLM Scanner"])
+        self.assertEqual(get.call_count, 3)  # LLM Scanner on GitHub, Ollama and garak
 
     def test_no_checks_while_restarting(self):
         app._updates["restarting"] = True
         with mock.patch.object(app.requests, "get") as get:
-            app.check_updates(force=True)
+            app.check_updates()
         get.assert_not_called()
 
-    def test_banner_and_buttons(self):
-        self.assertEqual(app.update_banner(), "")
-        app._updates.update(app={"version": "9.9.9", "tag": "v9.9.9", "notes": "Fixes <things>"}, ollama=("0.1", "0.2"))
-        banner, ollama_btn, garak_btn, app_btn = app.update_controls()
-        self.assertIn("LLM Scanner 9.9.9 is available", banner)
-        self.assertIn("Fixes &lt;things&gt;", banner)
-        self.assertEqual((ollama_btn["visible"], garak_btn["visible"], app_btn["visible"]), (True, False, True))
-        app._set_progress("Downloading LLM Scanner 9.9.9", 42.0)
-        banner, ollama_btn, _, app_btn = app.update_controls()
-        self.assertIn("42%", banner)
-        self.assertFalse(ollama_btn["visible"] or app_btn["visible"], "no second update while one runs")
-        app._set_progress("Installing packages", None)
-        self.assertIn("indeterminate", app.update_banner())
+    def test_nothing_shown_without_updates(self):
+        b = self.box()
+        self.assertFalse(b["box"])
+        self.assertFalse(any(b["rows"].values()) or b["all"] or b["dismiss"])
 
-    def test_result_message_and_dismiss(self):
-        app._updates.update(msg="garak update failed: <boom>", ok=False)
-        self.assertIn('up-result bad', app.update_banner())
-        self.assertIn("&lt;boom&gt;", app.update_banner())
+    def test_one_update_is_listed_without_update_all(self):
+        app._updates["ollama"] = ("0.34.2", "0.35.0")
+        b = self.box()
+        self.assertTrue(b["box"])
+        self.assertEqual(b["rows"], {"app": False, "ollama": True, "garak": False})
+        self.assertIn('0.34.2 <span class="up-arrow">→</span> 0.35.0', b["labels"]["ollama"])
+        self.assertFalse(b["all"])
+
+    def test_several_updates_offer_update_all(self):
+        app._updates.update(app={"version": "9.9.9", "tag": "v9.9.9", "notes": "Fixes <things>"},
+                            ollama=("0.34.2", "0.35.0"), garak=("0.17.0", "0.18.0"))
+        b = self.box()
+        self.assertTrue(all(b["rows"].values()))
+        self.assertTrue(b["all"])
+        self.assertIn(f'{app.APP_VERSION} <span class="up-arrow">→</span> 9.9.9', b["labels"]["app"])
+        self.assertIn("Fixes &lt;things&gt;", b["labels"]["app"])  # release notes on hover
+        app._set_progress("Downloading Ollama 0.35.0", 42.0)
+        b = self.box()
+        self.assertIn("42%", b["msg"])
+        self.assertFalse(any(b["rows"].values()) or b["all"], "no buttons while an update runs")
+
+    def test_close_button_hides_until_something_new(self):
+        app._updates.update(ollama=("0.34.2", "0.35.0"), garak=("0.17.0", "0.18.0"))
+        self.assertTrue(self.box()["dismiss"], "the x shows whenever the box does")
         app.dismiss_update_msg()
-        self.assertEqual(app.update_banner(), "")
+        self.assertFalse(self.box()["box"])
+        app._updates["ollama"] = ("0.34.2", "0.36.0")  # a newer release than the one closed
+        self.assertEqual(self.box()["rows"], {"app": False, "ollama": True, "garak": False})
+        with mock.patch.object(app, "check_updates", return_value=[]):
+            app.check_updates_now()  # asking again shows everything again
+        self.assertTrue(self.box()["rows"]["garak"])
+
+    def test_button_reports_up_to_date_then_clears(self):
+        def get(url, **kw):
+            if "pypi" in url:
+                return FakeResponse({"info": {"version": "0.0.1"}})
+            return FakeResponse({"tag_name": "v0.0.1", "prerelease": False})
+        with mock.patch.object(app.requests, "get", side_effect=get), mock.patch.object(app, "ollama_up", return_value="0.34.2"):
+            app.check_updates_now()
+        b = self.box()
+        self.assertIn("Everything is up to date: LLM Scanner", b["msg"])
+        self.assertIn("Ollama 0.34.2", b["msg"])
+        app._updates["msg_expires"] = time.time() - 1
+        self.assertFalse(self.box()["box"], "the up-to-date note goes away by itself")
+
+    def test_button_shows_available_update(self):
+        def get(url, **kw):
+            if "pypi" in url:
+                return FakeResponse({"info": {"version": "0.0.1"}})
+            if "ollama/ollama" in url:
+                return FakeResponse({"tag_name": "v0.0.1"})
+            return FakeResponse({"tag_name": "v99.0.0", "body": "New things", "prerelease": False})
+        with mock.patch.object(app.requests, "get", side_effect=get), mock.patch.object(app, "ollama_up", return_value="0.34.2"):
+            app.check_updates_now()
+        b = self.box()
+        self.assertEqual(b["rows"], {"app": True, "ollama": False, "garak": False})
+        self.assertEqual(b["msg"], "")
+
+    def test_button_reports_offline_until_dismissed(self):
+        with mock.patch.object(app.requests, "get", side_effect=app.requests.ConnectionError):
+            app.check_updates_now()
+        b = self.box()
+        self.assertIn("Couldn&#x27;t check Ollama, garak, LLM Scanner for updates", b["msg"])
+        self.assertTrue(b["dismiss"])
+        app.dismiss_update_msg()
+        self.assertFalse(self.box()["box"])
+
+
+class UpdateAll(UpdateState):
+    def test_runs_each_in_order_and_restarts_once(self):
+        app._updates.update(app={"version": "9.9.9", "tag": "v9.9.9", "notes": ""}, ollama=("0.1", "0.2"),
+                            garak=("0.17.0", "0.18.0"))
+        ran, restarts = [], []
+
+        def fake_run(kind):
+            ran.append(kind)
+            app._updates.update(ok=True, msg=f"{kind} done.")
+            if kind in ("garak", "app"):
+                app._restart_soon(kind)  # both need a restart; it must wait until the end
+            else:
+                app._updates[kind] = None
+        with mock.patch.object(app, "_run_update", side_effect=fake_run), \
+                mock.patch.object(app.threading, "Timer", side_effect=lambda *a: restarts.append(a) or mock.Mock()), \
+                mock.patch.object(app, "check_updates"):
+            app._run_all_updates()
+        self.assertEqual(ran, ["ollama", "garak", "app"])
+        self.assertEqual(len(restarts), 1)
+        self.assertTrue(app._updates["restarting"])
+        self.assertEqual(app._updates["msg"], "ollama done. garak done. app done.")
+        self.assertFalse(app._updates["defer_restart"])
+
+    def test_failure_is_reported_and_others_still_run(self):
+        app._updates.update(ollama=("0.1", "0.2"), garak=("0.17.0", "0.18.0"))
+
+        def fake_run(kind):
+            app._updates.update(ok=kind != "ollama", msg=f"{kind} {'failed' if kind == 'ollama' else 'done'}.")
+            app._updates[kind] = None
+        with mock.patch.object(app, "_run_update", side_effect=fake_run), mock.patch.object(app, "check_updates") as check, \
+                mock.patch.object(app.threading, "Timer") as timer:
+            app._run_all_updates()
+        self.assertFalse(app._updates["ok"])
+        self.assertIn("ollama failed. garak done.", app._updates["msg"])
+        timer.assert_not_called()
+        check.assert_called_once()
+
+    def test_update_all_starts_in_background(self):
+        with mock.patch.object(app.threading, "Thread") as t:
+            app.start_update("all")
+        self.assertIs(t.call_args.kwargs["target"], app._run_all_updates)
 
 
 class Starting(UpdateState):

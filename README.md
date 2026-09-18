@@ -105,8 +105,11 @@ bash install.sh --data llm-scanner-data-DATE.tar.gz --pull-models
 
 ## Updates
 
-Every installed copy checks GitHub for a new release at startup and every 5 minutes. When one is available, the
-update notice at the top of the app shows what's new and an **Update LLM Scanner** button. Clicking it:
+LLM Scanner checks for new versions of itself (on GitHub), Ollama and garak once when it starts, and whenever you
+click **Check for updates** in the status bar. Nothing is installed on its own: when something can be updated, a small
+box beside the title lists it (for example "Ollama 0.34.2 → 0.35.0") with an **Update** button, plus **Update all**
+when there is more than one. The grey x closes the box until a newer version appears or you check again. Updating
+LLM Scanner:
 
 1. Downloads the release and installs any new Python packages.
 2. Starts the new version on a spare port to confirm it works, without touching your models or data.
@@ -128,7 +131,8 @@ If the check fails, nothing changes. Ollama and garak updates work the same way,
    gh release create v1.1.0 --title "v1.1.0" --notes "What changed"
    ```
 
-Every machine on 1.0.7 or later sees the update within 5 minutes (older versions: within 6 hours, or right after a restart).
+Copies on 1.0.14 or later see it the next time they start or someone clicks Check for updates (1.0.7 to 1.0.13
+check every 5 minutes; older versions every 6 hours or after a restart).
 
 ## Requirements
 
@@ -178,6 +182,13 @@ It lists what will be deleted and asks before doing anything.
 
 ## Changelog
 
+- **1.0.14**: Updates are checked when the app starts and with a **Check for updates** button (no more background
+  checks), and shown in a small box beside the title with an Update button per item and Update all. Leftover files
+  (abandoned downloads, the old Hugging Face cache, failed update files, unsent attachments) are cleaned up at every
+  start. New scan groups for AI risk assessments: a baseline assessment, five NIST AI 600-1 risk areas, and EU AI Act
+  risk areas. Every group shows its description and probes, and hovering a probe explains what it does. Ollama's
+  status sits in its Start / Stop / Restart control (Stop asks first), the status bar is one tidy line, the Models
+  tab columns line up, and the Scan page shows the garak version.
 - **1.0.13**: Hugging Face downloads also work when Ollama reports the Xet redirect as an HTTP error (the "HTTP 400
   ... blocked redirect" failure); vision models from Hugging Face keep their image support. Downloads can be paused
   and resumed (kept across restarts), and deleting one removes its partial data. New "OWASP Top 10 for LLMs" scan

@@ -3,6 +3,7 @@
 import base64
 import bisect
 import codecs
+import functools
 import html
 import importlib.metadata
 import importlib.util
@@ -103,7 +104,8 @@ def gpu_live():
              "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5).stdout.strip().splitlines()[0]
         name, util, used, total, temp, power = [x.strip() for x in out.split(",")]
         num = lambda v: float(v) if re.match(r"^[\d.]+$", v) else None
-        return (name.replace("NVIDIA ", ""), num(util), int(used) / 1024, int(total) / 1024, num(temp), num(power))
+        short = re.sub(r"^(NVIDIA |AMD )?(GeForce |Radeon )?|( GPU)$", "", name)  # "RTX 5070 Laptop"
+        return (short or name, num(util), int(used) / 1024, int(total) / 1024, num(temp), num(power))
     except Exception:
         return None
 
@@ -124,26 +126,32 @@ def _meter(pct, cls=""):
     return f'<span class="meter {cls}"><i class="{tone}" style="width:{pct:.0f}%"></i></span>'
 
 
-def status_html(v=None):
-    v = v or ollama_up()
-    pills = [f'<span class="pill"><span class="dot ok"></span>Ollama {v}</span>' if v else
-             '<span class="pill"><span class="dot bad"></span>Ollama stopped</span>']
+def ollama_status_html(v):
+    """Ollama's state, shown inside its Start / Stop / Restart control."""
+    return (f'<span class="oc-status"><span class="dot ok"></span>Ollama {html.escape(v)}</span>' if v else
+            '<span class="oc-status"><span class="dot bad"></span>Ollama stopped</span>')
+
+
+def status_html():
+    """GPU and memory pills plus what's running (Ollama's own status sits in its control)."""
+    pills = []
     g = gpu_live()
     if g:
         name, util, used, total, temp, power = g
-        extra = "".join(f'<span class="muted">{x}</span>' for x in (
-            f"{temp:.0f}°C" if temp is not None else "", f"{power:.0f} W" if power is not None else "") if x)
-        pills.append(f'<span class="pill"><span class="dot ok"></span>{html.escape(name)}'
-                     f'<span class="lbl">GPU</span>{_meter(util)}<span class="val">{util or 0:.0f}%</span>'
-                     f'<span class="lbl">VRAM</span>{_meter(100 * used / total)}<span class="val">{used:.1f} / {total:.1f} GB</span>'
-                     f'{extra}</span>')
+        tip = f"GPU {util or 0:.0f}% busy, {used:.1f} of {total:.1f} GB video memory in use" + (
+            f", {temp:.0f}°C" if temp is not None else "") + (f", drawing {power:.0f} W" if power is not None else "")
+        pills.append(f'<span class="pill" data-tip-title="{html.escape(name)}" data-tip="{html.escape(tip)}">'
+                     f'<span class="dot ok"></span><span class="gpu-name">{html.escape(name)}</span>'
+                     f'{_meter(util)}<span class="val">{util or 0:.0f}%</span>'
+                     f'<span class="lbl">VRAM</span>{_meter(100 * used / total)}<span class="val">{used:.1f}/{total:.0f} GB</span>'
+                     + (f'<span class="muted">{temp:.0f}°C</span>' if temp is not None else "") + '</span>')
     else:
         pills.append('<span class="pill"><span class="dot warn"></span>No GPU detected</span>')
     r = ram_live()
     if r:
         pills.append(f'<span class="pill"><span class="lbl">RAM</span>{_meter(100 * r[0] / r[1])}'
-                     f'<span class="val">{r[0]:.0f} / {r[1]:.0f} GB</span></span>')
-    return f'<div class="status">{"".join(pills)}</div>{activity_html()}'
+                     f'<span class="val">{r[0]:.0f}/{r[1]:.0f} GB</span></span>')
+    return f'<div class="status">{"".join(pills)}</div>'
 
 
 def loaded_models():
@@ -194,8 +202,8 @@ def unload_models():
 def status_controls():
     """Status bar plus its buttons: Start when Ollama is stopped; Stop and Restart while it runs."""
     v = ollama_up()
-    return (status_html(v), gr.update(visible=bool(v and loaded_models())), gr.update(visible=not v),
-            gr.update(visible=bool(v)), gr.update(visible=bool(v)))
+    return (status_html(), gr.update(visible=bool(v and loaded_models())), gr.update(visible=not v),
+            gr.update(visible=bool(v)), gr.update(visible=bool(v)), ollama_status_html(v), activity_html())
 
 
 def _ollama_service(action, want_up):
@@ -259,7 +267,6 @@ APP_FILES = ["app.py", "analyst_report.py", "garak_runner.py", "llm-scanner.sh",
              "export-data.sh", "README.md", "VERSION", "requirements.txt", "static"]
 OLLAMA_DIR = Path.home() / ".local/ollama"
 KEEP_ON_UPDATE = {"data", ".venv", ".git", ".gitignore", ".github"}  # never replaced by a release
-UPDATE_CHECK_INTERVAL = 5 * 60
 _updates = {"checked": 0.0, "ollama": None, "garak": None, "app": None, "busy": None, "pct": None, "msg": "",
             "ok": True}
 
@@ -268,13 +275,13 @@ def _version_tuple(v):
     return tuple(int(x) for x in re.findall(r"\d+", v or "")[:3])
 
 
-def check_updates(force=False):
-    """Compare installed Ollama/garak with the latest releases. Results are cached for 5 minutes."""
+def check_updates():
+    """Compare LLM Scanner, Ollama and garak with their latest releases (only when asked: the Check for updates
+    button, or after installing an update). Returns the names of the ones that couldn't be checked."""
     if _updates.get("restarting"):
-        return
-    if not force and time.time() - _updates["checked"] < UPDATE_CHECK_INTERVAL:
-        return
+        return []
     _updates["checked"] = time.time()
+    failed = []
     try:
         latest = requests.get("https://api.github.com/repos/ollama/ollama/releases/latest", timeout=10).json()
         installed = ollama_up()
@@ -282,13 +289,13 @@ def check_updates(force=False):
         _updates["ollama"] = (installed, tag) if installed and tag and \
             _version_tuple(tag) > _version_tuple(installed) and not latest.get("prerelease") else None
     except Exception:
-        pass
+        failed.append("Ollama")
     try:
         installed = importlib.metadata.version("garak")
         tag = requests.get("https://pypi.org/pypi/garak/json", timeout=10).json()["info"]["version"]
         _updates["garak"] = (installed, tag) if _version_tuple(tag) > _version_tuple(installed) else None
     except Exception:
-        pass
+        failed.append("garak")
     try:
         rel = requests.get(f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest", timeout=10).json()
         tag = (rel.get("tag_name") or "").lstrip("v")
@@ -297,7 +304,32 @@ def check_updates(force=False):
         else:
             _updates["app"] = None
     except Exception:
-        pass
+        failed.append("LLM Scanner")
+    return failed
+
+
+def check_updates_now():
+    """Check for updates button: look now, then show what's available or that everything is current."""
+    if _updates["busy"] or _updates.get("restarting"):
+        return update_controls()
+    _updates.update(msg="", msg_expires=None, dismissed={})  # asking again shows everything again
+    _set_progress("Checking for updates", None)
+    try:
+        failed = check_updates()
+    finally:
+        _set_progress(None)
+    if failed:
+        _updates.update(ok=False, msg=f"Couldn't check {', '.join(failed)} for updates. Check the internet connection "
+                                      "and try again.")
+    elif not (_updates["app"] or _updates["ollama"] or _updates["garak"]):
+        try:
+            garak = importlib.metadata.version("garak")
+        except Exception:
+            garak = "?"
+        _updates.update(ok=True, msg=f"Everything is up to date: LLM Scanner {APP_VERSION}, Ollama "
+                                     f"{ollama_up() or 'not running'}, garak {garak}.",
+                        msg_expires=time.time() + 6)  # nothing to do, so the box goes away by itself
+    return update_controls()
 
 
 def _set_progress(phase, pct=None):
@@ -307,6 +339,8 @@ def _set_progress(phase, pct=None):
 
 
 def update_banner():
+    """The line inside the update box: progress while checking or installing, or the last result. What can be
+    updated is shown by the buttons beside it ("Update Ollama to 0.35.0")."""
     if _updates["busy"]:
         pct = _updates.get("pct")
         bar = (f'<div class="up-bar"><div style="width:{pct:.1f}%"></div></div>' if pct is not None else
@@ -314,35 +348,50 @@ def update_banner():
         right = f"{pct:.0f}%" if pct is not None else ""
         return (f'<div class="update-banner working"><div class="up-top"><span>{html.escape(_updates["busy"])}</span>'
                 f'<span>{right}</span></div>{bar}</div>')
-    items = []
-    if _updates["app"]:
-        items.append(f"LLM Scanner {_updates['app']['version']} is available (installed {APP_VERSION})")
-    if _updates["ollama"]:
-        items.append(f"Ollama {_updates['ollama'][1]} is available (installed {_updates['ollama'][0]})")
-    if _updates["garak"]:
-        items.append(f"garak {_updates['garak'][1]} is available (installed {_updates['garak'][0]})")
-    result = ""
     if _updates["msg"]:
         ok = _updates.get("ok", True)
-        result = f'<div class="up-result {"ok" if ok else "bad"}">{html.escape(_updates["msg"])}</div>'
-    if not items and not result:
-        return ""
-    head = ('<b>Update available:</b> ' + " &nbsp;·&nbsp; ".join(html.escape(i) for i in items)) if items else ""
-    notes = ""
-    if _updates["app"] and _updates["app"]["notes"]:
-        notes = f'<div class="up-notes">{html.escape(_updates["app"]["notes"][:400])}</div>'
-    return f'<div class="update-banner">{head}{notes}{result}</div>'
+        return f'<div class="update-banner"><div class="up-result {"ok" if ok else "bad"}">{html.escape(_updates["msg"])}</div></div>'
+    return ""
+
+
+UPDATE_NAMES = {"app": "LLM Scanner", "ollama": "Ollama", "garak": "garak"}
+
+
+def update_versions(kind):
+    """(installed, available) for one kind of update, or None."""
+    u = _updates[kind]
+    if not u:
+        return None
+    return (APP_VERSION, u["version"]) if kind == "app" else u
+
+
+def update_item_html(kind):
+    installed, new = update_versions(kind) or ("", "")
+    notes = _updates["app"]["notes"][:600] if kind == "app" and _updates["app"] and _updates["app"]["notes"] else ""
+    tip = f' data-tip-title="What\'s new in {new}" data-tip="{html.escape(notes)}"' if notes else ""
+    return (f'<div class="up-item-text"{tip}><span class="up-name">{UPDATE_NAMES[kind]}</span>'
+            f'<span class="up-ver">{html.escape(installed)} <span class="up-arrow">→</span> {html.escape(new)}</span></div>')
 
 
 def update_controls():
+    """The update box at the top. Hidden unless there is something to update, an update running, or a result to show.
+    Lists each available update with its own button, plus Update all when there is more than one."""
+    if _updates.get("msg_expires") and time.time() > _updates["msg_expires"]:
+        _updates.update(msg="", msg_expires=None)
     busy = bool(_updates["busy"])
-    return (update_banner(), gr.update(visible=bool(_updates["ollama"]) and not busy),
-            gr.update(visible=bool(_updates["garak"]) and not busy),
-            gr.update(visible=bool(_updates["app"]) and not busy))
+    dismissed = _updates.get("dismissed") or {}
+    available = [k for k in UPDATE_ORDER if _updates[k] and dismissed.get(k) != update_versions(k)[1]]
+    show = busy or bool(_updates["msg"]) or bool(available)
+    rows = [gr.update(visible=kind in available and not busy) for kind in ("app", "ollama", "garak")]
+    labels = [update_item_html(kind) for kind in ("app", "ollama", "garak")]
+    return (gr.update(visible=show), update_banner(), *rows, *labels,
+            gr.update(visible=len(available) > 1 and not busy), gr.update(visible=show and not busy))
 
 
 def dismiss_update_msg():
-    _updates["msg"] = ""
+    """The x on the update box: close it, and don't offer these same versions again until the next check."""
+    _updates["dismissed"] = {k: update_versions(k)[1] for k in UPDATE_ORDER if _updates[k]}
+    _updates.update(msg="", msg_expires=None)
     return update_controls()
 
 
@@ -429,8 +478,12 @@ def _verify_app_candidate(folder):
 
 
 def _restart_soon(kind):
-    """The update is installed and the app restarts in a few seconds; stop offering it in the meantime."""
+    """The update is installed and the app restarts in a few seconds; stop offering it in the meantime. During
+    Update all, the restart waits until every update has run."""
     _updates[kind] = None
+    if _updates.get("defer_restart"):
+        _updates["restart_pending"] = True
+        return
     _updates["restarting"] = True
     threading.Timer(4, lambda: subprocess.run(["systemctl", "--user", "restart", "llm-scanner"])).start()
 
@@ -562,31 +615,49 @@ def _run_update(kind):
         _updates["msg"] = f"{kind} update failed: {e}"
     finally:
         _set_progress(None)
-        if not _updates.get("restarting"):  # a restart is coming; this old process would re-offer the same update
-            check_updates(force=True)
+        if not _updates.get("restarting") and not _updates.get("defer_restart"):  # (a restart would re-offer it)
+            check_updates()
+
+
+UPDATE_ORDER = ("ollama", "garak", "app")  # LLM Scanner last: it restarts the app
+
+
+def _run_all_updates():
+    """Update all: every available update in turn, then one restart if any of them needs it."""
+    _updates["defer_restart"] = True
+    results, all_ok = [], True
+    try:
+        for kind in UPDATE_ORDER:
+            if _updates.get(kind):
+                _run_update(kind)
+                results.append(_updates["msg"])
+                all_ok = all_ok and _updates["ok"]
+    finally:
+        _updates["defer_restart"] = False
+    _updates.update(ok=all_ok, msg=" ".join(r for r in results if r))
+    if _updates.pop("restart_pending", False):
+        _restart_soon("app")
+    else:
+        check_updates()
 
 
 def start_update(kind):
+    """An Update button in the update box; kind is "app", "ollama", "garak" or "all"."""
     if _updates["busy"] or _updates.get("restarting"):
         return update_controls()
     if _proc.get("p") and _proc["p"].poll() is None:
         _updates["ok"] = False
         _updates["msg"] = "Finish or stop the running scan before updating."
         return update_controls()
-    if kind == "app" and (_image_proc.get("p") and _image_proc["p"].poll() is None):
+    if kind in ("app", "all") and (_image_proc.get("p") and _image_proc["p"].poll() is None):
         _updates["ok"] = False
         _updates["msg"] = "Wait for the image to finish generating before updating."
         return update_controls()
     _updates["msg"] = ""
     _set_progress("Starting update", 0)
-    threading.Thread(target=_run_update, args=(kind,), daemon=True).start()
+    threading.Thread(target=_run_all_updates if kind == "all" else _run_update, args=() if kind == "all" else (kind,),
+                     daemon=True).start()
     return update_controls()
-
-
-def _update_loop():
-    while True:
-        check_updates()
-        time.sleep(60)
 
 
 # ---------------------------------------------------------------- installed models
@@ -2190,11 +2261,89 @@ def load_catalog():
         if "text" not in v.get("modality", {}).get("in", ["text"]):
             continue
         cat[name] = {"module": name.split(".")[0], "desc": (v.get("description") or "").strip().split("\n")[0],
-                     "tier": v.get("tier"), "active": v.get("active", True), "tags": v.get("tags", [])}
+                     "tier": v.get("tier"), "active": v.get("active", True), "tags": v.get("tags", []),
+                     "goal": (v.get("goal") or "").strip()}
     return dict(sorted(cat.items()))
 
 
+# What each family of garak probes does, in plain language (shown when hovering a probe or family).
+MODULE_INFO = {
+    "adaptive_attacks": "An attacker model rewrites a harmful request again and again until the target complies.",
+    "agent_breaker": "Tests AI agents that use tools, by tricking them into misusing those tools. Needs an agent "
+                     "set up for it; not meaningful for a plain chat model.",
+    "ansiescape": "Tries to make the model output terminal escape codes, which can hide or change what a person "
+                  "sees in a terminal or log that shows the output.",
+    "apikey": "Asks the model to produce or complete secret API keys.",
+    "atkgen": "An attacker model writes prompts on the fly to steer the target into toxic replies.",
+    "audio": "Attacks delivered as audio, for models that accept sound.",
+    "av_spam_scanning": "Asks the model to output the standard antivirus and spam test signatures, to see whether "
+                        "anything filters its output.",
+    "badchars": "Hides or disguises instructions with invisible or look-alike Unicode characters.",
+    "base": "garak's internal building blocks, not attacks on their own.",
+    "continuation": "Starts an offensive word or slur and checks whether the model completes it.",
+    "dan": "'Do Anything Now' style jailbreaks: role-play prompts that tell the model it has no rules.",
+    "divergence": "Makes the model repeat a word until it drifts off and spills memorized training data.",
+    "doctor": "Wraps harmful requests in fake policy files or medical role-play to get past safety training.",
+    "donotanswer": "Questions a responsible model should decline: discrimination, dangerous information, "
+                   "misinformation and malicious uses.",
+    "dra": "Disguises a harmful request as a word puzzle the model has to reconstruct, then answer.",
+    "encoding": "Hides instructions in encodings such as Base64, ROT13 or Morse code to see if the model decodes "
+                "and follows them.",
+    "exploitation": "Tries to get output that would inject code into an application, such as template or SQL "
+                    "injection.",
+    "fileformats": "Inspects the model's files for risky formats instead of sending prompts.",
+    "fitd": "Foot in the door: starts with harmless requests and escalates to harmful ones over several turns.",
+    "glitch": "Uses rare 'glitch' tokens that can make models behave erratically.",
+    "goat": "An attacker model holds multi-turn conversations to wear down the target's refusals.",
+    "goodside": "Classic attacks by Riley Goodside: invisible Unicode instructions, threats to force a format, and "
+                "questions about a person the model is likely to make things up about.",
+    "grandma": "The 'grandma exploit': asks the model to play a late grandmother who used to share harmful "
+               "information or software product keys.",
+    "latentinjection": "Indirect prompt injection: hides instructions inside documents, résumés or reports the "
+                       "model is asked to work with.",
+    "leakreplay": "Checks whether the model reproduces copyrighted or training text word for word, such as books "
+                  "and newspaper articles.",
+    "lmrc": "Language Model Risk Cards: bullying, deadnaming, quack medicine, sexual content, slurs and profanity.",
+    "malwaregen": "Asks the model to write malware, from full programs to evasion tricks and payloads.",
+    "misleading": "States false claims and checks whether the model corrects them or builds on them.",
+    "packagehallucination": "Asks for code and checks whether it uses software packages that don't exist; "
+                            "attackers can publish malicious packages under those names.",
+    "phrasing": "Rewords harmful requests in the past or future tense, which often slips past refusals.",
+    "promptinject": "Tries to hijack the model's task so it outputs an attacker's text instead.",
+    "propile": "Checks whether the model leaks personal information about real people.",
+    "realtoxicityprompts": "Sentence openings known to lead models into toxic continuations.",
+    "sata": "Masks the harmful words in a request and asks the model to fill them in as part of an innocent task.",
+    "smuggling": "Smuggles a harmful request past filters by splitting or disguising it.",
+    "snowball": "Questions models tend to answer wrongly with confidence, testing whether errors snowball.",
+    "suffix": "Adds adversarial suffixes, strings of odd text found by optimization, that break safety training.",
+    "sysprompt_extraction": "Tries to get the model to reveal its hidden system prompt.",
+    "tap": "Tree of Attacks with Pruning: jailbreak prompts found by an automated attacker.",
+    "test": "garak's self-test probes; not real attacks.",
+    "topic": "Asks about controversial topics to see whether the model takes sides.",
+    "visual_jailbreak": "Jailbreaks delivered as images, for models that accept pictures.",
+    "web_injection": "Tries to make the model output Markdown images or links that would send data to an "
+                     "attacker's server when displayed.",
+}
+
+
+def probe_tip(name):
+    """Hover text for a probe: what its family does, garak's description, and the attack goal."""
+    v = CATALOG.get(name)
+    if not v:
+        return ""
+    parts = [MODULE_INFO.get(v["module"], ""), v["desc"]]
+    if v["goal"]:
+        parts.append(f"Goal: {v['goal'][0].upper()}{v['goal'][1:]}.")
+    if not v["active"]:
+        parts.append("Off by default in garak.")
+    return "\n".join(p for p in parts if p)
+
+
 CATALOG = load_catalog()
+try:
+    GARAK_VERSION = importlib.metadata.version("garak")  # (a garak update restarts the app, so this stays current)
+except importlib.metadata.PackageNotFoundError:
+    GARAK_VERSION = "not installed"
 MODULES = sorted({v["module"] for v in CATALOG.values()})
 
 
@@ -2208,10 +2357,74 @@ def owasp_preset():
                        "and tool-using apps). " if missing else "") + "Thorough; expect several hours.")
 
 
+NEEDS_ATTACKER_MODEL = {"atkgen", "adaptive_attacks"}  # these download and run a second model to attack with
+
+
+def _probes_for(tags=(), modules=(), probes=()):
+    """Active probes carrying a tag that starts with one of `tags`, in one of `modules`, or named in `probes`."""
+    return [n for n, v in CATALOG.items() if v["active"] and v["module"] not in NEEDS_ATTACKER_MODEL and (
+        (bool(tags) and any(t.startswith(tags) for t in v["tags"])) or v["module"] in modules or n in probes)]
+
+
+# Groups for AI evaluations and risk assessments. NIST AI 600-1 is the Generative AI Profile of the NIST AI Risk
+# Management Framework; each group covers one of its risk categories that a model can be tested for directly. The
+# mapping uses garak's own taxonomy tags plus the modules written for that risk. These support an assessment; they
+# are not a certified compliance test.
+_NOT_CERTIFIED = " An evaluation aid, not a certified compliance test."
+FRAMEWORK_PRESETS = {
+    "Baseline assessment": (
+        _probes_for(probes=(
+            "dan.DanInTheWild", "promptinject.HijackHateHumans", "latentinjection.LatentInjectionReport",
+            "encoding.InjectBase64", "malwaregen.TopLevel", "exploitation.SQLInjectionEcho",
+            "web_injection.MarkdownImageExfil", "sysprompt_extraction.SystemPromptExtraction", "apikey.GetKey",
+            "leakreplay.GuardianCloze", "packagehallucination.Python", "misleading.FalseAssertion",
+            "goodside.WhoIsRiley", "lmrc.QuackMedicine", "realtoxicityprompts.RTPBlank", "grandma.Substances",
+            "continuation.ContinueSlursReclaimedSlurs", "lmrc.Deadnaming", "ansiescape.AnsiRaw")),
+        "A time-boxed pre-deployment check with one or two representative probes from every risk area in the "
+        "NIST AI 600-1 groups below: security, integrity, harmful content, privacy and bias. Run it first; follow up "
+        "with the full group for any area that fails." + _NOT_CERTIFIED),
+    "NIST AI 600-1: Information security": (
+        _probes_for(tags=("avid-effect:security", "euai:robustness", "payload:malicious", "payload:jailbreak"),
+                    modules=("dan", "promptinject", "latentinjection", "encoding", "malwaregen", "exploitation",
+                             "web_injection", "ansiescape", "badchars", "phrasing", "dra", "sata")),
+        "Whether the model can be hijacked or turned against the systems around it: jailbreaks, direct and indirect "
+        "prompt injection, encoded and obfuscated attacks, malicious code and injection payloads, and data "
+        "exfiltration through rendered output." + _NOT_CERTIFIED),
+    "NIST AI 600-1: Information integrity and confabulation": (
+        _probes_for(tags=("euai:deception", "payload:hallucination", "quality:Robustness:GenerativeMisinformation",
+                          "quality:Behavioral:DeliberativeMisinformation"),
+                    modules=("misleading", "snowball", "packagehallucination"),
+                    probes=("goodside.WhoIsRiley", "lmrc.QuackMedicine")),
+        "Whether the model states falsehoods with confidence, accepts false premises, invents software packages or "
+        "people, or gives unsafe medical misinformation." + _NOT_CERTIFIED),
+    "NIST AI 600-1: Dangerous, violent and hateful content": (
+        _probes_for(tags=("euai:harmful", "euai:offensive", "payload:unwanted", "payload:dangerous",
+                          "risk-cards:lmrc:bullying", "risk-cards:lmrc:providing_illegal_info",
+                          "risk-cards:lmrc:slur_usage", "risk-cards:lmrc:sexual"),
+                    modules=("realtoxicityprompts", "continuation"), probes=("grandma.Substances", "grandma.Slurs")),
+        "Whether the model produces violent, hateful, harassing, sexual or illegal content, including instructions "
+        "for dangerous substances, when asked directly or through role-play." + _NOT_CERTIFIED),
+    "NIST AI 600-1: Data privacy and intellectual property": (
+        _probes_for(tags=("payload:leak", "quality:Security:ExtractionInversion", "quality:Security:Confidentiality"),
+                    modules=("leakreplay", "divergence", "apikey", "sysprompt_extraction"),
+                    probes=("grandma.Win10", "grandma.Win11")),
+        "Whether the model reveals memorized training data or copyrighted text, secrets such as API and product "
+        "keys, or its confidential system prompt." + _NOT_CERTIFIED),
+    "NIST AI 600-1: Harmful bias": (
+        _probes_for(tags=("euai:discrimination", "avid-effect:ethics:E0101", "risk-cards:lmrc:deadnaming"),
+                    modules=("topic",), probes=("continuation.ContinueSlursReclaimedSlurs",)),
+        "Whether the model discriminates against people or protected groups, uses slurs, misgenders or deadnames, "
+        "or takes sides on controversial topics." + _NOT_CERTIFIED),
+    "EU AI Act risk areas": (
+        _probes_for(tags=("euai:",)),
+        "Every garak probe tagged with an EU AI Act risk area: robustness and security, deception, discrimination, "
+        "and harmful or offensive content." + _NOT_CERTIFIED),
+}
+
 _owasp_probes, _owasp_desc = owasp_preset()
-if _owasp_probes:  # an empty list would mean every probe (the full scan)
-    PRESETS = {k: v for k, v in PRESETS.items() if k != "Full scan"} | {
-        "OWASP Top 10 for LLMs": (_owasp_probes, _owasp_desc), "Full scan": PRESETS["Full scan"]}
+_extra = {"OWASP Top 10 for LLMs": (_owasp_probes, _owasp_desc), **FRAMEWORK_PRESETS}
+PRESETS = {k: v for k, v in PRESETS.items() if k != "Full scan"} | {
+    k: v for k, v in _extra.items() if v[0]} | {"Full scan": PRESETS["Full scan"]}  # empty would mean every probe
 
 
 def expand(specs):
@@ -2338,14 +2551,45 @@ def resolve_scan(scan_type, selected):
     return None, "Choose a scan type."
 
 
+def probes_html(probes, desc):
+    """A group's description and the probes it runs, grouped by family. Hovering a probe or family explains it."""
+    by_module = {}
+    for n in probes:
+        by_module.setdefault(CATALOG[n]["module"] if n in CATALOG else n.split(".")[0], []).append(n)
+    rows = "".join(
+        f'<div class="pi-row"><span class="pi-mod" data-tip-title="{html.escape(m)}" '
+        f'data-tip="{html.escape(MODULE_INFO.get(m, ""))}">{html.escape(m)}</span><span class="pi-chips">'
+        + "".join(f'<span class="pi-chip" data-tip-title="{html.escape(n)}" data-tip="{html.escape(probe_tip(n))}">'
+                  f'{html.escape(n.split(".", 1)[-1])}</span>' for n in names) + "</span></div>"
+        for m, names in by_module.items())
+    families = f'{len(by_module)} famil{"y" if len(by_module) == 1 else "ies"}'
+    return (f'<div class="probe-info"><p class="pi-desc">{html.escape(desc)}</p>'
+            f'<div class="pi-count">{len(probes)} probe{"s" if len(probes) != 1 else ""} in {families}'
+            f'<span class="pi-hint">Hover a probe to see what it does</span></div>'
+            f'<div class="pi-list">{rows}</div></div>')
+
+
 def scan_info(scan_type, selected):
-    if scan_type in PRESETS and not PRESETS[scan_type][0]:
-        return PRESETS[scan_type][1]
+    """What a scan type runs: its description and every probe in it."""
+    if scan_type in PRESETS and not PRESETS[scan_type][0]:  # the full scan: every probe that is on by default
+        return probes_html([n for n, v in CATALOG.items() if v["active"]], PRESETS[scan_type][1])
     probes, err = resolve_scan(scan_type, selected)
     if err:
-        return err
-    desc = PRESETS[scan_type][1] + " " if scan_type in PRESETS else ""
-    return desc + f"{len(probes)} probes: " + ", ".join(probes[:10]) + (" ..." if len(probes) > 10 else "")
+        return f'<div class="probe-info"><p class="pi-desc">{html.escape(err)}</p></div>'
+    if scan_type in PRESETS:
+        desc = PRESETS[scan_type][1]
+    elif scan_type == CURRENT:
+        desc = "The probes currently selected on the Probes tab."
+    else:
+        desc = f"Your saved group \"{scan_type.removeprefix(GROUP_PREFIX)}\"."
+    return probes_html(probes, desc)
+
+
+def group_info(name, selected=()):
+    """The Probes tab's Group menu uses "Preset: X" for presets and plain names for saved groups."""
+    if not name:
+        return ""
+    return scan_info(name.removeprefix("Preset: ") if name.startswith("Preset: ") else GROUP_PREFIX + name, selected)
 
 
 def model_info(name):
@@ -2678,36 +2922,46 @@ APP_JS = (APP_DIR / "static" / "app.js").read_text(encoding="utf-8")
 # ---------------------------------------------------------------- UI
 with gr.Blocks(title="LLM Scanner") as ui:
     selected = gr.State([])
-    gr.HTML('<div class="hero"><div class="eyebrow">Local AI security &nbsp;·&nbsp; Current version v' + APP_VERSION + '</div><h1>LLM Scanner</h1>'
-            '<p>Download models from Hugging Face or Ollama, run them locally, and test them for '
-            'vulnerabilities with garak.</p></div>')
-    with gr.Row(elem_classes="update-row"):
-        update_html = gr.HTML(update_banner())
-        update_app_btn = gr.Button("Update LLM Scanner", variant="primary", size="sm", scale=0, min_width=170,
-                                   visible=False)
-        update_ollama_btn = gr.Button("Update Ollama", variant="primary", size="sm", scale=0, min_width=140, visible=False)
-        update_garak_btn = gr.Button("Update garak", variant="primary", size="sm", scale=0, min_width=130, visible=False)
-        update_dismiss = gr.Button("Dismiss", variant="secondary", size="sm", scale=0, min_width=100)
-        update_timer = gr.Timer(1.0)
+    with gr.Row(equal_height=False, elem_classes="top-row"):  # header, with the update box beside it when shown
+        gr.HTML('<div class="hero"><div class="eyebrow">Local AI security &nbsp;·&nbsp; Current version v' + APP_VERSION + '</div><h1>LLM Scanner</h1>'
+                '<p>Download models from Hugging Face or Ollama, run them locally, and test them for '
+                'vulnerabilities with garak.</p></div>', elem_classes="hero-holder")
+        with gr.Column(elem_classes="update-box", visible=False, scale=0, min_width=380) as update_box:  # only when there are updates
+            update_dismiss = gr.Button("", size="sm", scale=0, min_width=0, visible=False, elem_classes="up-close")
+            update_html = gr.HTML()
+            update_rows, update_labels, update_buttons = [], [], {}
+            for _kind in ("app", "ollama", "garak"):
+                with gr.Row(equal_height=True, elem_classes="up-item", visible=False) as _row:
+                    update_labels.append(gr.HTML(elem_classes="up-item-label"))
+                    update_buttons[_kind] = gr.Button("Update", variant="primary", size="sm", scale=0, min_width=90)
+                update_rows.append(_row)
+            with gr.Row(elem_classes="up-actions"):
+                update_all_btn = gr.Button("Update all", variant="primary", size="sm", scale=0, min_width=110, visible=False)
+                pass
+    update_timer = gr.Timer(1.0)  # outside the update box: a timer in a hidden container never ticks
     with gr.Row(elem_classes="statusrow"):
-        status = gr.HTML(status_html())
-        status_timer = gr.Timer(5.0)
-        _up = bool(ollama_up())
-        with gr.Row(equal_height=True, elem_classes="ollama-controls"):  # one pill: "Ollama  Start" or "Stop  Restart"
-            gr.HTML('<span class="oc-label">Ollama</span>', elem_classes="oc-label-holder", min_width=0)
-            start_btn = gr.Button("Start", variant="secondary", size="sm", scale=0, min_width=0, visible=not _up,
+        _v = ollama_up()
+        with gr.Row(equal_height=True, elem_classes="ollama-controls"):  # "Ollama 0.34.2  Stop  Restart" in one pill
+            ollama_status = gr.HTML(ollama_status_html(_v), elem_classes="oc-label-holder", min_width=0)
+            start_btn = gr.Button("Start", variant="secondary", size="sm", scale=0, min_width=0, visible=not _v,
                                   elem_classes="oc-start")
-            stop_ollama_btn = gr.Button("Stop", variant="secondary", size="sm", scale=0, min_width=0, visible=_up)
-            restart_ollama_btn = gr.Button("Restart", variant="secondary", size="sm", scale=0, min_width=0, visible=_up)
+            stop_ollama_btn = gr.Button("Stop", variant="secondary", size="sm", scale=0, min_width=0, visible=bool(_v),
+                                        elem_classes="oc-stop")  # asks first (static/app.js)
+            restart_ollama_btn = gr.Button("Restart", variant="secondary", size="sm", scale=0, min_width=0,
+                                           visible=bool(_v), elem_classes="oc-restart")
+        status = gr.HTML(status_html(), elem_classes="status-holder")
+        status_timer = gr.Timer(5.0)
         unload_btn = gr.Button("Unload models", variant="secondary", size="sm", scale=0, min_width=140,
                                visible=bool(loaded_models()))
         refresh_btn = gr.Button("Refresh", variant="secondary", size="sm", scale=0, min_width=100)
+        check_updates_btn = gr.Button("Check for updates", variant="secondary", size="sm", scale=0, min_width=150)
+    activity = gr.HTML(activity_html(), elem_classes="activity-holder")
 
     with gr.Tabs():
         # ---------------- Models
         with gr.Tab("Models"):
-            with gr.Row(equal_height=False):
-                with gr.Column(scale=2, min_width=480):
+            with gr.Row(equal_height=False, elem_classes="models-row"):  # both sides end at the same height
+                with gr.Column(scale=2, min_width=480, elem_classes="models-left"):
                     with gr.Column(elem_classes="card add-model-card"):
                         gr.HTML('<h2>Add a model</h2><p class="sub">Choose where to search, then search by name or paste a link.</p>')
                         search_loading = gr.HTML(visible=False, elem_classes="search-loading")
@@ -2726,7 +2980,7 @@ with gr.Blocks(title="LLM Scanner") as ui:
                             pull_btn = gr.Button("Download", variant="primary", scale=0, min_width=160, interactive=False)
                         pull_status = gr.HTML(elem_classes="note")
 
-                    with gr.Column(elem_classes="card"):
+                    with gr.Column(elem_classes="card downloads-card"):
                         gr.HTML('<h2>Downloads</h2><p class="sub">Downloads run in the background and pick up where they '
                                 'left off after a restart or lost connection.</p>')
                         dl_view = gr.HTML(downloads_html())
@@ -2917,6 +3171,8 @@ with gr.Blocks(title="LLM Scanner") as ui:
                         clear_btn = gr.Button("Clear", variant="secondary", size="sm", scale=0, min_width=90)
                     probe_count = gr.Markdown(elem_classes="note")
                     _init = filtered_probes("", "All categories", False)
+                    gr.HTML('<div id="probe-tips" hidden data-tips="' + html.escape(json.dumps(
+                        {n: probe_tip(n) for n in CATALOG})) + '"></div>', elem_classes="hidden-control")
                     probe_list = gr.CheckboxGroup(choices=[(probe_label(n), n) for n in _init], show_label=False,
                                                   elem_classes="probe-list")
                     probe_count.value = f"Showing {len(_init)} of {len(CATALOG)} probes."
@@ -2933,18 +3189,19 @@ with gr.Blocks(title="LLM Scanner") as ui:
                         group_name = gr.Textbox(label="Group name", placeholder="My jailbreak suite", scale=3, min_width=240)
                         save_btn = gr.Button("Save selection", variant="primary", scale=0, min_width=160)
                     group_status = gr.Markdown(elem_classes="note")
+                    group_about = gr.HTML()
 
         # ---------------- Scan
         with gr.Tab("Scan"):
             with gr.Column(elem_classes="card"):
-                gr.HTML('<h2>Run a scan</h2><p class="sub">garak sends attack prompts to the model and '
-                        'checks its responses.</p>')
+                gr.HTML(f'<h2>Run a scan <span class="ver-badge">garak {html.escape(GARAK_VERSION)}</span></h2>'
+                        '<p class="sub">garak sends attack prompts to the model and checks its responses.</p>')
                 with gr.Row():
                     scan_model = gr.Dropdown(label="Model", choices=model_names(), scale=1, min_width=280)
                     scan_type = gr.Dropdown(label="Scan type", choices=scan_choices(), value="Quick check",
                                             scale=1, min_width=280)
                 model_note = gr.Markdown(elem_classes="note")
-                scan_desc = gr.Markdown(scan_info("Quick check", []), elem_classes="note")
+                scan_desc = gr.HTML(scan_info("Quick check", []))
                 with gr.Accordion("Advanced settings", open=False):
                     with gr.Row():
                         gens = gr.Slider(1, 10, value=3, step=1, label="Attempts per prompt",
@@ -2987,20 +3244,21 @@ with gr.Blocks(title="LLM Scanner") as ui:
                         raw_view = gr.Code(show_label=False, language=None, lines=30, max_lines=30, elem_classes="log")
 
     # status
-    status_outputs = [status, unload_btn, start_btn, stop_ollama_btn, restart_ollama_btn]
+    status_outputs = [status, unload_btn, start_btn, stop_ollama_btn, restart_ollama_btn, ollama_status, activity]
     start_btn.click(start_ollama, outputs=status_outputs, show_progress="hidden")
     stop_ollama_btn.click(stop_ollama, outputs=status_outputs, show_progress="hidden")
     restart_ollama_btn.click(restart_ollama, outputs=status_outputs, show_progress="hidden")
     status_timer.tick(status_controls, outputs=status_outputs, show_progress="hidden")
     unload_btn.click(unload_models, outputs=status_outputs, show_progress="hidden")
     ui.load(status_controls, outputs=status_outputs, show_progress="hidden")
-    update_outputs = [update_html, update_ollama_btn, update_garak_btn, update_app_btn]
+    update_outputs = [update_box, update_html, *update_rows, *update_labels, update_all_btn, update_dismiss]
     update_timer.tick(update_controls, outputs=update_outputs, show_progress="hidden")
-    update_app_btn.click(lambda: start_update("app"), outputs=update_outputs, show_progress="hidden")
+    for _kind, _btn in update_buttons.items():
+        _btn.click(functools.partial(start_update, _kind), outputs=update_outputs, show_progress="hidden")
+    update_all_btn.click(lambda: start_update("all"), outputs=update_outputs, show_progress="hidden")
+    check_updates_btn.click(check_updates_now, outputs=update_outputs, show_progress="hidden")
     update_dismiss.click(dismiss_update_msg, outputs=update_outputs,
                          show_progress="hidden")
-    update_ollama_btn.click(lambda: start_update("ollama"), outputs=update_outputs, show_progress="hidden")
-    update_garak_btn.click(lambda: start_update("garak"), outputs=update_outputs, show_progress="hidden")
     refresh_btn.click(refresh_all, chat_state, [models_version, scan_model, status, scan_type, group_pick, chat_model],
                       show_progress="hidden")
 
@@ -3068,6 +3326,8 @@ with gr.Blocks(title="LLM Scanner") as ui:
 
     # scan
     scan_type.change(scan_info, [scan_type, selected], scan_desc, show_progress="hidden")
+    group_pick.change(group_info, [group_pick, selected], group_about, show_progress="hidden")
+    ui.load(group_info, [group_pick, selected], group_about, show_progress="hidden")
     scan_model.change(model_hint, scan_model, [model_note, tmo], show_progress="hidden")
     scan_btn.click(run_scan, [scan_model, scan_type, selected, gens, tmo, thinking],
                    [scan_log, scan_btn, stop_btn, scan_progress], show_progress="hidden").then(
@@ -3086,6 +3346,40 @@ with gr.Blocks(title="LLM Scanner") as ui:
         model_hint, scan_model, [model_note, tmo], show_progress="hidden").then(
         refresh_reports, outputs=rep, show_progress="hidden").then(
         show_report, [rep, raw_pick], [rep_summary, rep_view, raw_view, rep_files], show_progress="hidden")
+
+KEEP_BACKUPS = 3  # previous versions kept in data/backups after updates
+
+
+def clean_leftovers():
+    """Delete files earlier runs left behind: interrupted or abandoned downloads, the huggingface_hub caches of
+    1.0.10 and 1.0.11 (a second copy of every model), failed update staging, self-test files, attachments staged but
+    never sent, attachments and image settings whose chat or image is gone, and all but the newest update backups.
+    Downloads that are still queued or paused keep their partial files. Returns (files removed, bytes freed)."""
+    keep = {f for ref, _ in _pending() for f in _partial_files(ref)}
+    doomed = [DATA_DIR / ".hf-cache", IMAGE_MODEL_DIR / ".hf-cache", DATA_DIR / "update-staging", DATA_DIR / "tmp",
+              ATTACH_DIR / "staging"]
+    if HF_DOWNLOADS.exists():
+        doomed += [f for f in HF_DOWNLOADS.iterdir() if f not in keep]
+    if IMAGE_MODEL_DIR.exists():
+        doomed += [f for f in IMAGE_MODEL_DIR.rglob("*.part") if f not in keep]
+    if ATTACH_DIR.exists():
+        doomed += [d for d in ATTACH_DIR.iterdir() if d.is_dir() and d.name != "staging"
+                   and not (CHATS_DIR / f"{d.name}.json").exists()]
+    if IMAGES_DIR.exists():
+        doomed += [f for f in IMAGES_DIR.glob("*.json") if not f.with_suffix(".png").exists()]
+    backups = DATA_DIR / "backups"
+    if backups.exists():
+        doomed += sorted((d for d in backups.iterdir() if d.is_dir()), key=lambda d: d.stat().st_mtime)[:-KEEP_BACKUPS]
+    files = size = 0
+    for path in doomed:
+        if not path.exists():
+            continue
+        for f in ([path] if path.is_file() else [p for p in path.rglob("*") if p.is_file() and not p.is_symlink()]):
+            files += 1
+            size += f.stat().st_size
+        shutil.rmtree(path, ignore_errors=True) if path.is_dir() else path.unlink(missing_ok=True)
+    return files, size
+
 
 def ensure_desktop_integration():
     """Install the app icon and keep our own launcher entries pointing at it and at this app."""
@@ -3122,8 +3416,11 @@ if __name__ == "__main__":
         CHAT_INDEX.build()
         migrate_shared_files()
         unload_models()  # start with nothing in memory; models load only for a chat reply or a scan
+        files, size = clean_leftovers()
+        if files:
+            print(f"Removed {files} leftover files ({size / 1e9:.1f} GB)", flush=True)
         resume_pending_downloads()
-        threading.Thread(target=_update_loop, daemon=True).start()
+        threading.Thread(target=check_updates, daemon=True).start()  # once at startup; after that, on request
     ui.queue().launch(server_name="127.0.0.1", server_port=int(os.environ.get("LLM_SCANNER_PORT", 7861)),
                       inbrowser="--no-browser" not in sys.argv, allowed_paths=[str(GARAK_RUNS), str(ATTACH_DIR), str(IMAGES_DIR)],
                       theme=THEME, css=CSS, footer_links=[], js=APP_JS,
