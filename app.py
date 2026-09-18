@@ -407,6 +407,9 @@ def _update_app():
     missing = [f for f in ("app.py", "VERSION", "static") if not (new / f).exists()]
     if missing:
         raise RuntimeError(f"the release is missing {', '.join(missing)}")
+    packaged_version = (new / "VERSION").read_text(encoding="utf-8").strip()
+    if packaged_version != version:
+        raise RuntimeError(f"the release is labeled {version}, but its package contains VERSION {packaged_version}")
     old_reqs = (APP_DIR / "requirements.txt").read_text() if (APP_DIR / "requirements.txt").exists() else ""
     if (new / "requirements.txt").exists() and (new / "requirements.txt").read_text() != old_reqs:
         _set_progress(f"Installing Python packages for LLM Scanner {version}", None)
