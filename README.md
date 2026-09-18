@@ -176,6 +176,7 @@ It lists what will be deleted and asks before doing anything.
 
 ## Changelog
 
+- **1.0.11**: Show byte-level Hugging Face progress and total size while importing GGUF files into Ollama.
 - **1.0.10**: Fall back to a Hugging Face Hub download and Ollama import when Xet/CDN redirects prevent Ollama's native `hf.co` pull.
 - **1.0.9**: Include all Python modules in in-app updates so new releases start correctly after installation.
 - **1.0.8**: Fix release packaging so in-app updates install the version shown by the release, and reject mismatched release archives.

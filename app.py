@@ -1243,10 +1243,10 @@ def _hf_gguf_file(repo, tag):
         path = entry.get("path", "")
         name = path.rsplit("/", 1)[-1]
         if name.lower().endswith(".gguf") and name[:-5].lower().endswith(wanted):
-            candidates.append(path)
+            candidates.append((path, int(entry.get("size") or 0)))
     if not candidates:
         raise FileNotFoundError(f"could not find a GGUF file for quantization {tag} in {repo}")
-    return min(candidates, key=len)
+    return min(candidates, key=lambda item: len(item[0]))
 
 
 def _hf_ollama_fallback(ref, d):
@@ -1258,9 +1258,29 @@ def _hf_ollama_fallback(ref, d):
     from huggingface_hub import hf_hub_download
 
     d.update(state="downloading", msg="Downloading through Hugging Face")
-    filename = _hf_gguf_file(repo, tag)
-    model_file = Path(hf_hub_download(repo_id=repo, filename=filename, repo_type="model",
-                                      cache_dir=str(DATA_DIR / ".hf-cache")))
+    filename, total = _hf_gguf_file(repo, tag)
+    cache_dir = DATA_DIR / ".hf-cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    d.update(state="downloading", msg="Downloading through Hugging Face", done=0, total=total)
+    monitor_stop = threading.Event()
+
+    def monitor():
+        while not monitor_stop.wait(0.25):
+            partials = list(cache_dir.rglob("*.incomplete"))
+            if partials:
+                done = max(p.stat().st_size for p in partials)
+                d.update(state="downloading", msg="Downloading through Hugging Face", done=done, total=total)
+
+    monitor_thread = threading.Thread(target=monitor, daemon=True)
+    monitor_thread.start()
+    try:
+        model_file = Path(hf_hub_download(repo_id=repo, filename=filename, repo_type="model",
+                                          cache_dir=str(cache_dir)))
+    finally:
+        monitor_stop.set()
+        monitor_thread.join(timeout=1)
+    if total:
+        d.update(state="downloading", msg="Downloading through Hugging Face", done=total, total=total)
     modelfile = DATA_DIR / f".{_slug(ref)}.Modelfile"
     modelfile.write_text(f"FROM {model_file}\n", encoding="utf-8")
     try:
