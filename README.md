@@ -147,3 +147,8 @@ It lists what will be deleted and asks before doing anything.
 | `install.sh`, `uninstall.sh`, `export-data.sh` | Setup, removal, and data export |
 | `VERSION` | The version number the update check compares against |
 | `requirements.txt` | Exact Python package versions |
+
+## Changelog
+
+- **1.0.1**: Test release to confirm the in-app updater works end to end. No functional changes.
+- **1.0.0**: First release.
