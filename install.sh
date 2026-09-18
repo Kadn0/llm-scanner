@@ -84,6 +84,24 @@ if [ -n "$DATA_FILE" ]; then
   DATA_DIR_SRC="$DATA_DIR_SRC/llm-scanner-data"
   [ -d "$DATA_DIR_SRC" ] || fail "$DATA_FILE isn't an LLM Scanner data export."
 fi
+. /etc/os-release 2>/dev/null || true
+if [ "${NAME:-}" = "Pop!_OS" ]; then
+  info "System: ${PRETTY_NAME:-Pop!_OS}"
+else
+  warn "This installer is made for Pop!_OS 24.04. You're on ${PRETTY_NAME:-an unknown system}; it may still work."
+fi
+# NVIDIA card present but no working driver (e.g. Pop!_OS installed from the non-NVIDIA download)?
+if grep -qs 0x10de /sys/bus/pci/devices/*/vendor && ! { command -v nvidia-smi >/dev/null && nvidia-smi -L >/dev/null 2>&1; }; then
+  warn "An NVIDIA graphics card was found, but its driver isn't working, so models would run on the CPU (slowly)."
+  warn "Install the driver, reboot, then run this installer again:"
+  warn "    sudo apt install -y system76-driver-nvidia && sudo reboot"
+  if [ -t 0 ]; then
+    read -r -p "    Continue without the NVIDIA driver anyway? [y/N] " answer
+    [[ "$answer" =~ ^[Yy]$ ]] || exit 1
+  else
+    fail "Install the NVIDIA driver first (command above), reboot, then run the installer again."
+  fi
+fi
 GPU="none"
 if command -v nvidia-smi >/dev/null && nvidia-smi -L >/dev/null 2>&1; then
   GPU="nvidia"; info "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1)"

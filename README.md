@@ -17,23 +17,56 @@ security weaknesses with [garak](https://github.com/NVIDIA/garak). It runs entir
 - **Housekeeping**: models load only while in use, a live GPU/RAM status bar, start at boot, and one-click
   verified updates for LLM Scanner, Ollama, and garak.
 
-## Install
+## Set up on a fresh Pop!_OS install
 
-On a Linux machine (x86_64), run:
+LLM Scanner is made for **Pop!_OS 24.04** (COSMIC desktop). Starting from a freshly installed system:
+
+### 1. Install Pop!_OS with the NVIDIA driver
+
+- If the machine has an **NVIDIA** graphics card, install Pop!_OS from the **NVIDIA** download on
+  [system76.com/pop](https://system76.com/pop). The driver comes preinstalled.
+- If you already installed the standard download on an NVIDIA machine, add the driver and restart:
+
+  ```bash
+  sudo apt install -y system76-driver-nvidia
+  sudo reboot
+  ```
+
+- Check it works with `nvidia-smi` in a terminal; it should list your graphics card. (Machines without NVIDIA
+  graphics skip this step; image models use Vulkan and everything else runs on the CPU.)
+
+### 2. Update the system
+
+Open the **COSMIC Store** and install all updates, or run this, then restart:
+
+```bash
+sudo apt update && sudo apt full-upgrade -y
+```
+
+### 3. Install LLM Scanner
+
+Open **Terminal** and run:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Kadn0/llm-scanner/main/install.sh | bash
 ```
 
-Or clone the repository and run the installer:
+No sudo is needed; everything goes into your home folder. It downloads about 8 GB (mostly PyTorch, which garak
+needs, plus Ollama), so expect 10 to 20 minutes. When it finishes, LLM Scanner opens in Firefox.
 
-```bash
-git clone https://github.com/Kadn0/llm-scanner.git
-cd llm-scanner
-./install.sh
-```
+### 4. Add models
 
-The installer sets up:
+- **Chat model**: on the **Models** tab, search (for example `gemma` on Hugging Face or `qwen3` on Ollama),
+  choose a repository, and click **Download**. The recommended version is picked to fit your graphics memory.
+- **Image model**: on the **Images** tab, click **Download** next to Z-Image Turbo, or search for another.
+
+### 5. That's it
+
+- LLM Scanner starts automatically at boot and opens in Firefox when you log in.
+- It's also in your app launcher as **LLM Scanner**, and at http://127.0.0.1:7861.
+- New versions appear as an **Update LLM Scanner** button at the top of the app.
+
+### What gets installed
 
 | Part | Purpose | Location |
 |---|---|---|
@@ -43,38 +76,32 @@ The installer sets up:
 | garak, Gradio, PyTorch | Scanner and app packages (exact pinned versions) | `~/llm-scanner/.venv` |
 | uv | Python and package installer | `~/.local/bin/uv` |
 
-It also adds LLM Scanner to your app menu, starts it at boot, and opens it in your browser when you log in. The
-first install downloads about 6 GB of Python packages (mostly PyTorch, which garak needs), so it takes a while.
-
-Options:
+Installer options:
 
 | Option | Effect |
 |---|---|
 | `--data FILE` | Restore data exported from another machine (see below) |
 | `--pull-models` | With `--data`, also re-download that machine's Ollama chat models |
-| `--no-autostart` | Don't open the app in your browser at login |
+| `--no-autostart` | Don't open the app in Firefox at login |
 | `--no-start` | Install, but don't start it yet |
 
-## Move to a new machine
+To install from a clone instead: `git clone https://github.com/Kadn0/llm-scanner.git && cd llm-scanner && ./install.sh`
 
-Models aren't copied, since they're large and easy to download again. Your data is copied separately:
+## Move to a new machine (optional)
 
-1. On the old machine, export your chats, images, probe groups, scan reports, and model list:
+A fresh install starts empty: no models, chats, images, or reports. If you do want to bring your chats, images,
+probe groups, and scan reports along (models are never copied), export them on the old machine:
 
-   ```bash
-   ~/llm-scanner/export-data.sh
-   ```
+```bash
+~/llm-scanner/export-data.sh
+```
 
-   This creates `~/llm-scanner-data-DATE.tar.gz`.
+Copy the file it creates to the new machine and install with it:
 
-2. Copy that file to the new machine, then install with it:
-
-   ```bash
-   curl -fsSL https://raw.githubusercontent.com/Kadn0/llm-scanner/main/install.sh -o install.sh
-   bash install.sh --data llm-scanner-data-DATE.tar.gz --pull-models
-   ```
-
-3. Image models you used appear in the Images tab with a **Download** button.
+```bash
+curl -fsSL https://raw.githubusercontent.com/Kadn0/llm-scanner/main/install.sh -o install.sh
+bash install.sh --data llm-scanner-data-DATE.tar.gz --pull-models
+```
 
 ## Updates
 
@@ -104,16 +131,14 @@ Every machine sees the update within 6 hours, or immediately after a restart.
 
 ## Requirements
 
-- Linux on 64-bit Intel/AMD (x86_64). Built and tested on Pop!_OS 24.04 (Ubuntu based).
-- `curl` and `tar`. `zstd` is optional and makes the Ollama download smaller.
-- A systemd desktop session (standard on Ubuntu, Pop!_OS, Fedora, Debian, and most others).
-- About 10 GB of disk for the install, plus room for models.
-- GPU, optional but recommended:
-  - **NVIDIA** with the proprietary driver: chat and image models use the GPU.
-  - **Other GPUs** with Vulkan drivers: image models use the GPU; chat models may use the CPU.
-  - **No GPU**: everything works on the CPU, much more slowly.
+- **Pop!_OS 24.04** (x86_64). Other Ubuntu-based systems may work, but aren't tested.
+- About 10 GB of free disk for the install, plus room for models (each is typically 2 to 20 GB).
+- An NVIDIA graphics card is strongly recommended. With 8 GB of graphics memory, models up to about 7.5 GB run
+  fully on the GPU; bigger ones run partly in system memory, which is slower. 32 GB or more of system memory helps.
+- An internet connection for the install, model downloads, and update checks. Once models are downloaded,
+  chatting, image generation, and scanning all run offline.
 
-The app detects your video memory and recommends model versions that fit it.
+The app detects your graphics memory and recommends model versions that fit it.
 
 ## Troubleshooting
 
@@ -122,7 +147,8 @@ The app detects your video memory and recommends model versions that fit it.
 | The page won't load | `systemctl --user status llm-scanner` and `journalctl --user -u llm-scanner -n 50` |
 | Chat models don't respond | `systemctl --user status ollama` and `~/.local/bin/ollama list` |
 | Image generation fails | Check `~/.local/sd-cpp/sd-cli` exists; re-run `install.sh` to reinstall it |
-| It doesn't start at boot | Your system didn't allow start-at-boot without sudo. Run `sudo loginctl enable-linger $USER` once |
+| The installer says the NVIDIA driver isn't working | `sudo apt install -y system76-driver-nvidia`, reboot, run the installer again |
+| It doesn't start at boot | Run `sudo loginctl enable-linger $USER` once |
 | The page looks wrong after an update | Reload the page |
 | Anything else | `systemctl --user restart ollama llm-scanner` |
 
