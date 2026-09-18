@@ -439,7 +439,68 @@ class Downloads(TempDataTest):
         app._set_pending("a", True)
         app._set_pending("b", True)
         app._set_pending("a", False)
-        self.assertEqual(app._pending(), ["b"])
+        self.assertEqual(app._pending(), [("b", False)])
+        app._set_pending("b", True, paused=True)
+        self.assertEqual(app._pending(), [("b", True)])
+
+    def test_old_pending_format_still_resumes(self):
+        app.DOWNLOADS_FILE.write_text(json.dumps(["m:1", "m:2"]))  # written by 1.0.11 and earlier
+        with mock.patch.object(app, "start_download") as start:
+            app.resume_pending_downloads()
+        self.assertEqual([c.args[0] for c in start.call_args_list], ["m:1", "m:2"])
+
+    def test_paused_priority_download_does_not_hold_others(self):
+        app._downloads["p"] = {"state": "paused", "msg": "", "done": 0, "total": 0, "cancel": False, "pause": True}
+        app._priority["ref"] = "p"
+        self.assertFalse(app._yield_to_priority("other"))
+        app._downloads["p"]["pause"] = False
+        app._downloads["p"]["state"] = "downloading"
+        self.assertTrue(app._yield_to_priority("other"))
+
+    def test_run_download_restarts_worker_resumed_while_stopping(self):
+        app._downloads["r"] = {"state": "queued", "msg": "", "done": 0, "total": 0, "cancel": False, "running": True}
+        calls = []
+
+        def worker(ref):
+            calls.append(ref)
+            # 1st run: stopped for a pause, but the user already pressed resume; 2nd run: finishes
+            app._downloads[ref]["state"] = "paused" if len(calls) == 1 else "done"
+
+        with mock.patch.object(app, "_download_worker", worker):
+            app._run_download("r")
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(app._downloads["r"]["running"])
+
+    def test_row_icons_match_state(self):
+        base = {"msg": "", "done": 1, "total": 4, "cancel": False}
+        app._downloads["run"] = {**base, "state": "downloading"}
+        app._downloads["held"] = {**base, "state": "paused", "pause": True}
+        app._downloads["fin"] = {**base, "state": "failed"}
+        out = app.downloads_html()
+        run, held, fin = (out[out.index(f'title="{r}"'):] for r in ("run", "held", "fin"))
+        self.assertIn('class="dl-toggle pause"', run.split('class="dl"')[0])
+        self.assertIn('title="Delete download"', run.split('class="dl"')[0])
+        self.assertIn('class="dl-toggle resume"', held.split('class="dl"')[0])
+        self.assertNotIn("dl-toggle", fin.split('class="dl"')[0])
+        self.assertIn('title="Remove from list"', fin.split('class="dl"')[0])
+        self.assertEqual(app.active_downloads(), ["run"])  # paused ones aren't offered for priority
+
+    def test_pause_and_resume_controls(self):
+        app._downloads["r"] = {"state": "downloading", "msg": "", "done": 0, "total": 0, "cancel": False,
+                               "running": True}
+        app.toggle_download("pause:r")
+        self.assertEqual((app._downloads["r"]["state"], app._downloads["r"]["pause"]), ("paused", True))
+        self.assertEqual(app._pending(), [("r", True)])
+        with mock.patch.object(app, "_start_worker") as start:
+            app.toggle_download("resume:r")
+        start.assert_not_called()  # its worker is still winding down; _run_download picks it up again
+        self.assertFalse(app._downloads["r"]["pause"])
+        self.assertEqual(app._pending(), [("r", False)])
+        app._downloads["r"].update(pause=True, running=False)
+        with mock.patch.object(app, "_start_worker") as start:
+            app.toggle_download("resume:r")
+        start.assert_called_once_with("r")
+        self.assertEqual(app.toggle_download("pause:unknown")[1], "")
 
     def test_start_download_rejects_duplicates(self):
         with mock.patch.object(app.threading, "Thread"):
@@ -514,6 +575,50 @@ class HuggingFaceImport(TempDataTest):
         self.assertIn("FROM ", created[0])
         self.assertEqual(list(app.HF_DOWNLOADS.iterdir()), [], "the downloaded copy must be deleted after import")
 
+    def test_vision_model_imports_its_projector(self):
+        tree = [{"path": "SmolVLM-Q8_0.gguf", "size": 4}, {"path": "SmolVLM-f16.gguf", "size": 8},
+                {"path": "mmproj-SmolVLM-f16.gguf", "size": 3}, {"path": "mmproj-SmolVLM-Q8_0.gguf", "size": 2}]
+        app._downloads.clear()
+        ref = "hf.co/ggml-org/SmolVLM-GGUF:Q8_0"
+        app._downloads[ref] = {"state": "queued", "msg": "", "done": 0, "total": 0, "cancel": False}
+        modelfiles = []
+
+        def fake_run(cmd, **kw):
+            modelfiles.append(Path(cmd[-1]).read_text())
+            return mock.Mock(returncode=0)
+        with mock.patch.object(app.requests, "get", side_effect=self.fake_get([[b"GGUF"], [b"PJ"]], tree=tree)), \
+                mock.patch.object(app.subprocess, "run", fake_run):
+            app._download_worker(ref)
+        self.assertEqual(app._downloads[ref]["state"], "done")
+        urls = [u for u, _ in self.gets if "/resolve/" in u]
+        self.assertTrue(urls[0].endswith("/SmolVLM-Q8_0.gguf") and urls[1].endswith("/mmproj-SmolVLM-Q8_0.gguf"), urls)
+        self.assertEqual(modelfiles[0].count("FROM "), 2)
+        self.assertEqual(list(app.HF_DOWNLOADS.iterdir()), [])
+
+    def test_projector_is_never_picked_as_the_model(self):
+        tree = [{"path": "mmproj-Q8_0.gguf", "size": 1}, {"path": "x/Model-Q8_0.gguf", "size": 9}]
+        with mock.patch.object(app.requests, "get", return_value=FakeResponse(tree)):
+            files = app._hf_gguf_files("a/b", "Q8_0")
+        self.assertEqual([f for f, _ in files], ["x/Model-Q8_0.gguf", "mmproj-Q8_0.gguf"])
+
+    def test_blocked_redirect_as_http_error_also_imports(self):
+        """Ollama sometimes returns the redirect failure as an HTTP 400/500 response instead of in the stream."""
+        body = {"error": 'Head "https://us.aws.cdn.hf.co/xet-bridge-us/abc?Signature=x": blocked redirect to a different host'}
+        for status in (400, 500):
+            with self.subTest(status=status), \
+                    mock.patch.object(app.requests, "post", return_value=FakeResponse(body, status=status)):
+                app._downloads.clear()
+                d, created = self.run_worker(self.fake_get([[b"GGUF", b"data"]]))
+                self.assertEqual(d["state"], "done", d["msg"])
+                self.assertEqual(len(created), 1)
+
+    def test_other_http_errors_still_fail(self):
+        with mock.patch.object(app.requests, "post",
+                               return_value=FakeResponse({"error": "pull model manifest: file does not exist"}, status=400)):
+            d, _ = self.run_worker(self.fake_get([]))
+        self.assertEqual(d["state"], "failed")
+        self.assertIn("HTTP 400", d["msg"])
+
     def test_interrupted_download_resumes_with_range(self):
         def flaky():
             calls = iter([[b"GGUF"], app.requests.ConnectionError("drop"), [b"data"]])
@@ -572,6 +677,91 @@ class HuggingFaceImport(TempDataTest):
         d, _ = self.run_worker(get)
         self.assertEqual(d["state"], "cancelled")
         self.assertEqual([p.name for p in app.HF_DOWNLOADS.iterdir()], [])
+
+
+class PauseResumeDelete(HuggingFaceImport):
+    """Pause keeps the partial file for later, resume continues it with a range request, delete removes it."""
+
+    def test_pause_keeps_partial_file_and_resume_continues(self):
+        class PausedMidway(FakeResponse):
+            def iter_content(inner, n):
+                yield b"GGUF"
+                app.toggle_download(f"pause:{self.REF}")  # pressed after the first bytes arrived
+                yield b"data"
+
+        def get(url, **kw):
+            return FakeResponse(self.TREE) if "/api/models/" in url else PausedMidway()
+        d, created = self.run_worker(get)
+        part = app.HF_DOWNLOADS / (app._slug(self.REF) + ".gguf.part")
+        self.assertEqual(d["state"], "paused")
+        self.assertEqual(part.read_bytes(), b"GGUF")
+        self.assertEqual(app._pending(), [(self.REF, True)])
+        self.assertEqual(created, [])
+
+        d["pause"] = False
+        ranges = []
+
+        def get2(url, **kw):
+            ranges.append((kw.get("headers") or {}).get("Range"))
+            if "/api/models/" in url:
+                return FakeResponse(self.TREE)
+            return FakeResponse(lines=[b"data"], status=206)
+        with mock.patch.object(app.requests, "get", side_effect=get2), \
+                mock.patch.object(app.subprocess, "run", return_value=mock.Mock(returncode=0)):
+            app._download_worker(self.REF)
+        self.assertEqual(d["state"], "done")
+        self.assertIn("bytes=4-", ranges)
+        self.assertEqual(app._pending(), [])
+
+    def test_delete_paused_download_removes_partial_file_now(self):
+        app.HF_DOWNLOADS.mkdir(parents=True)
+        part = app.HF_DOWNLOADS / (app._slug(self.REF) + ".gguf.part")
+        part.write_bytes(b"GG")
+        app._downloads[self.REF] = {"state": "paused", "msg": "Paused", "done": 2, "total": 8, "cancel": False,
+                                    "pause": True, "running": False}
+        app._set_pending(self.REF, True, paused=True)
+        app.remove_download(self.REF)
+        self.assertFalse(part.exists())
+        self.assertEqual(app._downloads[self.REF]["state"], "cancelled")
+        self.assertEqual(app._pending(), [])
+        self.assertIn("No active downloads", app.downloads_html())
+
+    def test_restart_keeps_paused_downloads_paused(self):
+        app.HF_DOWNLOADS.mkdir(parents=True)
+        (app.HF_DOWNLOADS / (app._slug(self.REF) + ".gguf.part")).write_bytes(b"xxx")
+        app.DOWNLOADS_FILE.write_text(json.dumps([{"ref": self.REF, "paused": True}, "m:1"]))
+        with mock.patch.object(app, "start_download") as start:
+            app.resume_pending_downloads()
+        self.assertEqual([c.args[0] for c in start.call_args_list], ["m:1"])
+        d = app._downloads[self.REF]
+        self.assertEqual((d["state"], d["pause"], d["done"]), ("paused", True, 3))
+        self.assertIn('class="dl-toggle resume"', app.downloads_html())
+
+
+class DeleteModels(unittest.TestCase):
+    def test_needs_confirmation(self):
+        with mock.patch.object(app.requests, "delete") as delete:
+            app.delete_model("m", False)
+        delete.assert_not_called()
+
+    def test_deletes_and_refreshes_the_list(self):
+        with mock.patch.object(app.requests, "delete", return_value=FakeResponse(status=200)) as delete:
+            note, version = app.delete_model("qwen3:8b", True)
+        self.assertEqual(delete.call_args.kwargs["json"], {"model": "qwen3:8b"})
+        self.assertIn("Deleted qwen3:8b.", note)
+        self.assertIsInstance(version, float)
+
+    def test_reports_ollama_errors(self):
+        with mock.patch.object(app.requests, "delete", return_value=FakeResponse({"error": "model not found"}, status=404)):
+            note, _ = app.delete_model("gone", True)
+        self.assertIn("HTTP 404", note)
+        self.assertIn("model not found", note)
+        self.assertIn("error", note)
+
+    def test_ollama_not_running(self):
+        with mock.patch.object(app.requests, "delete", side_effect=app.requests.ConnectionError("refused")):
+            note, _ = app.delete_model("m", True)
+        self.assertIn("Ollama is not running", note)
 
 
 class FetchFile(TempDataTest):
@@ -723,6 +913,20 @@ class ProbesAndGroups(TempDataTest):
                 self.assertTrue(s in app.CATALOG or s in app.MODULES, f"{name}: {s} is not a garak probe")
             if specs:
                 self.assertTrue(app.expand(specs), name)
+
+    def test_owasp_preset_covers_every_testable_category(self):
+        probes, desc = app.PRESETS["OWASP Top 10 for LLMs"]
+        self.assertGreater(len(probes), 20)
+        self.assertTrue(all(app.CATALOG[p]["active"] for p in probes))
+        self.assertTrue(all(any(t.startswith("owasp:") for t in app.CATALOG[p]["tags"]) for p in probes))
+        tagged = {t for p in probes for t in app.CATALOG[p]["tags"] if t.startswith("owasp:")}
+        for n, v in app.CATALOG.items():  # no active OWASP-tagged probe is left out
+            if v["active"] and tagged & set(v["tags"]):
+                self.assertIn(n, probes)
+        self.assertIn("LLM01", desc)
+        self.assertEqual(app.resolve_scan("OWASP Top 10 for LLMs", []), (probes, None))
+        self.assertEqual(list(app.PRESETS)[-1], "Full scan")
+        self.assertIn("Preset: OWASP Top 10 for LLMs", app.group_choices())
 
     def test_expand_dedupes_and_ignores_unknown(self):
         probe = next(iter(app.CATALOG))

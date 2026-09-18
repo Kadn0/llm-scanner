@@ -17,6 +17,38 @@
       }
     });
   }, true);
+  // A highlight that slides to the selected item, for the page tabs, sub-tabs and two-way switches
+  // (Hugging Face / Ollama, report views), instead of the selection jumping from one item to the next.
+  const gliderGroups = () => [
+    ...[...document.querySelectorAll('[role="tablist"]')].map((el) => [el, 'button[role="tab"][aria-selected="true"]']),
+    ...[...document.querySelectorAll('.segmented .wrap:has(> label)')].map((el) => [el, 'label.selected, label:has(input:checked)']),
+  ];
+  const placeGliders = () => {
+    for (const [group, selector] of gliderGroups()) {
+      let glider = group.querySelector(':scope > .glider');
+      if (!glider) {
+        glider = document.createElement('span');
+        glider.className = 'glider';
+        glider.setAttribute('aria-hidden', 'true');
+        group.prepend(glider);
+        group.classList.add('has-glider');
+      }
+      const item = group.querySelector(selector);
+      if (!item || !item.offsetWidth) { glider.style.opacity = '0'; continue; }
+      glider.style.opacity = '';
+      glider.style.width = `${item.offsetWidth}px`;
+      glider.style.height = `${item.offsetHeight}px`;
+      glider.style.transform = `translate(${item.offsetLeft}px, ${item.offsetTop}px)`;
+      if (!glider.classList.contains('ready')) requestAnimationFrame(() => glider.classList.add('ready'));  // no slide on first paint
+    }
+  };
+  let gliderFrame = 0;
+  const queueGliders = () => { cancelAnimationFrame(gliderFrame); gliderFrame = requestAnimationFrame(placeGliders); };
+  new MutationObserver(queueGliders).observe(document.body, {subtree: true, attributes: true, attributeFilter: ['class', 'aria-selected']});
+  window.addEventListener('resize', queueGliders);
+  document.addEventListener('click', () => setTimeout(queueGliders, 0), true);
+  setInterval(placeGliders, 1500);  // tabs rendered later (sub-tabs, lazy panels)
+
   // Scrolling an open dropdown list (repository, version, ...) must not scroll the page behind it, even when the
   // list is too short to scroll or has reached its end.
   document.addEventListener('wheel', (e) => {
@@ -80,7 +112,7 @@
       return ['Delete report?', `${report.trim()} and all of its files will be permanently deleted. This cannot be undone.`];
     }
     if (btn.matches('.dl-del')) {
-      return ['Stop download?', `${btn.dataset.ref} will be stopped and removed from downloads. Partially downloaded data is cleaned up the next time Ollama restarts.`, 'Stop download'];
+      return ['Delete download?', `${btn.dataset.ref} will be stopped and removed from downloads, and its partially downloaded data deleted. Use pause instead to continue it later.`, 'Delete download'];
     }
     return null;
   };
@@ -91,8 +123,9 @@
     if (btn.dataset.confirmed === '1') { delete btn.dataset.confirmed; return; }  // let the confirmed click through
     e.preventDefault();
     e.stopImmediatePropagation();
-    const text = confirmText(btn);
-    if (!text || !(await askConfirm(...text))) return;
+    const finished = btn.matches('.dl-del') && btn.dataset.active === '0';  // just clears a finished row
+    const text = finished ? null : confirmText(btn);
+    if (!finished && (!text || !(await askConfirm(...text)))) return;
     if (btn.matches('.g-del')) {
       const box = document.querySelector('#img-del-name textarea, #img-del-name input');
       box.value = btn.dataset.name;
@@ -110,6 +143,18 @@
     btn.dataset.confirmed = '1';
     btn.click();
   }, true);
+
+  // Pause / resume icon on a download (no confirmation: nothing is lost).
+  document.addEventListener('click', (e) => {
+    const btn = e.target.closest('button.dl-toggle');
+    if (!btn) return;
+    const box = document.querySelector('#dl-toggle-ref textarea, #dl-toggle-ref input');
+    box.value = btn.dataset.action;
+    box.dispatchEvent(new Event('input', {bubbles: true}));
+    btn.classList.toggle('pause');
+    btn.classList.toggle('resume');  // flip the icon right away; the list refreshes within two seconds
+    setTimeout(() => document.querySelector('#dl-toggle-btn').click(), 80);
+  });
 
   // Long messages (yours or the AI's) collapse to a preview with Show more / Show less underneath.
   const COLLAPSE_AT = 420;

@@ -25,13 +25,13 @@ import requests
 import analyst_report
 
 APP_DIR = Path(__file__).resolve().parent
-DATA_DIR = APP_DIR / "data"
-DATA_DIR.mkdir(exist_ok=True)
+DATA_DIR = Path(os.environ.get("LLM_SCANNER_DATA") or APP_DIR / "data")  # overridable so tests use a scratch folder
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 OLLAMA = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 HF_API = "https://huggingface.co/api"
-OLLAMA_WEB = "https://ollama.com"
-GARAK_RUNS = Path.home() / ".local/share/garak/garak_runs"
+OLLAMA_WEB = os.environ.get("LLM_SCANNER_OLLAMA_WEB", "https://ollama.com")  # overridable for tests
+GARAK_RUNS = Path(os.environ.get("LLM_SCANNER_GARAK_RUNS") or Path.home() / ".local/share/garak/garak_runs")
 GROUPS_FILE = DATA_DIR / "probe_groups.json"
 PY = sys.executable
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -124,8 +124,8 @@ def _meter(pct, cls=""):
     return f'<span class="meter {cls}"><i class="{tone}" style="width:{pct:.0f}%"></i></span>'
 
 
-def status_html():
-    v = ollama_up()
+def status_html(v=None):
+    v = v or ollama_up()
     pills = [f'<span class="pill"><span class="dot ok"></span>Ollama {v}</span>' if v else
              '<span class="pill"><span class="dot bad"></span>Ollama stopped</span>']
     g = gpu_live()
@@ -192,16 +192,43 @@ def unload_models():
 
 
 def status_controls():
-    return status_html(), gr.update(visible=bool(loaded_models()))
+    """Status bar plus its buttons: Start when Ollama is stopped; Stop and Restart while it runs."""
+    v = ollama_up()
+    return (status_html(v), gr.update(visible=bool(v and loaded_models())), gr.update(visible=not v),
+            gr.update(visible=bool(v)), gr.update(visible=bool(v)))
+
+
+def _ollama_service(action, want_up):
+    """systemctl start/stop/restart the Ollama user service, then wait until it is up (or down)."""
+    subprocess.run(["systemctl", "--user", action, "ollama"], check=False)
+    for _ in range(40):
+        if bool(ollama_up()) == want_up:
+            break
+        time.sleep(0.5)
+    return status_controls()
+
+
+def _scan_running():
+    return bool(_proc.get("p") and _proc["p"].poll() is None)
 
 
 def start_ollama():
-    subprocess.run(["systemctl", "--user", "start", "ollama"], check=False)
-    for _ in range(20):
-        if ollama_up():
-            break
-        time.sleep(0.5)
-    return status_html()
+    return _ollama_service("start", True)
+
+
+def stop_ollama():
+    """Stop Ollama. Models unload; downloads wait and resume when it starts again."""
+    if _scan_running():
+        gr.Warning("A scan is using Ollama. Stop the scan first.")
+        return status_controls()
+    return _ollama_service("stop", False)
+
+
+def restart_ollama():
+    if _scan_running():
+        gr.Warning("A scan is using Ollama. Stop the scan first.")
+        return status_controls()
+    return _ollama_service("restart", True)
 
 
 def pump_output(p, on_text, on_exit):
@@ -589,8 +616,12 @@ def delete_model(name, confirmed):
     """Remove a model from Ollama; its files are deleted from disk."""
     if not confirmed:
         return gr.update(), gr.update()
-    r = requests.delete(f"{OLLAMA}/api/delete", json={"model": name}, timeout=60)
-    msg = f"Deleted {name}." if r.ok else f"Could not delete {name}: {r.text}"
+    try:
+        r = requests.delete(f"{OLLAMA}/api/delete", json={"model": name}, timeout=60)
+    except requests.RequestException:
+        msg = f"Could not delete {name}: Ollama is not running. Start it at the top of the page and try again."
+        return note_html(msg, "error"), gr.update()
+    msg = f"Deleted {name}." if r.ok else response_error(r, f"Deleting {name}")
     return note_html(msg, "" if r.ok else "error"), time.time()
 
 
@@ -1233,7 +1264,7 @@ def version_changed(repo, version):
 
 # ---------------------------------------------------------------- downloads (background, resumable)
 DOWNLOADS_FILE = DATA_DIR / "downloads.json"
-_downloads = {}  # ref -> {"state", "msg", "done", "total", "cancel"}
+_downloads = {}  # ref -> {"state", "msg", "done", "total", "cancel", "pause", "running"}
 _dl_lock = threading.Lock()
 _dl_finished = {"count": 0}
 ACTIVE = ("queued", "downloading", "waiting", "paused")
@@ -1244,14 +1275,21 @@ _priority = {"ref": None}
 def _yield_to_priority(ref):
     """True while another download has priority and is still running."""
     p = _priority["ref"]
-    return bool(p and p != ref and _downloads.get(p, {}).get("state") in ACTIVE)
+    other = _downloads.get(p, {})
+    return bool(p and p != ref and other.get("state") in ACTIVE and not other.get("pause"))
+
+
+def _should_stop(ref, d):
+    return d["cancel"] or d.get("pause") or _yield_to_priority(ref)
 
 
 def _pending():
+    """[(ref, paused)] for downloads to continue after a restart."""
     try:
-        return json.loads(DOWNLOADS_FILE.read_text())
+        entries = json.loads(DOWNLOADS_FILE.read_text())
     except Exception:
         return []
+    return [(e, False) if isinstance(e, str) else (e["ref"], bool(e.get("paused"))) for e in entries]
 
 
 class PermanentDownloadError(Exception):
@@ -1303,16 +1341,23 @@ def fetch_file(url, dest, size, should_stop, on_progress):
 HF_DOWNLOADS = DATA_DIR / "hf-downloads"  # GGUF files waiting to be imported into Ollama; deleted once imported
 
 
-def _hf_gguf_file(repo, tag):
-    """(path, size) of the GGUF file in a Hugging Face repo that an Ollama quantization tag like Q4_K_M means."""
+def _hf_gguf_files(repo, tag):
+    """[(path, size)] to import for an Ollama quantization tag like Q4_K_M: the model's GGUF file, plus the image
+    projector (mmproj) if the repo has one, which vision models need to see images."""
     res = requests.get(f"{HF_API}/models/{repo}/tree/main", params={"recursive": "true"}, timeout=30)
     _check_response(res, f"Listing files of {repo}")
+    ggufs = [(e["path"], int(e.get("size") or 0)) for e in res.json() if e.get("path", "").lower().endswith(".gguf")]
+    stem = lambda path: path.rsplit("/", 1)[-1][:-5]  # noqa: E731
     wanted = re.compile(rf"(^|[-_.]){re.escape(tag.removesuffix('.gguf'))}$", re.I)
-    candidates = [(e["path"], int(e.get("size") or 0)) for e in res.json()
-                  if e.get("path", "").lower().endswith(".gguf") and wanted.search(e["path"].rsplit("/", 1)[-1][:-5])]
-    if not candidates:
+    models = [g for g in ggufs if "mmproj" not in g[0].lower() and wanted.search(stem(g[0]))]
+    if not models:
         raise PermanentDownloadError(f"{repo} has no single-file GGUF for {tag}")
-    return min(candidates, key=lambda c: len(c[0]))
+    files = [min(models, key=lambda g: len(g[0]))]
+    projectors = [g for g in ggufs if "mmproj" in g[0].lower()]
+    if projectors:  # prefer the one matching the model's quantization, then full precision
+        rank = lambda g: (not wanted.search(stem(g[0])), not re.search(r"f16|bf16", stem(g[0]), re.I), g[1])  # noqa: E731
+        files.append(min(projectors, key=rank))
+    return files
 
 
 def _hf_import(ref, d):
@@ -1323,25 +1368,26 @@ def _hf_import(ref, d):
     if not m:
         raise PermanentDownloadError(f"{ref} is not a Hugging Face model reference")
     repo, tag = m.groups()
-    path, total = _hf_gguf_file(repo, tag)
+    files = _hf_gguf_files(repo, tag)
     HF_DOWNLOADS.mkdir(parents=True, exist_ok=True)
-    dest = HF_DOWNLOADS / f"{_slug(ref)}.gguf"
-    part = dest.with_name(dest.name + ".part")
+    dests = _hf_import_files(ref)[:len(files)]
+    total = sum(size for _, size in files)
 
     def progress():
-        d.update(state="downloading", msg="Downloading", done=part.stat().st_size if part.exists() else 0, total=total)
+        d.update(state="downloading", msg="Downloading", total=total, done=sum(
+            f.stat().st_size for dest in dests for f in (dest, dest.with_name(dest.name + ".part")) if f.exists()))
 
-    if not dest.exists():
-        progress()
-        if not fetch_file(HF_RESOLVE.format(repo=repo, path=path), dest, total,
-                          lambda: d["cancel"] or _yield_to_priority(ref), progress):
-            return False
+    for (path, size), dest in zip(files, dests):
+        if not dest.exists():
+            progress()
+            if not fetch_file(HF_RESOLVE.format(repo=repo, path=path), dest, size, lambda: _should_stop(ref, d), progress):
+                return False
     d.update(state="downloading", msg="Importing into Ollama", done=total, total=total)
     ollama_cli = OLLAMA_DIR / "bin/ollama"
     if not ollama_cli.exists():
         ollama_cli = Path(shutil.which("ollama") or "ollama")
     modelfile = HF_DOWNLOADS / f"{_slug(ref)}.Modelfile"
-    modelfile.write_text(f"FROM {dest}\n", encoding="utf-8")
+    modelfile.write_text("".join(f"FROM {dest}\n" for dest in dests), encoding="utf-8")  # 2nd FROM: the projector
     try:
         result = subprocess.run([str(ollama_cli), "create", ref, "-f", str(modelfile)], capture_output=True, text=True,
                                 timeout=3600, env=os.environ | {"OLLAMA_HOST": OLLAMA})
@@ -1350,25 +1396,84 @@ def _hf_import(ref, d):
     if result.returncode:
         detail = ANSI.sub("", result.stderr or result.stdout or f"exit code {result.returncode}").strip()
         raise RuntimeError(f"Ollama import failed: {detail[-300:]}")
-    dest.unlink(missing_ok=True)  # Ollama keeps its own copy
+    for dest in dests:
+        dest.unlink(missing_ok=True)  # Ollama keeps its own copy
     return True
 
 
-def _set_pending(ref, add):
+def _hf_import_files(ref):
+    """Where _hf_import keeps a model's GGUF and its projector until Ollama has imported them."""
+    return [HF_DOWNLOADS / f"{_slug(ref)}.gguf", HF_DOWNLOADS / f"{_slug(ref)}.mmproj.gguf"]
+
+
+def _set_pending(ref, add, paused=False):
     with _dl_lock:
-        refs = [r for r in _pending() if r != ref] + ([ref] if add else [])
-        DOWNLOADS_FILE.write_text(json.dumps(refs, indent=2))
+        entries = [{"ref": r, "paused": True} if p else r for r, p in _pending() if r != ref]
+        if add:
+            entries.append({"ref": ref, "paused": True} if paused else ref)
+        DOWNLOADS_FILE.write_text(json.dumps(entries, indent=2))
+
+
+def _run_download(ref):
+    """Runs a download's worker on its own thread until it finishes, fails, is deleted or is paused."""
+    d = _downloads[ref]
+    worker = _image_download_worker if ref.startswith("image:") else _download_worker
+    while True:
+        worker(ref)
+        with _dl_lock:
+            if d["state"] == "paused" and not d.get("pause") and not d["cancel"]:
+                continue  # resumed while it was stopping
+            d["running"] = False
+            return
+
+
+def _start_worker(ref):
+    _downloads[ref]["running"] = True
+    threading.Thread(target=_run_download, args=(ref,), daemon=True).start()
 
 
 def start_download(ref):
     with _dl_lock:
-        if _downloads.get(ref, {}).get("state") in ACTIVE:
-            return False
-        _downloads[ref] = {"state": "queued", "msg": "Queued", "done": 0, "total": 0, "cancel": False}
+        d = _downloads.get(ref)
+        if d and d["state"] in ACTIVE:
+            if not d.get("pause"):
+                return False
+            d["pause"] = False  # asking for a paused download again resumes it
+            d.update(state="queued", msg="Resuming")
+            if not d.get("running"):
+                _start_worker(ref)
+        else:
+            _downloads[ref] = {"state": "queued", "msg": "Queued", "done": 0, "total": 0, "cancel": False}
+            _start_worker(ref)
     _set_pending(ref, True)
-    worker = _image_download_worker if ref.startswith("image:") else _download_worker
-    threading.Thread(target=worker, args=(ref,), daemon=True).start()
     return True
+
+
+def _partial_files(ref):
+    """Files a stopped download leaves behind (Ollama discards its own partial pulls when it restarts)."""
+    if ref.startswith("image:"):
+        key = ref.split(":", 1)[1]
+        if key not in image_models():
+            return []
+        return [f.with_name(f.name + ".part") for f in image_model_files(key).values()]
+    if ref.startswith("hf.co/"):
+        return [f for gguf in _hf_import_files(ref) for f in (gguf.with_name(gguf.name + ".part"), gguf)]
+    return []
+
+
+def _worker_stopped(ref, d):
+    """A worker left its loop without finishing: deleted (partial data removed) or paused (kept to resume)."""
+    if d["cancel"]:
+        if d.get("hidden"):
+            for f in _partial_files(ref):
+                f.unlink(missing_ok=True)
+        d.update(state="cancelled", msg="Cancelled")
+        _set_pending(ref, False)
+    elif d.get("pause"):  # (if it was resumed meanwhile, _run_download starts it again)
+        d.update(state="paused", msg="Paused")
+        _set_pending(ref, True, paused=True)
+    else:
+        d.update(state="paused")
 
 
 def _download_worker(ref):
@@ -1376,7 +1481,7 @@ def _download_worker(ref):
     downloaded layers, so every retry (and every app restart) continues where it left off."""
     d = _downloads[ref]
     attempt = 0
-    while not d["cancel"]:
+    while not (d["cancel"] or d.get("pause")):
         if _yield_to_priority(ref):
             d.update(state="paused", msg="Paused for priority download")
             time.sleep(1)
@@ -1396,10 +1501,14 @@ def _download_worker(ref):
                 continue  # cancelled or paused; the loop handles both
             with requests.post(f"{OLLAMA}/api/pull", json={"model": ref, "stream": True},
                                stream=True, timeout=(10, 120)) as r:
-                if r.status_code >= 400:
-                    raise PermanentDownloadError(response_error(r, f"Pulling {ref}"))
+                if r.status_code >= 400:  # Ollama reports some failures, including the Xet redirect, this way
+                    message = response_error(r, f"Pulling {ref}")
+                    if ref.startswith("hf.co/") and "redirect" in message:
+                        d["direct"] = True
+                        continue
+                    raise PermanentDownloadError(message)
                 for line in r.iter_lines():
-                    if d["cancel"] or _yield_to_priority(ref):
+                    if _should_stop(ref, d):
                         break
                     if not line:
                         continue
@@ -1421,7 +1530,7 @@ def _download_worker(ref):
                         _set_pending(ref, False)
                         _dl_finished["count"] += 1
                         return
-            if d["cancel"] or d.get("direct"):
+            if d["cancel"] or d.get("pause") or d.get("direct"):
                 continue
             if _yield_to_priority(ref):
                 continue  # Ollama keeps the partial data; this resumes once the priority download finishes
@@ -1435,10 +1544,7 @@ def _download_worker(ref):
             wait = min(60, 5 * attempt)
             d.update(state="waiting", msg=f"Connection interrupted, resuming in {wait}s")
             time.sleep(wait)
-    if d.get("hidden"):  # removed with the trash icon: delete a partial direct download now
-        (HF_DOWNLOADS / f"{_slug(ref)}.gguf.part").unlink(missing_ok=True)
-    d.update(state="cancelled", msg="Cancelled. Downloaded data is kept, so starting it again resumes.")
-    _set_pending(ref, False)
+    _worker_stopped(ref, d)
 
 
 def prioritize_download(ref):
@@ -1449,31 +1555,54 @@ def prioritize_download(ref):
 
 
 def remove_download(ref):
-    """Trash icon on a download: stop it (if running) and remove it from the list. Ollama discards the
-    partial data the next time it starts, since nothing references it."""
+    """Trash icon on a download: stop it and remove it from the list, deleting its partial data. (Ollama discards
+    partial data of its own pulls the next time it starts, since nothing references it.)"""
     d = _downloads.get(ref)
     if not d:
         return gr.update(), gr.update()
-    if d["state"] in ACTIVE:
-        d["cancel"] = True
-    d["hidden"] = True
+    with _dl_lock:
+        d["hidden"] = True
+        if d["state"] in ACTIVE:
+            d["cancel"] = True
+        running = d.get("running")
+    if not running:  # nothing will clean up after it, e.g. a paused download
+        for f in _partial_files(ref):
+            f.unlink(missing_ok=True)
+        if d["state"] in ACTIVE:
+            d.update(state="cancelled", msg="Cancelled")
     _set_pending(ref, False)
     if _priority["ref"] == ref:
         _priority["ref"] = None
-    return note_html(f"Removed {ref} from downloads."), ""
+    return note_html(f"Deleted {download_label(ref)} from downloads."), ""
 
 
-def cancel_download(ref):
+def toggle_download(action):
+    """Pause or resume icon on a download. action is "pause:<ref>" or "resume:<ref>"."""
+    verb, _, ref = (action or "").partition(":")
     d = _downloads.get(ref)
-    if d and d["state"] in ACTIVE:
-        d["cancel"] = True
-        return f"Cancelling {ref}."
-    return "Choose an active download to cancel."
+    if not d or d["state"] not in ACTIVE:
+        return gr.update(), ""
+    if verb == "pause" and not d.get("pause"):
+        with _dl_lock:
+            d["pause"] = True
+            d.update(state="paused", msg="Paused")
+        _set_pending(ref, True, paused=True)
+        if _priority["ref"] == ref:
+            _priority["ref"] = None
+    elif verb == "resume" and d.get("pause"):
+        start_download(ref)
+    return gr.update(), ""
 
 
 def resume_pending_downloads():
-    for ref in _pending():
-        start_download(ref)
+    """After a restart: continue unfinished downloads, and list paused ones so they can be resumed."""
+    for ref, paused in _pending():
+        if paused:
+            done = sum(f.stat().st_size for f in _partial_files(ref) if f.exists())  # shown until it resumes
+            _downloads[ref] = {"state": "paused", "msg": "Paused", "done": done, "total": 0, "cancel": False,
+                               "pause": True, "running": False}
+        else:
+            start_download(ref)
 
 
 def download_label(ref):
@@ -1492,18 +1621,28 @@ def downloads_html():
     for ref, d in reversed(visible):
         pct = 100 * d["done"] / d["total"] if d["total"] else (100 if d["state"] == "done" else 0)
         size = f'{d["done"]/1e9:.1f} of {d["total"]/1e9:.1f} GB' if d["total"] else ""
-        detail = f'{pct:.0f}%   {size}' if d["state"] == "downloading" and d["total"] else ""
+        detail = f'{pct:.0f}%   {size}' if d["state"] in ("downloading", "paused") and d["total"] else ""
+        if d["state"] == "paused" and not d["total"] and d["done"]:
+            detail = f'{d["done"] / 1e9:.1f} GB downloaded'
+        toggle = ""
+        if d["state"] in ACTIVE:
+            action = "resume" if d.get("pause") else "pause"
+            toggle = (f'<button class="dl-toggle {action}" type="button" title="{action.capitalize()} download" '
+                      f'aria-label="{action.capitalize()} download" data-action="{action}:{html.escape(ref)}"></button>')
+        remove = "Delete download" if d["state"] in ACTIVE else "Remove from list"
         rows.append(
             f'<div class="dl"><div class="dl-top"><span class="dl-name" title="{html.escape(ref)}">{html.escape(download_label(ref))}</span>'
-            f'<span class="dl-state {d["state"]}">{html.escape(d["msg"])}</span>'
-            f'<button class="dl-del" type="button" title="Remove download" data-ref="{html.escape(ref)}"></button></div>'
+            f'<span class="dl-state {d["state"]}">{html.escape(d["msg"])}</span>{toggle}'
+            f'<button class="dl-del" type="button" title="{remove}" aria-label="{remove}" data-ref="{html.escape(ref)}"'
+            f' data-active="{int(d["state"] in ACTIVE)}"></button></div>'
             f'<div class="bar"><div class="fill {d["state"]}" style="width:{pct:.1f}%"></div></div>'
             f'<div class="dl-detail">{detail}</div></div>')
     return "".join(rows)
 
 
 def active_downloads():
-    return [r for r, d in _downloads.items() if d["state"] in ACTIVE and not d.get("hidden")]
+    """Downloads that are running or waiting their turn (not the ones paused with the pause icon)."""
+    return [r for r, d in _downloads.items() if d["state"] in ACTIVE and not d.get("hidden") and not d.get("pause")]
 
 
 def downloads_tick(seen, picked):
@@ -1535,7 +1674,7 @@ def pull_model(source, repo, version):
 
 
 # ---------------------------------------------------------------- image generation (stable-diffusion.cpp)
-SD_DIR = Path.home() / ".local/sd-cpp"
+SD_DIR = Path(os.environ.get("LLM_SCANNER_SD_DIR") or Path.home() / ".local/sd-cpp")
 SD_CLI = SD_DIR / "sd-cli"
 IMAGE_MODEL_DIR = DATA_DIR / "image-models"
 IMAGES_DIR = DATA_DIR / "images"
@@ -1822,9 +1961,9 @@ def _image_download_worker(ref):
     d = _downloads[ref]
     files = [(spec[0], spec[1], dest) for spec, dest in
              zip(image_models()[key]["files"].values(), image_model_files(key).values(), strict=True)]
-    stop = lambda: d["cancel"] or _yield_to_priority(ref)  # noqa: E731
+    stop = lambda: _should_stop(ref, d)  # noqa: E731
     attempt = 0
-    while not d["cancel"]:
+    while not (d["cancel"] or d.get("pause")):
         if _yield_to_priority(ref):
             d.update(state="paused", msg="Paused for priority download")
             time.sleep(1)
@@ -1849,7 +1988,7 @@ def _image_download_worker(ref):
                 if not fetch_file(HF_RESOLVE.format(repo=repo, path=path), dest, size, stop, progress):
                     break
             if stop():
-                continue  # cancelled, or paused for a priority download; the loop handles both
+                continue  # deleted, paused, or waiting for a priority download; the loop handles each
             if image_model_installed(key):
                 d.update(state="done", msg="Done", finished=time.time(), done=total, total=total)
                 _set_pending(ref, False)
@@ -1864,11 +2003,7 @@ def _image_download_worker(ref):
             wait = min(60, 5 * attempt)
             d.update(state="waiting", msg=f"Connection interrupted, resuming in {wait}s")
             time.sleep(wait)
-    if d.get("hidden"):  # removed with the trash icon: delete the partial files now
-        for _, _, dest in files:
-            dest.with_name(dest.name + ".part").unlink(missing_ok=True)
-    d.update(state="cancelled", msg="Cancelled")
-    _set_pending(ref, False)
+    _worker_stopped(ref, d)
 
 
 def image_models_version_html(key):
@@ -2055,12 +2190,28 @@ def load_catalog():
         if "text" not in v.get("modality", {}).get("in", ["text"]):
             continue
         cat[name] = {"module": name.split(".")[0], "desc": (v.get("description") or "").strip().split("\n")[0],
-                     "tier": v.get("tier"), "active": v.get("active", True)}
+                     "tier": v.get("tier"), "active": v.get("active", True), "tags": v.get("tags", [])}
     return dict(sorted(cat.items()))
 
 
 CATALOG = load_catalog()
 MODULES = sorted({v["module"] for v in CATALOG.values()})
+
+
+def owasp_preset():
+    """Every active garak probe mapped to the OWASP Top 10 for LLM Applications, and the categories they cover."""
+    probes = [n for n, v in CATALOG.items() if v["active"] and any(t.startswith("owasp:") for t in v["tags"])]
+    covered = sorted({t.split(":")[1].upper() for n in probes for t in CATALOG[n]["tags"] if t.startswith("owasp:llm")})
+    missing = [f"LLM{i:02d}" for i in range(1, 11) if f"LLM{i:02d}" not in covered]
+    return probes, (f"Every garak probe mapped to the OWASP Top 10 for LLM Applications ({', '.join(covered)}). "
+                    + (f"garak has no tests for {', '.join(missing)} on a standalone model (they concern training data "
+                       "and tool-using apps). " if missing else "") + "Thorough; expect several hours.")
+
+
+_owasp_probes, _owasp_desc = owasp_preset()
+if _owasp_probes:  # an empty list would mean every probe (the full scan)
+    PRESETS = {k: v for k, v in PRESETS.items() if k != "Full scan"} | {
+        "OWASP Top 10 for LLMs": (_owasp_probes, _owasp_desc), "Full scan": PRESETS["Full scan"]}
 
 
 def expand(specs):
@@ -2301,7 +2452,7 @@ def run_scan(model, scan_type, selected, generations, timeout, thinking=False):
         yield "Select a model to scan.", gr.update(), gr.update(), gr.update()
         return
     if not ollama_up():
-        yield "Ollama is not running. Click Start Ollama.", gr.update(), gr.update(), gr.update()
+        yield "Ollama is not running. Start it at the top of the page.", gr.update(), gr.update(), gr.update()
         return
     probes, err = resolve_scan(scan_type, selected)
     if err:
@@ -2541,7 +2692,13 @@ with gr.Blocks(title="LLM Scanner") as ui:
     with gr.Row(elem_classes="statusrow"):
         status = gr.HTML(status_html())
         status_timer = gr.Timer(5.0)
-        start_btn = gr.Button("Start Ollama", variant="secondary", size="sm", scale=0, min_width=120)
+        _up = bool(ollama_up())
+        with gr.Row(equal_height=True, elem_classes="ollama-controls"):  # one pill: "Ollama  Start" or "Stop  Restart"
+            gr.HTML('<span class="oc-label">Ollama</span>', elem_classes="oc-label-holder", min_width=0)
+            start_btn = gr.Button("Start", variant="secondary", size="sm", scale=0, min_width=0, visible=not _up,
+                                  elem_classes="oc-start")
+            stop_ollama_btn = gr.Button("Stop", variant="secondary", size="sm", scale=0, min_width=0, visible=_up)
+            restart_ollama_btn = gr.Button("Restart", variant="secondary", size="sm", scale=0, min_width=0, visible=_up)
         unload_btn = gr.Button("Unload models", variant="secondary", size="sm", scale=0, min_width=140,
                                visible=bool(loaded_models()))
         refresh_btn = gr.Button("Refresh", variant="secondary", size="sm", scale=0, min_width=100)
@@ -2575,9 +2732,10 @@ with gr.Blocks(title="LLM Scanner") as ui:
                         dl_view = gr.HTML(downloads_html())
                         dl_remove_ref = gr.Textbox(elem_id="dl-remove-ref", elem_classes="hidden-control", container=False)
                         dl_remove_btn = gr.Button("remove", elem_id="dl-remove-btn", elem_classes="hidden-control")
+                        dl_toggle_ref = gr.Textbox(elem_id="dl-toggle-ref", elem_classes="hidden-control", container=False)
+                        dl_toggle_btn = gr.Button("toggle", elem_id="dl-toggle-btn", elem_classes="hidden-control")
                         with gr.Row(equal_height=True, visible=False) as dl_controls:
                             dl_pick = gr.Dropdown(label="Active download (select one to give it priority)", choices=[], scale=4)
-                            dl_cancel = gr.Button("Cancel download", variant="stop", scale=0, min_width=170)
                         dl_timer = gr.Timer(2.0)
                         dl_seen = gr.State(0)
 
@@ -2623,7 +2781,7 @@ with gr.Blocks(title="LLM Scanner") as ui:
 
                             @gr.render(inputs=[chats_version, active_chat, chat_search],
                                        triggers=[chats_version.change, chat_search.change, ui.load],
-                                       trigger_mode="always_last")
+                                       trigger_mode="always_last", show_progress="hidden")
                             def render_chat_list(_version, current_id, query):
                                 chats = CHAT_INDEX.search(query)
                                 if not chats:
@@ -2649,7 +2807,7 @@ with gr.Blocks(title="LLM Scanner") as ui:
                 models_version = gr.State(0.0)
                 manage_status = gr.HTML(elem_classes="note")
 
-                @gr.render(inputs=models_version, triggers=[models_version.change, ui.load])
+                @gr.render(inputs=models_version, triggers=[models_version.change, ui.load], show_progress="hidden")
                 def render_models(_version):
                     models = list_models()
                     with gr.Column(elem_classes="models-table"):
@@ -2720,7 +2878,7 @@ with gr.Blocks(title="LLM Scanner") as ui:
                     img_search_dl = gr.Button("Download", variant="primary", scale=0, min_width=160, interactive=False)
                 img_models_note = gr.HTML(elem_classes="note")
 
-                @gr.render(inputs=images_version, triggers=[images_version.change, ui.load])
+                @gr.render(inputs=images_version, triggers=[images_version.change, ui.load], show_progress="hidden")
                 def render_image_models(_version):
                     with gr.Column(elem_classes="models-table image-models"):
                         gr.HTML('<div class="mt-row mt-head"><div class="mt-cell">Model</div><div class="mt-cell">About'
@@ -2829,31 +2987,36 @@ with gr.Blocks(title="LLM Scanner") as ui:
                         raw_view = gr.Code(show_label=False, language=None, lines=30, max_lines=30, elem_classes="log")
 
     # status
-    start_btn.click(start_ollama, outputs=status)
-    status_timer.tick(status_controls, outputs=[status, unload_btn], show_progress="hidden")
-    unload_btn.click(unload_models, outputs=[status, unload_btn], show_progress="hidden")
+    status_outputs = [status, unload_btn, start_btn, stop_ollama_btn, restart_ollama_btn]
+    start_btn.click(start_ollama, outputs=status_outputs, show_progress="hidden")
+    stop_ollama_btn.click(stop_ollama, outputs=status_outputs, show_progress="hidden")
+    restart_ollama_btn.click(restart_ollama, outputs=status_outputs, show_progress="hidden")
+    status_timer.tick(status_controls, outputs=status_outputs, show_progress="hidden")
+    unload_btn.click(unload_models, outputs=status_outputs, show_progress="hidden")
+    ui.load(status_controls, outputs=status_outputs, show_progress="hidden")
     update_outputs = [update_html, update_ollama_btn, update_garak_btn, update_app_btn]
     update_timer.tick(update_controls, outputs=update_outputs, show_progress="hidden")
-    update_app_btn.click(lambda: start_update("app"), outputs=update_outputs)
+    update_app_btn.click(lambda: start_update("app"), outputs=update_outputs, show_progress="hidden")
     update_dismiss.click(dismiss_update_msg, outputs=update_outputs,
                          show_progress="hidden")
-    update_ollama_btn.click(lambda: start_update("ollama"), outputs=update_outputs)
-    update_garak_btn.click(lambda: start_update("garak"), outputs=update_outputs)
-    refresh_btn.click(refresh_all, chat_state, [models_version, scan_model, status, scan_type, group_pick, chat_model])
+    update_ollama_btn.click(lambda: start_update("ollama"), outputs=update_outputs, show_progress="hidden")
+    update_garak_btn.click(lambda: start_update("garak"), outputs=update_outputs, show_progress="hidden")
+    refresh_btn.click(refresh_all, chat_state, [models_version, scan_model, status, scan_type, group_pick, chat_model],
+                      show_progress="hidden")
 
     # models
-    source.change(source_changed, source, [query, repo, version, search_note, pull_btn])
+    source.change(source_changed, source, [query, repo, version, search_note, pull_btn], show_progress="hidden")
     for trigger in (search_btn.click, query.submit):
         trigger(search_models, [source, query], [repo, version, search_note, pull_btn, search_loading],
                 show_progress="hidden")
     repo.input(list_versions, [source, repo], [version, search_note, pull_btn, search_loading], show_progress="hidden")
-    version.input(version_changed, [repo, version], pull_btn)
-    pull_btn.click(pull_model, [source, repo, version], pull_status)
-    dl_pick.input(prioritize_download, dl_pick, pull_status)
+    version.input(version_changed, [repo, version], pull_btn, show_progress="hidden")
+    pull_btn.click(pull_model, [source, repo, version], pull_status, show_progress="hidden")
+    dl_pick.input(prioritize_download, dl_pick, pull_status, show_progress="hidden")
     dl_timer.tick(downloads_tick, [dl_seen, dl_pick],
                   [dl_view, dl_seen, models_version, dl_pick, dl_controls],
                   show_progress="hidden")
-    dl_cancel.click(cancel_download, dl_pick, pull_status)
+    dl_toggle_btn.click(toggle_download, dl_toggle_ref, [pull_status, dl_toggle_ref], show_progress="hidden")
     dl_remove_btn.click(remove_download, dl_remove_ref, [pull_status, dl_remove_ref], show_progress="hidden")
     img_go.click(generate_image, [img_model, img_prompt, img_size, img_steps, img_seed],
                  [img_progress, img_note, img_go, img_stop, img_result, img_gallery], show_progress="hidden")
@@ -2893,13 +3056,14 @@ with gr.Blocks(title="LLM Scanner") as ui:
     # probes and groups
     filters = [probe_query, probe_module, show_all]
     for comp in filters:
-        comp.change(filter_probes, filters + [selected], [probe_list, probe_count])
-    probe_list.input(probes_ticked, [probe_list] + filters + [selected], [selected, sel_summary])
-    sel_shown_btn.click(select_shown, filters + [selected], [selected, probe_list, sel_summary])
-    clear_btn.click(clear_selection, outputs=[selected, probe_list, sel_summary])
-    load_btn.click(load_group, [group_pick] + filters, [selected, probe_list, sel_summary, group_name])
-    save_btn.click(save_group, [group_name, selected], [group_status, group_pick, scan_type])
-    del_group_btn.click(delete_group, group_pick, [group_status, group_pick, scan_type])
+        comp.change(filter_probes, filters + [selected], [probe_list, probe_count], show_progress="hidden")
+    probe_list.input(probes_ticked, [probe_list] + filters + [selected], [selected, sel_summary], show_progress="hidden")
+    sel_shown_btn.click(select_shown, filters + [selected], [selected, probe_list, sel_summary], show_progress="hidden")
+    clear_btn.click(clear_selection, outputs=[selected, probe_list, sel_summary], show_progress="hidden")
+    load_btn.click(load_group, [group_pick] + filters, [selected, probe_list, sel_summary, group_name],
+                   show_progress="hidden")
+    save_btn.click(save_group, [group_name, selected], [group_status, group_pick, scan_type], show_progress="hidden")
+    del_group_btn.click(delete_group, group_pick, [group_status, group_pick, scan_type], show_progress="hidden")
     selected.change(scan_info, [scan_type, selected], scan_desc, show_progress="hidden")
 
     # scan
@@ -2911,15 +3075,17 @@ with gr.Blocks(title="LLM Scanner") as ui:
     stop_btn.click(stop_scan, outputs=scan_log, show_progress="hidden")
 
     # reports
-    rep.change(show_report, [rep, raw_pick], [rep_summary, rep_view, raw_view, rep_files])
-    raw_pick.change(read_raw, [rep, raw_pick], raw_view)
-    rep_open.click(open_report, rep)
+    rep.change(show_report, [rep, raw_pick], [rep_summary, rep_view, raw_view, rep_files], show_progress="hidden")
+    raw_pick.change(read_raw, [rep, raw_pick], raw_view, show_progress="hidden")
+    rep_open.click(open_report, rep, show_progress="hidden")
     rep_delete.click(delete_report, [rep, rep_confirm], [rep, rep_status],
-                     js="(name, c) => [name, !!name]")
+                     js="(name, c) => [name, !!name]", show_progress="hidden")
 
-    ui.load(refresh_all, chat_state, [models_version, scan_model, status, scan_type, group_pick, chat_model]).then(
-        model_hint, scan_model, [model_note, tmo]).then(
-        refresh_reports, outputs=rep).then(show_report, [rep, raw_pick], [rep_summary, rep_view, raw_view, rep_files])
+    ui.load(refresh_all, chat_state, [models_version, scan_model, status, scan_type, group_pick, chat_model],
+            show_progress="hidden").then(
+        model_hint, scan_model, [model_note, tmo], show_progress="hidden").then(
+        refresh_reports, outputs=rep, show_progress="hidden").then(
+        show_report, [rep, raw_pick], [rep_summary, rep_view, raw_view, rep_files], show_progress="hidden")
 
 def ensure_desktop_integration():
     """Install the app icon and keep our own launcher entries pointing at it and at this app."""

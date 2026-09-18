@@ -171,13 +171,19 @@ It lists what will be deleted and asks before doing anything.
 | `analyst_report.py` | Builds the security-analyst summary of a garak run |
 | `garak_runner.py` | Runs garak with the app's Ollama settings (thinking control, keep-alive) |
 | `static/` | Styling and browser scripts |
-| `tests/` | Automated tests (no network, models or real data needed) |
+| `tests/` | Automated tests: `test_app.py` (functions), `test_ui.py` (every page, against a fake Ollama), `test_updates.py` (updates, including upgrading earlier releases). No network, models or real data needed |
 | `install.sh`, `uninstall.sh`, `export-data.sh` | Setup, removal, and data export |
 | `VERSION` | The version number the update check compares against |
 | `requirements.txt` | Exact Python package versions |
 
 ## Changelog
 
+- **1.0.13**: Hugging Face downloads also work when Ollama reports the Xet redirect as an HTTP error (the "HTTP 400
+  ... blocked redirect" failure); vision models from Hugging Face keep their image support. Downloads can be paused
+  and resumed (kept across restarts), and deleting one removes its partial data. New "OWASP Top 10 for LLMs" scan
+  preset. Ollama start / stop / restart in one control. Smoother look: a sliding highlight on tabs and switches, a
+  cleaner tab bar, gentle transitions, and no loading flicker when switching sources or filtering. Tests now cover
+  every page and every kind of update, including upgrading from earlier releases.
 - **1.0.12**: Hugging Face downloads work on every PC again: when Ollama can't follow Hugging Face's new Xet storage
   redirect, the app downloads the GGUF itself (resumable, with progress, cancel and priority) and imports it, then
   deletes its copy instead of keeping a second one. Updating from 1.0.8 or earlier no longer leaves the app unable to
