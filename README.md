@@ -105,7 +105,7 @@ bash install.sh --data llm-scanner-data-DATE.tar.gz --pull-models
 
 ## Updates
 
-Every installed copy checks GitHub for a new release at startup and every 6 hours. When one is available, the
+Every installed copy checks GitHub for a new release at startup and every 5 minutes. When one is available, the
 update notice at the top of the app shows what's new and an **Update LLM Scanner** button. Clicking it:
 
 1. Downloads the release and installs any new Python packages.
@@ -116,7 +116,8 @@ If the check fails, nothing changes. Ollama and garak updates work the same way,
 
 ### Publishing a new version (maintainer)
 
-1. Make your changes and test them locally.
+1. Make your changes on `main` and test them locally, including the automated tests:
+   `.venv/bin/python -m unittest discover -s tests`
 2. Bump the number in `VERSION` (for example `1.0.0` to `1.1.0`).
 3. If you changed Python packages, refresh the pins:
    `~/.local/bin/uv pip freeze --python .venv/bin/python > requirements.txt`
@@ -127,7 +128,7 @@ If the check fails, nothing changes. Ollama and garak updates work the same way,
    gh release create v1.1.0 --title "v1.1.0" --notes "What changed"
    ```
 
-Every machine sees the update within 6 hours, or immediately after a restart.
+Every machine on 1.0.7 or later sees the update within 5 minutes (older versions: within 6 hours, or right after a restart).
 
 ## Requirements
 
@@ -170,12 +171,19 @@ It lists what will be deleted and asks before doing anything.
 | `analyst_report.py` | Builds the security-analyst summary of a garak run |
 | `garak_runner.py` | Runs garak with the app's Ollama settings (thinking control, keep-alive) |
 | `static/` | Styling and browser scripts |
+| `tests/` | Automated tests (no network, models or real data needed) |
 | `install.sh`, `uninstall.sh`, `export-data.sh` | Setup, removal, and data export |
 | `VERSION` | The version number the update check compares against |
 | `requirements.txt` | Exact Python package versions |
 
 ## Changelog
 
+- **1.0.12**: Hugging Face downloads work on every PC again: when Ollama can't follow Hugging Face's new Xet storage
+  redirect, the app downloads the GGUF itself (resumable, with progress, cancel and priority) and imports it, then
+  deletes its copy instead of keeping a second one. Updating from 1.0.8 or earlier no longer leaves the app unable to
+  start. Scans and image generation keep running and finish cleanly if the page is closed or reloaded; a second scan
+  can't start while one is running. Stopped scans appear in Reports. Scrolling a dropdown list no longer scrolls the
+  page. Added automated tests.
 - **1.0.11**: Show byte-level Hugging Face progress and total size while importing GGUF files into Ollama.
 - **1.0.10**: Fall back to a Hugging Face Hub download and Ollama import when Xet/CDN redirects prevent Ollama's native `hf.co` pull.
 - **1.0.9**: Include all Python modules in in-app updates so new releases start correctly after installation.

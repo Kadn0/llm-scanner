@@ -384,3 +384,5 @@ button.row-del:hover { background:#3a1d1d url("data:image/svg+xml,%3Csvg xmlns='
 .required:has(input[role="combobox"]:disabled) { opacity:.45; }
 .required input[role="combobox"]:disabled { cursor:not-allowed !important; }
 .up-notes { color:#a9c7ea; font-size:13px; margin-top:6px; white-space:pre-wrap; max-height:90px; overflow:hidden; }
+/* Scrolling an open dropdown list scrolls only the list, never the page behind it. */
+.options, .option-list { overscroll-behavior: contain; }

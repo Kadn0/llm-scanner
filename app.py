@@ -2,6 +2,7 @@
 
 import base64
 import bisect
+import codecs
 import html
 import importlib.metadata
 import importlib.util
@@ -22,7 +23,6 @@ import gradio as gr
 import requests
 
 import analyst_report
-from download_utils import exception_message, is_permanent_error, response_error
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
@@ -204,14 +204,34 @@ def start_ollama():
     return status_html()
 
 
+def pump_output(p, on_text, on_exit):
+    """Read a child process's output on a background thread, then call on_exit once it ends. Scans and image
+    generation keep running when the page that started them is closed or reloaded; if nobody read their output
+    they would freeze as soon as the pipe filled up."""
+    def run():
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        while chunk := p.stdout.read1(4096):
+            try:
+                on_text(decoder.decode(chunk))
+            except Exception:  # a display problem must never stop the draining
+                pass
+        p.wait()
+        on_exit()
+
+    reader = threading.Thread(target=run, daemon=True)
+    reader.start()
+    return reader
+
+
 # ---------------------------------------------------------------- update checks
 UV = str(Path.home() / ".local/bin/uv")
 APP_VERSION = (APP_DIR / "VERSION").read_text().strip() if (APP_DIR / "VERSION").exists() else "0.0.0"
 UPDATE_REPO = os.environ.get("LLM_SCANNER_REPO", "Kadn0/llm-scanner")  # GitHub repo the app updates from
 CHECK_ONLY = os.environ.get("LLM_SCANNER_CHECK") == "1"  # set while an update verifies itself on a spare port
-APP_FILES = ["app.py", "download_utils.py", "analyst_report.py", "garak_runner.py", "llm-scanner.sh", "install.sh", "uninstall.sh",
+APP_FILES = ["app.py", "analyst_report.py", "garak_runner.py", "llm-scanner.sh", "install.sh", "uninstall.sh",
              "export-data.sh", "README.md", "VERSION", "requirements.txt", "static"]
 OLLAMA_DIR = Path.home() / ".local/ollama"
+KEEP_ON_UPDATE = {"data", ".venv", ".git", ".gitignore", ".github"}  # never replaced by a release
 UPDATE_CHECK_INTERVAL = 5 * 60
 _updates = {"checked": 0.0, "ollama": None, "garak": None, "app": None, "busy": None, "pct": None, "msg": "",
             "ok": True}
@@ -426,13 +446,15 @@ def _update_app():
     backup = DATA_DIR / "backups" / APP_VERSION
     shutil.rmtree(backup, ignore_errors=True)
     backup.mkdir(parents=True)
-    for name in APP_FILES:
+    # Everything the release ships, not just a fixed list, so a file added in a new version is never left behind.
+    installed = sorted((set(APP_FILES) | {f.name for f in new.iterdir()}) - KEEP_ON_UPDATE)
+    for name in installed:
         src, dst = APP_DIR / name, backup / name
         if src.is_dir():
-            shutil.copytree(src, dst)
+            shutil.copytree(src, dst, ignore=shutil.ignore_patterns("__pycache__"))
         elif src.exists():
             shutil.copy2(src, dst)
-    for name in APP_FILES:
+    for name in installed:
         src, dst = new / name, APP_DIR / name
         if src.is_dir():
             shutil.rmtree(dst, ignore_errors=True)
@@ -1232,71 +1254,104 @@ def _pending():
         return []
 
 
+class PermanentDownloadError(Exception):
+    """The download can't succeed as requested (missing file, rejected request), so retrying won't help."""
+
+
+def response_error(response, operation):
+    """The server's own explanation for a failed request, e.g. 'Pulling x failed (HTTP 404): not found'."""
+    detail = ""
+    try:
+        payload = response.json()
+        detail = str(payload.get("error") or payload.get("message") or "") if isinstance(payload, dict) else str(payload or "")
+    except ValueError:
+        detail = (response.text or "").strip()
+    detail = re.sub(r"\s+", " ", detail).strip()[:500]
+    return f"{operation} failed (HTTP {response.status_code})" + (f": {detail}" if detail else "")
+
+
+def _check_response(response, operation):
+    """4xx means the request itself is wrong and fails for good; 5xx and network errors are retried."""
+    if 400 <= response.status_code < 500:
+        raise PermanentDownloadError(response_error(response, operation))
+    response.raise_for_status()
+
+
+def fetch_file(url, dest, size, should_stop, on_progress):
+    """Download url to dest, resuming from dest.part with an HTTP range request. Returns False if should_stop()
+    interrupted it (the partial file is kept), True once dest is complete."""
+    part = dest.with_name(dest.name + ".part")
+    have = part.stat().st_size if part.exists() else 0
+    headers = {"Range": f"bytes={have}-"} if have else {}
+    with requests.get(url, headers=headers, stream=True, timeout=(15, 120), allow_redirects=True) as r:
+        if r.status_code != 416:  # 416: the partial file is already complete
+            _check_response(r, f"Downloading {dest.name}")
+            if have and r.status_code != 206:  # server ignored the range: start this file over
+                have = 0
+            with open(part, "ab" if have else "wb") as fh:
+                for chunk in r.iter_content(1 << 20):
+                    if should_stop():
+                        return False
+                    fh.write(chunk)
+                    on_progress()
+    if size and part.stat().st_size < size:
+        raise ConnectionError("download ended early")
+    part.replace(dest)
+    return True
+
+
+HF_DOWNLOADS = DATA_DIR / "hf-downloads"  # GGUF files waiting to be imported into Ollama; deleted once imported
+
+
 def _hf_gguf_file(repo, tag):
-    """Find the GGUF filename represented by an Ollama Hugging Face quantization tag."""
-    res = requests.get(f"{HF_API}/models/{repo_from_text(repo)}/tree/main",
-                       params={"recursive": "true"}, timeout=30)
-    res.raise_for_status()
-    wanted = tag.removesuffix(".gguf").lower()
-    candidates = []
-    for entry in res.json():
-        path = entry.get("path", "")
-        name = path.rsplit("/", 1)[-1]
-        if name.lower().endswith(".gguf") and name[:-5].lower().endswith(wanted):
-            candidates.append((path, int(entry.get("size") or 0)))
+    """(path, size) of the GGUF file in a Hugging Face repo that an Ollama quantization tag like Q4_K_M means."""
+    res = requests.get(f"{HF_API}/models/{repo}/tree/main", params={"recursive": "true"}, timeout=30)
+    _check_response(res, f"Listing files of {repo}")
+    wanted = re.compile(rf"(^|[-_.]){re.escape(tag.removesuffix('.gguf'))}$", re.I)
+    candidates = [(e["path"], int(e.get("size") or 0)) for e in res.json()
+                  if e.get("path", "").lower().endswith(".gguf") and wanted.search(e["path"].rsplit("/", 1)[-1][:-5])]
     if not candidates:
-        raise FileNotFoundError(f"could not find a GGUF file for quantization {tag} in {repo}")
-    return min(candidates, key=lambda item: len(item[0]))
+        raise PermanentDownloadError(f"{repo} has no single-file GGUF for {tag}")
+    return min(candidates, key=lambda c: len(c[0]))
 
 
-def _hf_ollama_fallback(ref, d):
-    """Import an HF GGUF through huggingface-hub when Ollama rejects its Xet redirect."""
-    match = re.fullmatch(r"hf\.co/([^:]+):(.+)", ref)
-    if not match:
-        raise ValueError(f"cannot import malformed Hugging Face model reference {ref}")
-    repo, tag = match.groups()
-    from huggingface_hub import hf_hub_download
+def _hf_import(ref, d):
+    """Download a Hugging Face GGUF directly and import it into Ollama. Ollama's own pull fails for most Hugging
+    Face models ("blocked redirect to a different host") because the files are served from Hugging Face's Xet
+    storage on another domain. Returns True once imported, False if cancelled or paused for another download."""
+    m = re.fullmatch(r"hf\.co/([^:]+):(.+)", ref)
+    if not m:
+        raise PermanentDownloadError(f"{ref} is not a Hugging Face model reference")
+    repo, tag = m.groups()
+    path, total = _hf_gguf_file(repo, tag)
+    HF_DOWNLOADS.mkdir(parents=True, exist_ok=True)
+    dest = HF_DOWNLOADS / f"{_slug(ref)}.gguf"
+    part = dest.with_name(dest.name + ".part")
 
-    d.update(state="downloading", msg="Downloading through Hugging Face")
-    filename, total = _hf_gguf_file(repo, tag)
-    cache_dir = DATA_DIR / ".hf-cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    d.update(state="downloading", msg="Downloading through Hugging Face", done=0, total=total)
-    monitor_stop = threading.Event()
+    def progress():
+        d.update(state="downloading", msg="Downloading", done=part.stat().st_size if part.exists() else 0, total=total)
 
-    def monitor():
-        while not monitor_stop.wait(0.25):
-            partials = list(cache_dir.rglob("*.incomplete"))
-            if partials:
-                done = max(p.stat().st_size for p in partials)
-                d.update(state="downloading", msg="Downloading through Hugging Face", done=done, total=total)
-
-    monitor_thread = threading.Thread(target=monitor, daemon=True)
-    monitor_thread.start()
+    if not dest.exists():
+        progress()
+        if not fetch_file(HF_RESOLVE.format(repo=repo, path=path), dest, total,
+                          lambda: d["cancel"] or _yield_to_priority(ref), progress):
+            return False
+    d.update(state="downloading", msg="Importing into Ollama", done=total, total=total)
+    ollama_cli = OLLAMA_DIR / "bin/ollama"
+    if not ollama_cli.exists():
+        ollama_cli = Path(shutil.which("ollama") or "ollama")
+    modelfile = HF_DOWNLOADS / f"{_slug(ref)}.Modelfile"
+    modelfile.write_text(f"FROM {dest}\n", encoding="utf-8")
     try:
-        model_file = Path(hf_hub_download(repo_id=repo, filename=filename, repo_type="model",
-                                          cache_dir=str(cache_dir)))
-    finally:
-        monitor_stop.set()
-        monitor_thread.join(timeout=1)
-    if total:
-        d.update(state="downloading", msg="Downloading through Hugging Face", done=total, total=total)
-    modelfile = DATA_DIR / f".{_slug(ref)}.Modelfile"
-    modelfile.write_text(f"FROM {model_file}\n", encoding="utf-8")
-    try:
-        ollama_cli = OLLAMA_DIR / "bin/ollama"
-        if not ollama_cli.exists():
-            ollama_cli = Path(shutil.which("ollama") or "")
-        if not ollama_cli.exists():
-            raise FileNotFoundError("Ollama command was not found")
-        d.update(state="downloading", msg="Importing into Ollama")
-        result = subprocess.run([str(ollama_cli), "create", ref, "-f", str(modelfile)],
-                                capture_output=True, text=True, timeout=3600)
-        if result.returncode:
-            detail = (result.stderr or result.stdout or f"exit code {result.returncode}").strip()
-            raise RuntimeError(f"Ollama import failed: {detail[-500:]}")
+        result = subprocess.run([str(ollama_cli), "create", ref, "-f", str(modelfile)], capture_output=True, text=True,
+                                timeout=3600, env=os.environ | {"OLLAMA_HOST": OLLAMA})
     finally:
         modelfile.unlink(missing_ok=True)
+    if result.returncode:
+        detail = ANSI.sub("", result.stderr or result.stdout or f"exit code {result.returncode}").strip()
+        raise RuntimeError(f"Ollama import failed: {detail[-300:]}")
+    dest.unlink(missing_ok=True)  # Ollama keeps its own copy
+    return True
 
 
 def _set_pending(ref, add):
@@ -1332,24 +1387,28 @@ def _download_worker(ref):
             continue
         layers = {}
         try:
+            if d.get("direct"):  # Ollama can't fetch this one itself
+                if _hf_import(ref, d):
+                    d.update(state="done", msg="Done", finished=time.time())
+                    _set_pending(ref, False)
+                    _dl_finished["count"] += 1
+                    return
+                continue  # cancelled or paused; the loop handles both
             with requests.post(f"{OLLAMA}/api/pull", json={"model": ref, "stream": True},
                                stream=True, timeout=(10, 120)) as r:
                 if r.status_code >= 400:
-                    raise ValueError(response_error(r, f"Pulling {ref}"))
+                    raise PermanentDownloadError(response_error(r, f"Pulling {ref}"))
                 for line in r.iter_lines():
                     if d["cancel"] or _yield_to_priority(ref):
                         break
                     if not line:
                         continue
-                    ev = json.loads(line)
+                    ev = json.loads(line)  # a line cut off mid-transfer raises, and is retried like any drop
                     if "error" in ev:
-                        if ref.startswith("hf.co/") and "blocked redirect to a different host" in ev["error"]:
-                            _hf_ollama_fallback(ref, d)
-                            d.update(state="done", msg="Done", finished=time.time())
-                            _set_pending(ref, False)
-                            _dl_finished["count"] += 1
-                            return
-                        raise ValueError(ev["error"])
+                        if ref.startswith("hf.co/") and "redirect" in ev["error"]:
+                            d["direct"] = True
+                            break
+                        raise PermanentDownloadError(ev["error"])
                     if ev.get("digest") and ev.get("total"):
                         layers[ev["digest"]] = (ev.get("completed", 0), ev["total"])
                         done = sum(c for c, _ in layers.values())
@@ -1362,12 +1421,12 @@ def _download_worker(ref):
                         _set_pending(ref, False)
                         _dl_finished["count"] += 1
                         return
-            if d["cancel"]:
-                break
+            if d["cancel"] or d.get("direct"):
+                continue
             if _yield_to_priority(ref):
                 continue  # Ollama keeps the partial data; this resumes once the priority download finishes
             raise ConnectionError("download stream ended early")
-        except ValueError as e:  # Ollama rejected the request, e.g. model or version doesn't exist
+        except PermanentDownloadError as e:  # e.g. the model or version doesn't exist
             d.update(state="failed", msg=str(e))
             _set_pending(ref, False)
             return
@@ -1376,6 +1435,8 @@ def _download_worker(ref):
             wait = min(60, 5 * attempt)
             d.update(state="waiting", msg=f"Connection interrupted, resuming in {wait}s")
             time.sleep(wait)
+    if d.get("hidden"):  # removed with the trash icon: delete a partial direct download now
+        (HF_DOWNLOADS / f"{_slug(ref)}.gguf.part").unlink(missing_ok=True)
     d.update(state="cancelled", msg="Cancelled. Downloaded data is kept, so starting it again resumes.")
     _set_pending(ref, False)
 
@@ -1479,16 +1540,6 @@ SD_CLI = SD_DIR / "sd-cli"
 IMAGE_MODEL_DIR = DATA_DIR / "image-models"
 IMAGES_DIR = DATA_DIR / "images"
 HF_RESOLVE = "https://huggingface.co/{repo}/resolve/main/{path}"
-
-
-def _hf_cached_file(repo, path, cache_dir):
-    """Download through huggingface-hub when available, avoiding CDN redirects blocked by some networks."""
-    try:
-        from huggingface_hub import hf_hub_download
-        return Path(hf_hub_download(repo_id=repo_from_text(repo), filename=path.lstrip("/"),
-                                    repo_type="model", cache_dir=str(cache_dir)))
-    except (ImportError, OSError, RuntimeError, ValueError):
-        return None
 
 
 SHARED_DIR = IMAGE_MODEL_DIR / "shared"      # companion files (text encoders, VAEs) reused across models
@@ -1614,7 +1665,7 @@ def image_repo_files(repo, family):
     for f in res.json():
         path, size = f.get("path", ""), f.get("size", 0) / 1e9
         name = path.split("/")[-1].lower()
-        if any(k in name for k in ("vae", "lora", "mmproj", "text_encoder", "inpaint", "refiner", "controlnet")):
+        if any(k in path.lower() for k in ("vae", "lora", "mmproj", "text_encoder", "inpaint", "refiner", "controlnet")):
             continue
         if FAMILIES[family]["role"] == "diffusion-model":
             if name.endswith(".gguf") and not re.search(r"-\d{5}-of-\d{5}", name):
@@ -1771,6 +1822,7 @@ def _image_download_worker(ref):
     d = _downloads[ref]
     files = [(spec[0], spec[1], dest) for spec, dest in
              zip(image_models()[key]["files"].values(), image_model_files(key).values(), strict=True)]
+    stop = lambda: d["cancel"] or _yield_to_priority(ref)  # noqa: E731
     attempt = 0
     while not d["cancel"]:
         if _yield_to_priority(ref):
@@ -1780,63 +1832,34 @@ def _image_download_worker(ref):
         try:
             sizes = []
             for repo, path, _ in files:
-                cached = _hf_cached_file(repo, path, IMAGE_MODEL_DIR / ".hf-cache")
-                if cached is not None:
-                    sizes.append(cached.stat().st_size)
-                else:
-                    head = requests.head(HF_RESOLVE.format(repo=repo, path=path), allow_redirects=True, timeout=20)
-                    head.raise_for_status()
-                    sizes.append(int(head.headers.get("content-length", 0)))
+                head = requests.head(HF_RESOLVE.format(repo=repo, path=path), allow_redirects=True, timeout=20)
+                _check_response(head, f"Checking {path}")
+                sizes.append(int(head.headers.get("content-length", 0)))
             total = sum(sizes)
+
+            def progress():
+                done = sum(p.stat().st_size if p.exists() else 0 for p in
+                           [f[2] for f in files] + [f[2].with_name(f[2].name + ".part") for f in files])
+                d.update(state="downloading", msg="Downloading", done=done, total=total)
+
             for (repo, path, dest), size in zip(files, sizes, strict=True):
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 if dest.exists() and dest.stat().st_size == size:
                     continue
-                cached = _hf_cached_file(repo, path, IMAGE_MODEL_DIR / ".hf-cache")
-                if cached is not None:
-                    shutil.copyfile(cached, dest)
-                    d.update(state="downloading", msg="Downloading", done=sum(
-                        p.stat().st_size if p.exists() else 0
-                        for p in [f[2] for f in files] +
-                        [f[2].with_name(f[2].name + ".part") for f in files]), total=total)
-                    continue
-                part = dest.with_name(dest.name + ".part")
-                have = part.stat().st_size if part.exists() else 0
-                headers = {"Range": f"bytes={have}-"} if have else {}
-                with requests.get(HF_RESOLVE.format(repo=repo, path=path), headers=headers, stream=True,
-                                  timeout=(15, 120), allow_redirects=True) as r:
-                    if r.status_code == 416:  # already complete
-                        pass
-                    else:
-                        r.raise_for_status()
-                        if have and r.status_code != 206:  # server ignored the range: start this file over
-                            have = 0
-                        with open(part, "ab" if have else "wb") as fh:
-                            for chunk in r.iter_content(1 << 20):
-                                if d["cancel"] or _yield_to_priority(ref):
-                                    break
-                                fh.write(chunk)
-                                done = sum(p.stat().st_size if p.exists() else 0 for p in
-                                           [f[2] for f in files] + [f[2].with_name(f[2].name + ".part") for f in files])
-                                d.update(state="downloading", msg="Downloading", done=done, total=total)
-                if d["cancel"] or _yield_to_priority(ref):
+                if not fetch_file(HF_RESOLVE.format(repo=repo, path=path), dest, size, stop, progress):
                     break
-                if part.exists() and part.stat().st_size >= size:
-                    part.replace(dest)
-            if d["cancel"]:
-                break
-            if _yield_to_priority(ref):
-                continue
+            if stop():
+                continue  # cancelled, or paused for a priority download; the loop handles both
             if image_model_installed(key):
                 d.update(state="done", msg="Done", finished=time.time(), done=total, total=total)
                 _set_pending(ref, False)
                 _dl_finished["count"] += 1
                 return
-        except Exception as e:
-            if is_permanent_error(e):
-                d.update(state="failed", msg=exception_message(e, "Hugging Face download"))
-                _set_pending(ref, False)
-                return
+        except PermanentDownloadError as e:
+            d.update(state="failed", msg=str(e))
+            _set_pending(ref, False)
+            return
+        except Exception:
             attempt += 1
             wait = min(60, 5 * attempt)
             d.update(state="waiting", msg=f"Connection interrupted, resuming in {wait}s")
@@ -1954,36 +1977,41 @@ def generate_image(key, prompt, size_label, steps, seed):
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, start_new_session=True)
     _image_proc["p"] = p
     step_re = re.compile(r"(\d+)/(\d+)\s*-\s*[\d.]+\s*(?:s/it|it/s)")
-    phase, pct, buf, tail, last, sampled = "Loading model", 2.0, "", [], 0.0, False
-    while True:
-        chunk = p.stdout.read1(4096)
-        if not chunk:
-            break
-        buf += chunk.decode("utf-8", "replace").replace("\r", "\n")
-        lines = buf.split("\n")
-        buf = lines.pop()
+    st = {"phase": "Loading model", "pct": 2.0, "buf": "", "tail": [], "sampled": False, "elapsed": 0.0}
+
+    def on_text(text):
+        lines = (st["buf"] + text.replace("\r", "\n")).split("\n")
+        st["buf"] = lines.pop()
         for line in lines:
             line = ANSI.sub("", line).strip()
             if not line:
                 continue
-            tail = (tail + [line])[-12:]
+            st["tail"] = (st["tail"] + [line])[-12:]
             m = step_re.search(line)
             if m and int(m.group(2)) == int(steps):  # sampling progress bar (one tick per step)
                 n, total = int(m.group(1)), int(m.group(2))
-                sampled = True
-                phase, pct = f"Generating, step {n} of {total}", 10 + 80 * n / max(total, 1)
-            elif sampled and "decod" in line.lower():  # decoder messages before sampling are part of loading
-                phase, pct = "Decoding image", max(pct, 92)
-        if time.time() - last > 0.4:
-            last = time.time()
-            yield (image_progress_html(phase, pct, f"Elapsed {_fmt_secs(time.time() - start)}"), keep, keep, keep, keep, keep)
-    p.wait()
-    _image_proc["p"] = None
-    elapsed = time.time() - start
+                st["sampled"] = True
+                st["phase"], st["pct"] = f"Generating, step {n} of {total}", 10 + 80 * n / max(total, 1)
+            elif st["sampled"] and "decod" in line.lower():  # decoder messages before sampling are part of loading
+                st["phase"], st["pct"] = "Decoding image", max(st["pct"], 92)
+
+    def on_exit():  # also runs if the page was closed, so the image still gets its settings file
+        st["elapsed"] = time.time() - start
+        if p.returncode == 0 and out.exists():
+            out.with_suffix(".json").write_text(json.dumps({
+                "prompt": prompt, "model": preset["name"], "width": width, "height": height, "steps": int(steps),
+                "seed": seed, "seconds": round(st["elapsed"], 1)}, indent=1), encoding="utf-8")
+        if _image_proc["p"] is p:
+            _image_proc["p"] = None
+
+    reader = pump_output(p, on_text, on_exit)
+    while reader.is_alive():
+        reader.join(0.4)
+        if reader.is_alive():
+            yield (image_progress_html(st["phase"], st["pct"], f"Elapsed {_fmt_secs(time.time() - start)}"),
+                   keep, keep, keep, keep, keep)
+    elapsed, pct, tail = st["elapsed"], st["pct"], st["tail"]
     if p.returncode == 0 and out.exists():
-        out.with_suffix(".json").write_text(json.dumps({
-            "prompt": prompt, "model": preset["name"], "width": width, "height": height, "steps": int(steps),
-            "seed": seed, "seconds": round(elapsed, 1)}, indent=1), encoding="utf-8")
         yield (image_progress_html("Image ready", 100, f"{_fmt_secs(elapsed)} &nbsp;·&nbsp; seed {seed} &nbsp;·&nbsp; "
                                    f"{width} x {height} &nbsp;·&nbsp; {int(steps)} steps", "done"),
                "", gr.update(interactive=True), gr.update(visible=False), str(out), gallery_html())
@@ -2279,6 +2307,13 @@ def run_scan(model, scan_type, selected, generations, timeout, thinking=False):
     if err:
         yield err, gr.update(), gr.update(), gr.update()
         return
+    if _proc.get("p") and _proc["p"].poll() is None:  # e.g. started before this page was reloaded
+        yield ("A scan is already running. Wait for it to finish, or click Stop to end it.", gr.update(),
+               gr.update(interactive=True), gr.update())
+        return
+    if _image_proc.get("p") and _image_proc["p"].poll() is None:
+        yield "An image is being generated on the GPU. Start the scan once it finishes.", gr.update(), gr.update(), gr.update()
+        return
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", model)
     prefix = f"{safe}_{time.strftime('%Y%m%d-%H%M%S')}"
     gen_opts = {"timeout": int(timeout)}
@@ -2297,32 +2332,37 @@ def run_scan(model, scan_type, selected, generations, timeout, thinking=False):
     yield head, gr.update(interactive=False), gr.update(interactive=True), progress.html()
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, start_new_session=True)
     _proc["p"] = p
-    buf, cur, last = [], "", 0.0
-    while True:
-        chunk = p.stdout.read1(4096)
-        if not chunk:
-            break
-        for c in EMOJI.sub("", ANSI.sub("", chunk.decode("utf-8", "replace"))):
+    buf, cur = [], [""]
+
+    def on_text(text):
+        for c in EMOJI.sub("", ANSI.sub("", text)):
             if c in "\n\r":
-                if cur:
-                    progress.feed(cur)
+                if cur[0]:
+                    progress.feed(cur[0])
                 if c == "\n":
-                    if "%|" in cur and buf and "%|" in buf[-1]:
-                        buf[-1] = cur  # keep only the latest progress bar line
+                    if "%|" in cur[0] and buf and "%|" in buf[-1]:
+                        buf[-1] = cur[0]  # keep only the latest progress bar line
                     else:
-                        buf.append(cur)
-                cur = ""
+                        buf.append(cur[0])
+                        if len(buf) > 5000:  # a days-long full scan must not grow memory without limit
+                            del buf[:1000]
+                cur[0] = ""
             else:
-                cur += c
-        if time.time() - last > 1.0:
-            last = time.time()
-            yield head + "\n".join(buf[-400:] + [cur]), gr.update(), gr.update(), progress.html()
-    p.wait()
-    _proc["p"] = None
-    unload_models()  # free memory as soon as the scan is over
+                cur[0] += c
+
+    def on_exit():  # also runs if the page was closed during the scan
+        if _proc["p"] is p:
+            _proc["p"] = None
+        unload_models()  # free memory as soon as the scan is over
+
+    reader = pump_output(p, on_text, on_exit)
+    while reader.is_alive():
+        reader.join(1.0)
+        if reader.is_alive():
+            yield head + "\n".join(buf[-400:] + cur), gr.update(), gr.update(), progress.html()
     ok = p.returncode == 0
     end = "Scan complete. Open Reports to view the results." if ok else f"Scan stopped (exit code {p.returncode})."
-    yield (head + "\n".join(buf + [cur]) + f"\n\n{end}", gr.update(interactive=True), gr.update(interactive=False),
+    yield (head + "\n".join(buf + cur) + f"\n\n{end}", gr.update(interactive=True), gr.update(interactive=False),
            progress.html("done" if ok else "stopped"))
 
 
@@ -2336,14 +2376,27 @@ def stop_scan():
 
 # ---------------------------------------------------------------- reports
 def reports():
+    """(label, name) per scan run, newest first. A run is named by its garak HTML report; a scan that was
+    stopped partway has no HTML report, only report.jsonl, and is listed as stopped."""
     if not GARAK_RUNS.exists():
         return []
-    files = sorted(GARAK_RUNS.glob("*.report.html"), key=lambda f: f.stat().st_mtime, reverse=True)
+    runs = {}
+    for f in GARAK_RUNS.iterdir():
+        for suffix in (".report.html", ".report.jsonl"):
+            if f.name.endswith(suffix) and len(f.name) > len(suffix):
+                prefix = f.name[:-len(suffix)]
+                runs[prefix] = max(runs.get(prefix, 0), f.stat().st_mtime)
     out = []
-    for f in files:
-        label = re.sub(r"_(\d{8}-\d{6})$", "", f.name[:-len(".report.html")]).replace("hf.co_", "")
-        out.append((f"{label}   {time.strftime('%b %d, %H:%M', time.localtime(f.stat().st_mtime))}", f.name))
+    for prefix, mtime in sorted(runs.items(), key=lambda r: r[1], reverse=True):
+        label = re.sub(r"_(\d{8}-\d{6})$", "", prefix).replace("hf.co_", "")
+        stopped = "" if (GARAK_RUNS / f"{prefix}.report.html").exists() else "   (stopped)"
+        out.append((f"{label}   {time.strftime('%b %d, %H:%M', time.localtime(mtime))}{stopped}", prefix + ".report.html"))
     return out
+
+
+def _known_report(name):
+    """Only names the Reports list offers are accepted, so a crafted name can't reach other files."""
+    return bool(name) and name in {n for _, n in reports()}
 
 
 def refresh_reports():
@@ -2362,7 +2415,7 @@ def report_paths(name):
 
 
 def read_raw(name, which):
-    if not name:
+    if not _known_report(name):
         return ""
     p = report_paths(name)["hitlog" if which == "Hitlog (failing responses)" else "jsonl"]
     if not p.exists():
@@ -2375,7 +2428,7 @@ def read_raw(name, which):
 
 def show_report(name, which="Full report (report.jsonl)"):
     empty = '<div class="empty">No reports yet. Run a scan to create one.</div>'
-    if not name:
+    if not _known_report(name):
         return empty, empty, "", None
     paths = report_paths(name)
     try:
@@ -2383,14 +2436,18 @@ def show_report(name, which="Full report (report.jsonl)"):
         summary = f'<iframe class="report dark" srcdoc="{html.escape(paths["analyst"].read_text(encoding="utf-8"))}"></iframe>'
     except Exception as e:
         summary = f'<div class="empty">Could not build the security summary: {html.escape(str(e))}</div>'
-    garak_view = f'<iframe class="report" srcdoc="{html.escape(paths["garak"].read_text(encoding="utf-8"))}"></iframe>'
+    if paths["garak"].exists():
+        garak_view = f'<iframe class="report" srcdoc="{html.escape(paths["garak"].read_text(encoding="utf-8"))}"></iframe>'
+    else:
+        garak_view = ('<div class="empty">This scan was stopped before garak wrote its report. The security summary '
+                      'and raw data show the results collected before it stopped.</div>')
     files = [str(paths[k]) for k in ("analyst", "csv", "garak", "jsonl", "hitlog") if paths[k].exists()]
     return summary, garak_view, read_raw(name, which), files
 
 
 def delete_report(name, confirmed):
     """Permanently delete every file from one scan run (garak report, raw JSONL, hitlog, summary, CSV)."""
-    if not confirmed or not name:
+    if not confirmed or not _known_report(name):
         return gr.update(), gr.update()
     prefix = name[:-len(".report.html")]
     removed = 0
@@ -2402,9 +2459,15 @@ def delete_report(name, confirmed):
 
 
 def open_report(name):
-    if name:
+    if _known_report(name):
         p = report_paths(name)["analyst"]
+        try:
+            analyst_report.build(GARAK_RUNS / name)
+        except Exception:
+            pass
         target = p if p.exists() else GARAK_RUNS / name
+        if not target.exists():
+            return
         threading.Thread(target=webbrowser.open, args=(target.as_uri(),), daemon=True).start()
 
 

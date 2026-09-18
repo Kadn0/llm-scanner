@@ -17,6 +17,16 @@
       }
     });
   }, true);
+  // Scrolling an open dropdown list (repository, version, ...) must not scroll the page behind it, even when the
+  // list is too short to scroll or has reached its end.
+  document.addEventListener('wheel', (e) => {
+    const box = e.target.closest('.options');
+    if (!box) return;
+    const list = box.querySelector('.option-list') || box;
+    const atTop = list.scrollTop <= 0;
+    const atBottom = list.scrollTop + list.clientHeight >= list.scrollHeight - 1;
+    if ((e.deltaY < 0 && atTop) || (e.deltaY > 0 && atBottom)) e.preventDefault();
+  }, {passive: false, capture: true});
   // Enter sends a chat message (Shift+Enter is ignored for single-line input).
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.target.closest('#chat-input')) {
