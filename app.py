@@ -1232,6 +1232,53 @@ def _pending():
         return []
 
 
+def _hf_gguf_file(repo, tag):
+    """Find the GGUF filename represented by an Ollama Hugging Face quantization tag."""
+    res = requests.get(f"{HF_API}/models/{repo_from_text(repo)}/tree/main",
+                       params={"recursive": "true"}, timeout=30)
+    res.raise_for_status()
+    wanted = tag.removesuffix(".gguf").lower()
+    candidates = []
+    for entry in res.json():
+        path = entry.get("path", "")
+        name = path.rsplit("/", 1)[-1]
+        if name.lower().endswith(".gguf") and name[:-5].lower().endswith(wanted):
+            candidates.append(path)
+    if not candidates:
+        raise FileNotFoundError(f"could not find a GGUF file for quantization {tag} in {repo}")
+    return min(candidates, key=len)
+
+
+def _hf_ollama_fallback(ref, d):
+    """Import an HF GGUF through huggingface-hub when Ollama rejects its Xet redirect."""
+    match = re.fullmatch(r"hf\.co/([^:]+):(.+)", ref)
+    if not match:
+        raise ValueError(f"cannot import malformed Hugging Face model reference {ref}")
+    repo, tag = match.groups()
+    from huggingface_hub import hf_hub_download
+
+    d.update(state="downloading", msg="Downloading through Hugging Face")
+    filename = _hf_gguf_file(repo, tag)
+    model_file = Path(hf_hub_download(repo_id=repo, filename=filename, repo_type="model",
+                                      cache_dir=str(DATA_DIR / ".hf-cache")))
+    modelfile = DATA_DIR / f".{_slug(ref)}.Modelfile"
+    modelfile.write_text(f"FROM {model_file}\n", encoding="utf-8")
+    try:
+        ollama_cli = OLLAMA_DIR / "bin/ollama"
+        if not ollama_cli.exists():
+            ollama_cli = Path(shutil.which("ollama") or "")
+        if not ollama_cli.exists():
+            raise FileNotFoundError("Ollama command was not found")
+        d.update(state="downloading", msg="Importing into Ollama")
+        result = subprocess.run([str(ollama_cli), "create", ref, "-f", str(modelfile)],
+                                capture_output=True, text=True, timeout=3600)
+        if result.returncode:
+            detail = (result.stderr or result.stdout or f"exit code {result.returncode}").strip()
+            raise RuntimeError(f"Ollama import failed: {detail[-500:]}")
+    finally:
+        modelfile.unlink(missing_ok=True)
+
+
 def _set_pending(ref, add):
     with _dl_lock:
         refs = [r for r in _pending() if r != ref] + ([ref] if add else [])
@@ -1276,6 +1323,12 @@ def _download_worker(ref):
                         continue
                     ev = json.loads(line)
                     if "error" in ev:
+                        if ref.startswith("hf.co/") and "blocked redirect to a different host" in ev["error"]:
+                            _hf_ollama_fallback(ref, d)
+                            d.update(state="done", msg="Done", finished=time.time())
+                            _set_pending(ref, False)
+                            _dl_finished["count"] += 1
+                            return
                         raise ValueError(ev["error"])
                     if ev.get("digest") and ev.get("total"):
                         layers[ev["digest"]] = (ev.get("completed", 0), ev["total"])
