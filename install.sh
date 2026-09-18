@@ -311,4 +311,8 @@ if [ -n "$DATA_FILE" ] && [ -s "$DATA_DIR_SRC/ollama-models.txt" ] && [ "$PULL_M
   info "Your chat models weren't copied. Re-download them in the app, or re-run with: --data FILE --pull-models"
 fi
 info "LLM Scanner checks GitHub for new versions at startup and every 6 hours, and shows an Update button."
-info "Image models: download them again from the Images tab (your custom ones are listed with a Download button)."
+if [ -n "$DATA_FILE" ]; then
+  info "Image models: download them again from the Images tab (the ones you used are listed with a Download button)."
+else
+  info "Download chat models from the Models tab and image models from the Images tab."
+fi
