@@ -1401,6 +1401,17 @@ IMAGE_MODEL_DIR = DATA_DIR / "image-models"
 IMAGES_DIR = DATA_DIR / "images"
 HF_RESOLVE = "https://huggingface.co/{repo}/resolve/main/{path}"
 
+
+def _hf_cached_file(repo, path, cache_dir):
+    """Download through huggingface-hub when available, avoiding CDN redirects blocked by some networks."""
+    try:
+        from huggingface_hub import hf_hub_download
+        return Path(hf_hub_download(repo_id=repo_from_text(repo), filename=path.lstrip("/"),
+                                    repo_type="model", cache_dir=str(cache_dir)))
+    except (ImportError, OSError, RuntimeError, ValueError):
+        return None
+
+
 SHARED_DIR = IMAGE_MODEL_DIR / "shared"      # companion files (text encoders, VAEs) reused across models
 CUSTOM_IMAGE_FILE = DATA_DIR / "image_models.json"
 
@@ -1690,13 +1701,25 @@ def _image_download_worker(ref):
         try:
             sizes = []
             for repo, path, _ in files:
-                head = requests.head(HF_RESOLVE.format(repo=repo, path=path), allow_redirects=True, timeout=20)
-                head.raise_for_status()
-                sizes.append(int(head.headers.get("content-length", 0)))
+                cached = _hf_cached_file(repo, path, IMAGE_MODEL_DIR / ".hf-cache")
+                if cached is not None:
+                    sizes.append(cached.stat().st_size)
+                else:
+                    head = requests.head(HF_RESOLVE.format(repo=repo, path=path), allow_redirects=True, timeout=20)
+                    head.raise_for_status()
+                    sizes.append(int(head.headers.get("content-length", 0)))
             total = sum(sizes)
             for (repo, path, dest), size in zip(files, sizes, strict=True):
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 if dest.exists() and dest.stat().st_size == size:
+                    continue
+                cached = _hf_cached_file(repo, path, IMAGE_MODEL_DIR / ".hf-cache")
+                if cached is not None:
+                    shutil.copyfile(cached, dest)
+                    d.update(state="downloading", msg="Downloading", done=sum(
+                        p.stat().st_size if p.exists() else 0
+                        for p in [f[2] for f in files] +
+                        [f[2].with_name(f[2].name + ".part") for f in files]), total=total)
                     continue
                 part = dest.with_name(dest.name + ".part")
                 have = part.stat().st_size if part.exists() else 0
