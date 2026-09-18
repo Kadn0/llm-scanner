@@ -53,7 +53,7 @@
   // Probes tab's list (its text comes from the hidden #probe-tips element). One floating panel, so cards never clip it.
   const tipBox = document.createElement('div');
   tipBox.className = 'tip-box';
-  tipBox.innerHTML = '<div class="tip-title"></div><div class="tip-body"></div>';
+  tipBox.innerHTML = '<span class="pt-icon"></span><div class="pt-text"><div class="tip-title"></div><div class="tip-body"></div></div>';
   document.body.appendChild(tipBox);
   let probeTips = null;
   let tipTimer = 0;

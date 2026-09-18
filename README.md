@@ -182,6 +182,9 @@ It lists what will be deleted and asks before doing anything.
 
 ## Changelog
 
+- **1.0.15**: The models table shows a small Hugging Face or Ollama logo beside each model instead of a Source
+  column, and clicking a model opens its Hugging Face or Ollama page. Probe explanations appear in a quieter pop-up
+  tip, and each group lists "Hover a probe or family to see what it does" underneath.
 - **1.0.14**: Updates are checked when the app starts and with a **Check for updates** button (no more background
   checks), and shown in a small box beside the title with an Update button per item and Update all. Leftover files
   (abandoned downloads, the old Hugging Face cache, failed update files, unsent attachments) are cleaned up at every
