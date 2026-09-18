@@ -2752,8 +2752,38 @@ with gr.Blocks(title="LLM Scanner") as ui:
         model_hint, scan_model, [model_note, tmo]).then(
         refresh_reports, outputs=rep).then(show_report, [rep, raw_pick], [rep_summary, rep_view, raw_view, rep_files])
 
+def ensure_desktop_integration():
+    """Install the app icon and keep our own launcher entries pointing at it and at this app."""
+    icons = Path.home() / ".local/share/icons/hicolor"
+    for src, dest in ((APP_DIR / "static/icon.svg", icons / "scalable/apps/llm-scanner.svg"),
+                      (APP_DIR / "static/icon.png", icons / "256x256/apps/llm-scanner.png")):
+        if src.exists() and (not dest.exists() or dest.read_bytes() != src.read_bytes()):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dest)
+    launcher = APP_DIR / "llm-scanner.sh"
+    try:
+        desktop_dir = Path(subprocess.run(["xdg-user-dir", "DESKTOP"], capture_output=True, text=True,
+                                          timeout=5).stdout.strip() or Path.home() / "Desktop")
+    except Exception:
+        desktop_dir = Path.home() / "Desktop"
+    for entry in (Path.home() / ".local/share/applications/llm-scanner.desktop",
+                  Path.home() / ".config/autostart/llm-scanner.desktop", desktop_dir / "llm-scanner.desktop"):
+        try:
+            text = entry.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        fixed = re.sub(r"^Icon=.*$", "Icon=llm-scanner", text, flags=re.M)
+        fixed = re.sub(r"^Exec=.*$", f"Exec={launcher}", fixed, flags=re.M)
+        if fixed != text:
+            entry.write_text(fixed, encoding="utf-8")
+
+
 if __name__ == "__main__":
     if not CHECK_ONLY:
+        try:
+            ensure_desktop_integration()
+        except Exception:
+            pass
         CHAT_INDEX.build()
         migrate_shared_files()
         unload_models()  # start with nothing in memory; models load only for a chat reply or a scan
@@ -2761,4 +2791,5 @@ if __name__ == "__main__":
         threading.Thread(target=_update_loop, daemon=True).start()
     ui.queue().launch(server_name="127.0.0.1", server_port=int(os.environ.get("LLM_SCANNER_PORT", 7861)),
                       inbrowser="--no-browser" not in sys.argv, allowed_paths=[str(GARAK_RUNS), str(ATTACH_DIR), str(IMAGES_DIR)],
-                      theme=THEME, css=CSS, footer_links=[], js=APP_JS)
+                      theme=THEME, css=CSS, footer_links=[], js=APP_JS,
+                      favicon_path=str(APP_DIR / "static/icon.png"))

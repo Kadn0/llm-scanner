@@ -48,6 +48,9 @@ systemctl --user disable --now llm-scanner ollama >/dev/null 2>&1 || true
 rm -f "$HOME/.config/systemd/user/llm-scanner.service" "$HOME/.config/systemd/user/ollama.service"
 systemctl --user daemon-reload >/dev/null 2>&1 || true
 rm -f "$HOME/.local/share/applications/llm-scanner.desktop" "$HOME/.config/autostart/llm-scanner.desktop"
+rm -f "$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop")/llm-scanner.desktop"
+rm -f "$HOME/.local/share/icons/hicolor/scalable/apps/llm-scanner.svg" \
+      "$HOME/.local/share/icons/hicolor/256x256/apps/llm-scanner.png"
 rm -rf "$HOME/.local/ollama" "$HOME/.local/sd-cpp"
 rm -f "$HOME/.local/bin/ollama"
 

@@ -269,20 +269,34 @@ EOF
     warn "Couldn't enable start-at-boot (the system didn't allow it without sudo). Services will start when you log in instead."
   fi
 
+  icons="$HOME/.local/share/icons/hicolor"
+  mkdir -p "$icons/scalable/apps" "$icons/256x256/apps"
+  cp "$APP_DIR/static/icon.svg" "$icons/scalable/apps/llm-scanner.svg"
+  cp "$APP_DIR/static/icon.png" "$icons/256x256/apps/llm-scanner.png"
+
   desktop="$HOME/.local/share/applications"
   mkdir -p "$desktop"
   cat > "$desktop/llm-scanner.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=LLM Scanner
-Comment=Pull models from Hugging Face or Ollama, chat, generate images, and scan with garak
+Comment=Download models, chat, generate images, and scan AI models with garak
 Exec=$APP_DIR/llm-scanner.sh
-Icon=security-high
+Icon=llm-scanner
 Terminal=false
 Categories=Development;Security;
+StartupNotify=false
 EOF
   command -v update-desktop-database >/dev/null && update-desktop-database "$desktop" >/dev/null 2>&1 || true
   info "Added LLM Scanner to your app menu"
+
+  # Desktop shortcut: the same launcher, shown on the desktop.
+  desk_dir="$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop")"
+  mkdir -p "$desk_dir"
+  cp "$desktop/llm-scanner.desktop" "$desk_dir/llm-scanner.desktop"
+  chmod +x "$desk_dir/llm-scanner.desktop"
+  if command -v gio >/dev/null; then gio set "$desk_dir/llm-scanner.desktop" metadata::trusted true 2>/dev/null || true; fi
+  info "Added an LLM Scanner shortcut to your desktop"
   if [ "$AUTOSTART" = "1" ]; then
     mkdir -p "$HOME/.config/autostart"
     cat > "$HOME/.config/autostart/llm-scanner.desktop" <<EOF
@@ -291,7 +305,7 @@ Type=Application
 Name=LLM Scanner
 Comment=Open LLM Scanner when you log in
 Exec=$APP_DIR/llm-scanner.sh
-Icon=security-high
+Icon=llm-scanner
 Terminal=false
 X-GNOME-Autostart-enabled=true
 X-GNOME-Autostart-Delay=5

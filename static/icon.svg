@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2a2a2e"/>
+      <stop offset="1" stop-color="#0b0b0d"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4fb0ff"/>
+      <stop offset="1" stop-color="#0060d6"/>
+    </linearGradient>
+    <linearGradient id="beam" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0.95"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#bg)"/>
+  <rect x="8.5" y="8.5" width="239" height="239" rx="55.5" fill="none" stroke="#ffffff" stroke-opacity="0.08"/>
+  <!-- shield -->
+  <path d="M128 38 L196 64 V122 C196 165 167 199 128 216 C89 199 60 165 60 122 V64 Z" fill="url(#shield)"/>
+  <path d="M128 38 L196 64 V122 C196 165 167 199 128 216 C89 199 60 165 60 122 V64 Z" fill="none"
+        stroke="#ffffff" stroke-opacity="0.25" stroke-width="2"/>
+  <!-- AI spark -->
+  <path d="M128 78 C131 104 140 113 166 116 C140 119 131 128 128 154 C125 128 116 119 90 116 C116 113 125 104 128 78 Z"
+        fill="#ffffff"/>
+  <circle cx="160" cy="88" r="7" fill="#ffffff" fill-opacity="0.85"/>
+  <!-- scan line -->
+  <rect x="70" y="170" width="116" height="5" rx="2.5" fill="url(#beam)"/>
+</svg>
