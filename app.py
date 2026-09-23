@@ -3819,7 +3819,8 @@ def clean_leftovers():
             continue
         for f in ([path] if path.is_file() else [p for p in path.rglob("*") if p.is_file() and not p.is_symlink()]):
             files += 1
-            size += f.stat().st_blocks * 512  # disk actually used; Ollama's partial layers are sparse
+            st = f.stat()
+            size += min(st.st_size, st.st_blocks * 512)  # Ollama's partial layers are sparse: count the disk used
         shutil.rmtree(path, ignore_errors=True) if path.is_dir() else path.unlink(missing_ok=True)
     return files, size
 

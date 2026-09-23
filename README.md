@@ -182,6 +182,14 @@ It lists what will be deleted and asks before doing anything.
 
 ## Changelog
 
+- **1.1.1**: A scan cut short by LLM Scanner stopping or the computer shutting down resumes at the next start with
+  only the probes it had not finished (saved as a new part of the same scan), and the Scan tab shows a running scan
+  after the page is reloaded. Deleting a download also deletes the partial data Ollama kept for it, and leftover
+  partial data is cleared at startup. Version lists show how each version splits across video and system memory;
+  versions Ollama can't load are greyed out with an icon that explains why, and can still be downloaded. The Scan
+  tab marks models Ollama can't load and won't scan them. Choosing an option by clicking its name works again, hover
+  explanations are no longer hidden behind open lists, the Models tab no longer pads cards with empty space, and in
+  Reports the box selects while clicking a name shows that report.
 - **1.1.0**: Downloading a Hugging Face model no longer fails on a name Ollama doesn't recognise. Versions are named
   the way the repository names them (`dspark-bf16`, `PQ2_0`, `UD-Q5_K_XL`), and if Ollama refuses a tag for any
   reason the app fetches the file itself. Versions in a format Ollama cannot load are marked and never recommended,
