@@ -1209,6 +1209,20 @@ def hf_find_repos(query):
     return [m["id"] for m in res.json()], q
 
 
+# The quantization at the end of a GGUF filename, with any prefix it carries: Q4_K_M, IQ3_XS, UD-Q5_K_XL, BF16, and
+# repository-specific ones such as PQ2_0 or PTQ1_0. It must follow a separator, so "PQ2_0" is never read as "Q2_0".
+QUANT_IN_NAME = re.compile(r"(?:^|[-_.])((?:UD-)?[A-Za-z]{0,3}(?:Q\d[\w.]*|BF16|F16|F32|FP16|MXFP4[\w.]*))\.gguf$", re.I)
+
+
+# Quantizations Ollama's own llama.cpp can load. Some repositories ship formats that need their own llama.cpp build
+# (for example Prism's ternary PQ2_0 and PTQ1_0); those are offered but marked, because Ollama cannot run them.
+STANDARD_QUANT = re.compile(r"^(?:UD-)?(?:I?Q\d(?:_\w+)*|TQ\d_\d|BF16|F16|F32|FP16|MXFP4(?:_\w+)*)$", re.I)
+
+
+def runs_in_ollama(tag):
+    return bool(STANDARD_QUANT.match(tag.split(":", 1)[-1]))
+
+
 def hf_versions(repo):
     """[(size_gb, tag)] for single-file GGUF quantizations in a Hugging Face repo."""
     res = requests.get(f"{HF_API}/models/{repo_from_text(repo)}/tree/main", params={"recursive": "true"}, timeout=15)
@@ -1220,7 +1234,7 @@ def hf_versions(repo):
         if (not low.endswith(".gguf") or any(k in low for k in ("mmproj", "imatrix", "mtp"))
                 or re.search(r"-\d{5}-of-\d{5}", low)):
             continue
-        m = re.search(r"((?:UD-)?(?:I?Q\d\w*|BF16|F16|F32))\.gguf$", name, re.I)
+        m = QUANT_IN_NAME.search(name)
         if m:
             opts[m.group(1)] = f.get("size", 0) / 1e9
     return sorted((size, tag) for tag, size in opts.items())
@@ -1338,16 +1352,22 @@ def list_versions(source, repo):
         yield (gr.update(choices=[PLEASE_CHOOSE], value="", interactive=False), note_html(msg, "error"),
                gr.update(interactive=False), hide)
         return
-    best = best_version(opts)
+    usable = [o for o in opts if runs_in_ollama(o[1])]
+    best = best_version(usable or opts)  # never recommend a format Ollama can't load
     choices = [PLEASE_CHOOSE] + [
-        (f"{tag.split(':', 1)[-1]}   {size:.1f} GB   {fit_label(size)}" + ("   (Recommended)" if tag == best else ""), tag)
-        for size, tag in opts]
+        (f"{tag.split(':', 1)[-1]}   {size:.1f} GB   " + (fit_label(size) if runs_in_ollama(tag) else
+                                                          "needs its own llama.cpp build")
+         + ("   (Recommended)" if tag == best else ""), tag) for size, tag in opts]
     size = next(sz for sz, t in opts if t == best)
     desc = _ollama_meta.get(repo, {}).get("desc", "") if source == SRC_OLLAMA else ""
     why = (f"Auto-selected {best.split(':', 1)[-1]} ({size:.1f} GB), the largest version under {VRAM_BUDGET_GB} GB "
            "so it runs fully on your GPU." if size <= VRAM_BUDGET_GB else
            f"No version fits under {VRAM_BUDGET_GB} GB, so the smallest ({size:.1f} GB) was selected; it will "
            "run partly in system memory.")
+    skipped = [t for _, t in opts if not runs_in_ollama(t)]
+    if skipped:
+        why += (f" {', '.join(skipped)} " + ("is" if len(skipped) == 1 else "are") +
+                " in a format Ollama cannot load: it needs the llama.cpp build from the model's authors.")
     yield (gr.update(choices=choices, value=best, interactive=True),
            note_html((desc + " " if desc else "") + why), gr.update(interactive=True), hide)
 

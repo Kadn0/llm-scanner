@@ -182,6 +182,9 @@ It lists what will be deleted and asks before doing anything.
 
 ## Changelog
 
+- **1.0.16**: Version names of Hugging Face models are read in full, so repository-specific quantizations such as
+  `PQ2_0` are no longer offered as `Q2_0` and then fail to download. Versions in a format Ollama cannot load (they
+  need the model author's own llama.cpp build) are marked in the list and never recommended.
 - **1.0.15**: The models table shows a small Hugging Face or Ollama logo beside each model instead of a Source
   column, and clicking a model opens its Hugging Face or Ollama page. Probe explanations appear in a quieter pop-up
   tip, and each group lists "Hover a probe or family to see what it does" underneath.

@@ -142,6 +142,36 @@ class VersionPicking(unittest.TestCase):
             got = app.hf_versions("x/y")
         self.assertEqual([t for _, t in got], ["IQ3_XS", "Q4_K_M", "UD-Q5_K_XL", "bf16"])
 
+    def test_hf_versions_keeps_the_whole_quantization_name(self):
+        """Repositories use their own quantization names (PQ2_0, PTQ1_0); reading them as Q2_0 asks for a file
+        that does not exist."""
+        tree = [{"path": "Ternary-Bonsai-2-27B-PQ2_0.gguf", "size": 7.2e9},
+                {"path": "Ternary-Bonsai-2-27B-PTQ1_0.gguf", "size": 5.9e9},
+                {"path": "Ternary-Bonsai-2-27B-F16.gguf", "size": 53.8e9},
+                {"path": "Ternary-Bonsai-2-27B-mmproj-BF16.gguf", "size": 0.9e9}]
+        with mock.patch.object(app.requests, "get", return_value=FakeResponse(tree)):
+            got = app.hf_versions("prism-ml/Ternary-Bonsai-2-27B-gguf")
+        self.assertEqual([t for _, t in got], ["PTQ1_0", "PQ2_0", "F16"])
+        with mock.patch.object(app.requests, "get", return_value=FakeResponse(tree)):
+            files = app._hf_gguf_files("prism-ml/Ternary-Bonsai-2-27B-gguf", "PQ2_0")
+        self.assertEqual(files[0][0], "Ternary-Bonsai-2-27B-PQ2_0.gguf")
+        self.assertEqual(files[1][0], "Ternary-Bonsai-2-27B-mmproj-BF16.gguf")
+
+    def test_formats_ollama_cannot_load_are_marked_not_recommended(self):
+        for tag in ("Q4_K_M", "UD-Q5_K_XL", "IQ3_XS", "TQ1_0", "BF16", "F16", "MXFP4_MOE", "q8_0"):
+            self.assertTrue(app.runs_in_ollama(tag), tag)
+        for tag in ("PQ2_0", "PTQ1_0", "AWQ4"):
+            self.assertFalse(app.runs_in_ollama(tag), tag)
+        tree = [{"path": "M-PQ2_0.gguf", "size": 7.2e9}, {"path": "M-PTQ1_0.gguf", "size": 5.9e9},
+                {"path": "M-F16.gguf", "size": 53.8e9}]
+        with mock.patch.object(app.requests, "get", return_value=FakeResponse(tree)):
+            versions, note, *_ = list(app.list_versions(app.SRC_HF, "prism-ml/x-gguf"))[-1]
+        self.assertEqual(versions["value"], "F16", "a format Ollama can load must be the recommended one")
+        labels = dict((v, lbl) for lbl, v in versions["choices"] if v)
+        self.assertIn("needs its own llama.cpp build", labels["PQ2_0"])
+        self.assertNotIn("needs its own", labels["F16"])
+        self.assertIn("PTQ1_0, PQ2_0 are in a format Ollama cannot load", note)
+
     def test_fit_label(self):
         with mock.patch.object(app, "VRAM_BUDGET_GB", 7.5), mock.patch.object(app, "ram_gb", return_value=32):
             self.assertEqual(app.fit_label(7), "fits on GPU, fast")
