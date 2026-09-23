@@ -14,6 +14,7 @@ security weaknesses with [garak](https://github.com/NVIDIA/garak). It runs entir
   with a gallery. Image models can be found through Hugging Face search too.
 - **Scanning**: garak probes, saved probe groups, a live progress bar, and a security-analyst report with OWASP
   LLM Top 10 mapping, evidence, remediation, and the raw garak data.
+- **Settings**: save a Hugging Face access token to reach gated and private models, kept on this machine only.
 - **Housekeeping**: models load only while in use, a live GPU/RAM status bar, start at boot, and one-click
   verified updates for LLM Scanner, Ollama, and garak.
 
@@ -90,7 +91,8 @@ To install from a clone instead: `git clone https://github.com/Kadn0/llm-scanner
 ## Move to a new machine (optional)
 
 A fresh install starts empty: no models, chats, images, or reports. If you do want to bring your chats, images,
-probe groups, and scan reports along (models are never copied), export them on the old machine:
+probe groups, and scan reports along (models and your Hugging Face token are never copied), export them on the old
+machine:
 
 ```bash
 ~/llm-scanner/export-data.sh
@@ -182,6 +184,13 @@ It lists what will be deleted and asks before doing anything.
 
 ## Changelog
 
+- **1.1.2**: A **Settings** tab with a Hugging Face access token, so gated models (the ones whose conditions you
+  accept on their Hugging Face page) and models in your private repositories can be downloaded, and searches and
+  downloads are no longer limited to what Hugging Face allows anonymously. The token is checked with Hugging Face
+  before it is saved, is stored on this computer only in `data/settings.json` where just your account can read it,
+  is never shown in full again, and is left out of `export-data.sh` archives. A download Hugging Face refuses now
+  says whether a token is missing or the account it belongs to has no access to that model. If you already have
+  `HF_TOKEN` set on this machine, it is used when nothing is saved in the app.
 - **1.1.1**: A scan cut short by LLM Scanner stopping or the computer shutting down resumes at the next start with
   only the probes it had not finished (saved as a new part of the same scan), and the Scan tab shows a running scan
   after the page is reloaded. Deleting a download also deletes the partial data Ollama kept for it, and leftover

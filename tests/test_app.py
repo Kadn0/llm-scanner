@@ -63,6 +63,7 @@ class TempDataTest(unittest.TestCase):
             "GROUPS_FILE": data / "probe_groups.json", "DOWNLOADS_FILE": data / "downloads.json",
             "GARAK_RUNS": self.tmp / "garak_runs", "CHAT_INDEX": app.ChatIndex(), "SCAN_JOB": data / "scan_job.json",
             "OLLAMA_BLOBS": self.tmp / "ollama-blobs", "PULL_LAYERS_FILE": data / "pull_layers.json",
+            "SETTINGS_FILE": data / "settings.json",
         }
         for name, value in patches.items():
             p = mock.patch.object(app, name, value)
@@ -178,6 +179,149 @@ class VersionPicking(unittest.TestCase):
             self.assertEqual(app.fit_breakdown(7), "7.0 GB VRAM")
             self.assertEqual(app.fit_breakdown(20), "7.5 GB VRAM + 12.5 GB RAM")
             self.assertEqual(app.fit_breakdown(40), "40.0 GB \u2014 too large for this PC")
+
+
+# ---------------------------------------------------------------- settings and the Hugging Face token
+class HuggingFaceToken(TempDataTest):
+    TOKEN = "hf_abcdefghijklmnop"
+
+    def setUp(self):
+        super().setUp()
+        env = mock.patch.dict(os.environ, {n: "" for n in app.HF_TOKEN_ENV})  # ignore a real login on this machine
+        env.start()
+        self.addCleanup(env.stop)
+        app._hf_meta.clear()
+
+    def save(self, token, response=None, offline=False):
+        kw = {"side_effect": OSError("offline")} if offline else {"return_value": response or FakeResponse({"name": "kadn"})}
+        with mock.patch.object(app.requests, "get", **kw):
+            return app.save_hf_token(token)
+
+    def test_nothing_saved_reads_as_empty(self):
+        self.assertEqual(app.read_settings(), {})
+        self.assertEqual(app.hf_token(), "")
+        self.assertEqual(app.hf_headers(), {})
+
+    def test_an_unreadable_settings_file_is_ignored(self):
+        for text in ("not json at all", '["a list, not an object"]'):
+            app.SETTINGS_FILE.write_text(text, encoding="utf-8")
+            self.assertEqual(app.read_settings(), {})
+            self.assertEqual(app.hf_token(), "")
+
+    def test_a_saved_token_is_used_and_kept_private(self):
+        app.write_settings({"hf_token": self.TOKEN})
+        self.assertEqual(app.hf_token(), self.TOKEN)
+        self.assertEqual(app.hf_headers(), {"Authorization": f"Bearer {self.TOKEN}"})
+        self.assertEqual(app.SETTINGS_FILE.stat().st_mode & 0o777, 0o600, "a credential must not be world-readable")
+
+    def test_the_environment_is_a_fallback_and_a_saved_token_wins(self):
+        with mock.patch.dict(os.environ, {"HF_TOKEN": "hf_from_the_environment"}):
+            self.assertEqual(app.hf_token(), "hf_from_the_environment")
+            app.write_settings({"hf_token": self.TOKEN})
+            self.assertEqual(app.hf_token(), self.TOKEN)
+
+    def test_the_token_only_goes_to_hugging_face(self):
+        """Downloads redirect to Xet storage on another domain; the credential must not follow them there."""
+        app.write_settings({"hf_token": self.TOKEN})
+        self.assertIn("Authorization", app.hf_headers("https://huggingface.co/o/r/resolve/main/m.gguf"))
+        for elsewhere in ("https://cas-bridge.xethub.hf.co/x", "https://example.com/huggingface.co/x",
+                          "https://ollama.com/library/qwen3"):
+            self.assertEqual(app.hf_headers(elsewhere), {}, elsewhere)
+
+    def test_mask_token(self):
+        self.assertEqual(app.mask_token(self.TOKEN), "hf_\u2026mnop")
+        self.assertEqual(app.mask_token("short"), "\u2026")
+        self.assertEqual(app.mask_token(""), "")
+
+    def test_saving_checks_the_token_and_reports_the_account(self):
+        box, note = self.save(f"  {self.TOKEN}  ")  # pasted with stray whitespace
+        self.assertEqual(app.hf_token(), self.TOKEN)
+        self.assertEqual(box["value"], "", "the box is cleared so the secret does not sit in the page")
+        self.assertIn("kadn", note)
+
+    def test_a_rejected_token_is_not_saved(self):
+        _, note = self.save("hf_wrong_token_value", FakeResponse({"error": "unauthorized"}, status=401))
+        self.assertEqual(app.hf_token(), "")
+        self.assertIn("rejected", note)
+
+    def test_a_token_is_still_saved_when_hugging_face_cannot_be_reached(self):
+        _, note = self.save(self.TOKEN, offline=True)
+        self.assertEqual(app.hf_token(), self.TOKEN)
+        self.assertIn("be reached to check it", note)  # note_html escapes the apostrophe in "couldn't"
+        self.assertNotIn(self.TOKEN, note, "the note shows a masked token, never the whole one")
+
+    def test_saving_an_empty_box_explains_itself_and_changes_nothing(self):
+        app.write_settings({"hf_token": self.TOKEN})
+        _, note = self.save("   ")
+        self.assertEqual(app.hf_token(), self.TOKEN)
+        self.assertIn("Enter a token", note)
+
+    def test_other_settings_survive_saving_and_removing_a_token(self):
+        app.write_settings({"something_else": "kept"})
+        self.save(self.TOKEN)
+        self.assertEqual(app.read_settings()["something_else"], "kept")
+        app.remove_hf_token()
+        self.assertEqual(app.read_settings(), {"something_else": "kept"})
+        self.assertEqual(app.hf_token(), "")
+
+    def test_removing_falls_back_to_the_environment(self):
+        app.write_settings({"hf_token": self.TOKEN})
+        with mock.patch.dict(os.environ, {"HF_TOKEN": "hf_from_the_environment"}):
+            _, note = app.remove_hf_token()
+            self.assertEqual(app.hf_token(), "hf_from_the_environment")
+            self.assertIn("HF_TOKEN", note)
+
+    def test_the_status_line_never_shows_the_whole_token(self):
+        app.write_settings({"hf_token": self.TOKEN})
+        note = app.hf_token_status()
+        self.assertIn(app.mask_token(self.TOKEN), note)
+        self.assertNotIn(self.TOKEN, note)
+
+    def test_repository_requests_carry_the_token(self):
+        app.write_settings({"hf_token": self.TOKEN})
+        seen = []
+
+        def get(url, **kw):
+            seen.append((kw.get("headers") or {}).get("Authorization"))
+            return FakeResponse([] if "/tree/" in url or url.endswith("/models") else {})
+
+        with mock.patch.object(app.requests, "get", side_effect=get):
+            app.hf_find_repos("smollm")
+            app.hf_gguf_catalog("o/r")
+            app.hf_repo_info("o/r")
+        self.assertEqual(seen, [f"Bearer {self.TOKEN}"] * 3)
+
+    def test_downloads_send_the_token_to_hugging_face_only(self):
+        app.write_settings({"hf_token": self.TOKEN})
+        seen = {}
+
+        def get(url, **kw):
+            seen[url] = kw.get("headers") or {}
+            return FakeResponse(lines=[b"12345678"], status=200)
+
+        hf, xet = "https://huggingface.co/o/r/resolve/main/a.gguf", "https://cas-bridge.xethub.hf.co/a"
+        with mock.patch.object(app.requests, "get", side_effect=get):
+            for url, name in ((hf, "a.gguf"), (xet, "b.gguf")):
+                app.fetch_file(url, self.tmp / name, 8, lambda: False, lambda: None)
+        self.assertEqual(seen[hf]["Authorization"], f"Bearer {self.TOKEN}")
+        self.assertNotIn("Authorization", seen[xet])
+
+    def test_a_refused_download_says_how_to_fix_it(self):
+        denied = FakeResponse({"error": "Access to model o/r is restricted"}, status=403)
+        url = "https://huggingface.co/o/r/resolve/main/m.gguf"
+        with mock.patch.object(app.requests, "get", return_value=denied):
+            with self.assertRaises(app.PermanentDownloadError) as no_token:
+                app.fetch_file(url, self.tmp / "m.gguf", 8, lambda: False, lambda: None)
+            app.write_settings({"hf_token": self.TOKEN})
+            with self.assertRaises(app.PermanentDownloadError) as wrong_token:
+                app.fetch_file(url, self.tmp / "m.gguf", 8, lambda: False, lambda: None)
+        self.assertIn("Settings tab", str(no_token.exception))
+        self.assertIn("doesn't grant access", str(wrong_token.exception))
+
+    def test_startup_cleanup_keeps_the_settings_file(self):
+        app.write_settings({"hf_token": self.TOKEN})
+        app.clean_leftovers()
+        self.assertEqual(app.hf_token(), self.TOKEN)
 
 
 # ---------------------------------------------------------------- chats

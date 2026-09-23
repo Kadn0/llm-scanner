@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -30,10 +31,11 @@ DATA_DIR = Path(os.environ.get("LLM_SCANNER_DATA") or APP_DIR / "data")  # overr
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 OLLAMA = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
-HF_API = "https://huggingface.co/api"
+HF_API = os.environ.get("LLM_SCANNER_HF_API") or "https://huggingface.co/api"  # overridable for tests
 OLLAMA_WEB = os.environ.get("LLM_SCANNER_OLLAMA_WEB", "https://ollama.com")  # overridable for tests
 GARAK_RUNS = Path(os.environ.get("LLM_SCANNER_GARAK_RUNS") or Path.home() / ".local/share/garak/garak_runs")
 GROUPS_FILE = DATA_DIR / "probe_groups.json"
+SETTINGS_FILE = DATA_DIR / "settings.json"  # what the Settings tab saves, including the Hugging Face token
 PY = sys.executable
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 EMOJI = re.compile("[\U0001F000-\U0001FAFF☀-➿⬀-⯿️‍]+ ?")
@@ -56,6 +58,73 @@ PRESETS = {
 }
 
 _proc = {"p": None}
+
+
+# ---------------------------------------------------------------- settings
+def read_settings():
+    """Everything the Settings tab has saved, or {} when nothing has been saved yet."""
+    try:
+        saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return saved if isinstance(saved, dict) else {}
+
+
+def write_settings(values):
+    """Save settings so only this user can read them: the Hugging Face token is a credential."""
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = SETTINGS_FILE.with_name(SETTINGS_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(values, indent=2), encoding="utf-8")
+    tmp.chmod(0o600)
+    tmp.replace(SETTINGS_FILE)  # replace in one step, so a crash can't leave a half-written file
+
+
+# The variables Hugging Face's own tools read, so a login already set up on this machine is picked up.
+HF_TOKEN_ENV = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN")
+
+
+def hf_token():
+    """The Hugging Face access token: the one saved in the app, otherwise one from the environment."""
+    saved = str(read_settings().get("hf_token") or "").strip()
+    return saved or next((v for n in HF_TOKEN_ENV if (v := str(os.environ.get(n) or "").strip())), "")
+
+
+def _is_hf_url(url):
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    return host == "huggingface.co" or host.endswith(".huggingface.co")
+
+
+def hf_headers(url=None):
+    """The Authorization header for Hugging Face when a token is set, {} when there is none.
+
+    Only ever added for huggingface.co itself: downloads are redirected to Hugging Face's Xet storage on another
+    domain, and requests drops the header again on a cross-host redirect. A credential must not follow a request
+    off the host it was meant for."""
+    if url is not None and not _is_hf_url(url):
+        return {}
+    token = hf_token()
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def mask_token(token):
+    """A token shown back to the user: enough to recognize it, not enough to use it."""
+    return f"{token[:3]}\u2026{token[-4:]}" if len(token) > 12 else "\u2026" if token else ""
+
+
+def hf_whoami(token):
+    """(account name, error) for a token. Both empty means Hugging Face couldn't be reached to check it."""
+    try:
+        res = requests.get(f"{HF_API}/whoami-v2", headers={"Authorization": f"Bearer {token}"}, timeout=15)
+    except Exception:
+        return "", ""
+    if res.status_code in (401, 403):
+        return "", "Hugging Face rejected this token. Check it was copied in full and has read access."
+    if not res.ok:
+        return "", ""
+    try:
+        return str(res.json().get("name") or ""), ""
+    except ValueError:
+        return "", ""
 
 
 # ---------------------------------------------------------------- system helpers
@@ -1236,7 +1305,7 @@ def hf_find_repos(query):
     q = repo_from_text(query)
     if "/" in q and q.lower().endswith("gguf"):
         return [q], q
-    res = requests.get(f"{HF_API}/models", timeout=15, params={
+    res = requests.get(f"{HF_API}/models", timeout=15, headers=hf_headers(), params={
         "search": q.split("/")[-1], "filter": "gguf", "sort": "downloads", "limit": 25})
     res.raise_for_status()
     return [m["id"] for m in res.json()], q
@@ -1265,7 +1334,8 @@ def hf_gguf_catalog(repo):
     A file's tag is what tells it apart from the others in the repo, so it matches what the repository shows:
     Q4_K_M, UD-Q5_K_XL, PQ2_0, dspark-bf16. Repositories name their files differently, so the shared part of the
     names is dropped rather than guessing which part is the quantization."""
-    res = requests.get(f"{HF_API}/models/{repo_from_text(repo)}/tree/main", params={"recursive": "true"}, timeout=30)
+    res = requests.get(f"{HF_API}/models/{repo_from_text(repo)}/tree/main", params={"recursive": "true"},
+                       headers=hf_headers(), timeout=30)
     _check_response(res, f"Listing files of {repo}")
     ggufs = [(e["path"], int(e.get("size") or 0)) for e in res.json()
              if e.get("path", "").lower().endswith(".gguf") and not SHARD_IN_NAME.search(e["path"].lower())]
@@ -1297,7 +1367,7 @@ def hf_repo_info(repo):
     repo = repo_from_text(repo)
     if repo not in _hf_meta:
         try:
-            d = requests.get(f"{HF_API}/models/{repo}", timeout=15).json()
+            d = requests.get(f"{HF_API}/models/{repo}", headers=hf_headers(), timeout=15).json()
             card = d.get("cardData") or {}
             base = card.get("base_model")
             _hf_meta[repo] = {"base": (base[0] if isinstance(base, list) else base) or "",
@@ -1527,13 +1597,26 @@ def _check_response(response, operation):
     response.raise_for_status()
 
 
+def _hf_denied(name, response):
+    """Hugging Face refused a download: say whether a token is missing, or the account simply has no access."""
+    detail = response_error(response, f"Downloading {name}")
+    if not hf_token():
+        return (f"{detail}. This model is gated or private. Accept its conditions on its Hugging Face page, then "
+                "add a Hugging Face token on the Settings tab.")
+    return (f"{detail}. The Hugging Face token in use doesn't grant access to this model. Accept its conditions "
+            "on its Hugging Face page, or save a token from an account that has access.")
+
+
 def fetch_file(url, dest, size, should_stop, on_progress):
     """Download url to dest, resuming from dest.part with an HTTP range request. Returns False if should_stop()
     interrupted it (the partial file is kept), True once dest is complete."""
     part = dest.with_name(dest.name + ".part")
     have = part.stat().st_size if part.exists() else 0
     headers = {"Range": f"bytes={have}-"} if have else {}
+    headers.update(hf_headers(url))  # gated and private models; dropped again on the redirect to Xet storage
     with requests.get(url, headers=headers, stream=True, timeout=(15, 120), allow_redirects=True) as r:
+        if r.status_code in (401, 403) and _is_hf_url(url):
+            raise PermanentDownloadError(_hf_denied(dest.name, r))
         if r.status_code != 416:  # 416: the partial file is already complete
             _check_response(r, f"Downloading {dest.name}")
             if have and r.status_code != 206:  # server ignored the range: start this file over
@@ -2088,7 +2171,8 @@ def detect_family(repo):
 
 def image_repo_files(repo, family):
     """[(size_gb, path)] of files usable as the main model for this family."""
-    res = requests.get(f"{HF_API}/models/{repo}/tree/main", params={"recursive": "true"}, timeout=15)
+    res = requests.get(f"{HF_API}/models/{repo}/tree/main", params={"recursive": "true"}, headers=hf_headers(),
+                       timeout=15)
     res.raise_for_status()
     opts = []
     for f in res.json():
@@ -2108,7 +2192,8 @@ def image_repo_files(repo, family):
 
 def _remote_size(repo, path):
     try:
-        head = requests.head(HF_RESOLVE.format(repo=repo, path=path), allow_redirects=True, timeout=15)
+        url = HF_RESOLVE.format(repo=repo, path=path)
+        head = requests.head(url, headers=hf_headers(url), allow_redirects=True, timeout=15)
         return int(head.headers.get("content-length", 0)) / 1e9
     except Exception:
         return 0.0
@@ -2130,7 +2215,7 @@ def image_search(query):
         else:
             seen, repos = set(), []
             for extra in ({"filter": "gguf"}, {}):
-                res = requests.get(f"{HF_API}/models", timeout=15, params={
+                res = requests.get(f"{HF_API}/models", timeout=15, headers=hf_headers(), params={
                     "search": q, "pipeline_tag": "text-to-image", "sort": "downloads", "limit": 20, **extra})
                 res.raise_for_status()
                 for m in res.json():
@@ -2261,7 +2346,8 @@ def _image_download_worker(ref):
         try:
             sizes = []
             for repo, path, _ in files:
-                head = requests.head(HF_RESOLVE.format(repo=repo, path=path), allow_redirects=True, timeout=20)
+                url = HF_RESOLVE.format(repo=repo, path=path)
+                head = requests.head(url, headers=hf_headers(url), allow_redirects=True, timeout=20)
                 _check_response(head, f"Checking {path}")
                 sizes.append(int(head.headers.get("content-length", 0)))
             total = sum(sizes)
@@ -3300,6 +3386,43 @@ def refresh_all(chat=None):
             gr.update(choices=group_choices()), chat_upd)
 
 
+# ---------------------------------------------------------------- settings tab
+def hf_token_status():
+    """The line under the token box: where the token in use comes from, or that there isn't one."""
+    saved = str(read_settings().get("hf_token") or "").strip()
+    if saved:
+        return note_html(f"Saved token {mask_token(saved)} is in use.")
+    env = next((n for n in HF_TOKEN_ENV if str(os.environ.get(n) or "").strip()), "")
+    if env:
+        return note_html(f"No token saved here. Using {env} from this machine's environment.")
+    return note_html("No token set. Public models work without one; gated and private models need it.")
+
+
+def save_hf_token(token):
+    """Save the token from the Settings tab, once Hugging Face has confirmed it works."""
+    token = (token or "").strip()
+    if not token:
+        return gr.update(), note_html("Enter a token first, or use Remove to delete the saved one.", "error")
+    who, error = hf_whoami(token)
+    if error:
+        return gr.update(), note_html(error, "error")
+    write_settings({**read_settings(), "hf_token": token})
+    _hf_meta.clear()  # repository details were read without the token; gated repos may look different with it
+    if who:
+        return gr.update(value=""), note_html(f"Saved. Hugging Face recognizes this token as {who}.")
+    return gr.update(value=""), note_html(
+        f"Saved token {mask_token(token)}. Hugging Face couldn't be reached to check it.")
+
+
+def remove_hf_token():
+    """Forget the saved token. An environment variable, if there is one, applies again."""
+    settings = read_settings()
+    if settings.pop("hf_token", None):
+        write_settings(settings)
+        _hf_meta.clear()
+    return gr.update(value=""), hf_token_status()
+
+
 # ---------------------------------------------------------------- look and feel
 FONT = [gr.themes.GoogleFont("Inter"), "-apple-system", "BlinkMacSystemFont", "Helvetica Neue", "sans-serif"]
 MONO = [gr.themes.GoogleFont("JetBrains Mono"), "SF Mono", "ui-monospace", "monospace"]
@@ -3671,6 +3794,24 @@ with gr.Blocks(title="LLM Scanner") as ui:
                                             value="Full report (report.jsonl)", show_label=False, elem_classes="segmented")
                         raw_view = gr.Code(show_label=False, language=None, lines=30, max_lines=30, elem_classes="log")
 
+        # ---------------- Settings
+        with gr.Tab("Settings"):
+            with gr.Column(elem_classes="card"):
+                gr.HTML('<h2>Hugging Face access token</h2><p class="sub">Lets LLM Scanner download gated models '
+                        '(those whose conditions you accept on Hugging Face first) and models in your private '
+                        'repositories, and it raises the limit on how much you can download. Public models do not '
+                        'need one. Create a token with read access at '
+                        '<a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener">'
+                        'huggingface.co/settings/tokens</a>. It is saved on this computer only, in '
+                        '<code>data/settings.json</code>, readable by your user account alone, and is never included '
+                        'in a data export.</p>')
+                hf_token_box = gr.Textbox(label="Token", type="password", placeholder="hf_...", max_lines=1,
+                                          autofocus=False, elem_classes="hf-token")
+                with gr.Row(equal_height=True):
+                    hf_save_btn = gr.Button("Save", variant="primary", scale=0, min_width=140)
+                    hf_remove_btn = gr.Button("Remove", variant="stop", scale=0, min_width=140)
+                hf_token_note = gr.HTML(hf_token_status(), elem_classes="note")
+
     # status
     status_outputs = [status, unload_btn, start_btn, stop_ollama_btn, restart_ollama_btn, ollama_status, activity]
     start_btn.click(start_ollama, outputs=status_outputs, show_progress="hidden")
@@ -3689,6 +3830,12 @@ with gr.Blocks(title="LLM Scanner") as ui:
                          show_progress="hidden")
     refresh_btn.click(refresh_all, chat_state, [models_version, scan_model, status, scan_type, group_pick, chat_model],
                       show_progress="hidden")
+
+    # settings
+    for trigger in (hf_save_btn.click, hf_token_box.submit):
+        trigger(save_hf_token, hf_token_box, [hf_token_box, hf_token_note], show_progress="hidden")
+    hf_remove_btn.click(remove_hf_token, outputs=[hf_token_box, hf_token_note], show_progress="hidden")
+    ui.load(hf_token_status, outputs=hf_token_note, show_progress="hidden")
 
     # models
     source.change(source_changed, source, [query, repo, version, search_note, pull_btn], show_progress="hidden")
