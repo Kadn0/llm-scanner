@@ -226,9 +226,11 @@ button.row-del:hover { background:#3a1d1d url("data:image/svg+xml,%3Csvg xmlns='
 
 /* downloads: trash icon, long names truncate so controls stay visible */
 .hidden-control { display:none !important; }
-.dl-top { align-items:center; }
+.dl-top { align-items:center; flex-wrap:nowrap; }
 .dl-name { flex:1 1 auto; min-width:0; }
-.dl-state { flex:0 0 auto; }
+/* long names and long status text shrink with an ellipsis; the pause and delete buttons keep their place */
+.dl-state { flex:0 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; }
+.dl-del, .dl-toggle { flex:0 0 30px !important; }
 .dl-del { flex:0 0 30px; width:30px; height:30px; border:none; border-radius:7px; cursor:pointer; opacity:.6;
           background:transparent url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23a1a1a6' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 6h18'/%3E%3Cpath d='M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2'/%3E%3Cpath d='M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6'/%3E%3Cpath d='M10 11v6'/%3E%3Cpath d='M14 11v6'/%3E%3C/svg%3E") center / 16px 16px no-repeat; }
 .dl:hover .dl-del { opacity:1; }
@@ -557,3 +559,13 @@ button[role="tab"], .segmented label { transition:color .3s ease, background-col
 .mt-model-name { min-width:0; overflow-wrap:anywhere; }
 a.mt-model-name { color:inherit !important; text-decoration:none !important; }
 a.mt-model-name:hover { color:#2997ff !important; text-decoration:underline !important; text-underline-offset:3px; }
+/* Reports: the list of runs with a tick box each */
+.report-list .wrap { display:flex !important; flex-direction:column !important; gap:0 !important; max-height:320px;
+        overflow-y:auto; overscroll-behavior:contain; border:1px solid #232325; border-radius:12px; background:#121214; }
+.report-list label { border:none !important; border-radius:0 !important; background:transparent !important;
+        padding:9px 14px !important; border-bottom:1px solid #1d1d1f !important; font-size:14px; }
+.report-list label:last-child { border-bottom:none !important; }
+.report-list label:hover { background:#1d1d1f !important; }
+.report-list label.selected, .report-list label:has(input:checked) { background:#0a1d33 !important; }
+.report-actions { align-items:center !important; margin-top:10px; }
+.report-actions .select-all label { background:transparent !important; border:none !important; padding-left:2px !important; }

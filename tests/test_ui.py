@@ -223,7 +223,7 @@ class AppPages(unittest.TestCase):
         repo_update, _, note, *_ = self.call("/search_models", "Ollama", name)
         self.assertIn("Found 3 models", note)
         versions = self.call("/list_versions", "Ollama", name)
-        self.assertIn("Auto-selected", versions[1])
+        self.assertIn("Recommended:", versions[1])
         return self.call("/pull_model", "Ollama", name, f"{name}:{tag}")
 
     def wait_downloads(self, text, timeout=20):
@@ -345,30 +345,40 @@ class AppPages(unittest.TestCase):
 
     # ------------------------------------------------------------ reports page
     def test_view_and_delete_reports(self):
-        choices = self.call("/refresh_reports")
+        """Ticking a report shows it; Delete removes every file of the ticked runs. (The button's own label is
+        checked in test_app.py: Gradio's API doesn't return button labels.)"""
         names = sorted(p.name.split(".report")[0] for p in self.runs.glob("*.report.jsonl"))
         self.assertEqual(len(names), 2)
-        summary, garak_view, raw, files = self.call("/show_report", "hf.co_x_tiny_20260917-100000.report.html",
-                                                     "Full report (report.jsonl)")
-        self.assertIn("LLM security assessment", summary)
+        full, hitlog = "Full report (report.jsonl)", "Hitlog (failing responses)"
+        complete, stopped = "hf.co_x_tiny_20260917-100000.report.html", "tiny_20260917-110000.report.html"
+
+        summary, garak_view, raw, files = self.call("/reports_ticked", [complete], full)
+        self.assertIn("LLM security assessment", summary)  # ticking a report also shows it
         self.assertIn("iframe", garak_view)
         self.assertIn("start_run setup", raw)
-        self.assertIn("evil", self.call("/read_raw", "hf.co_x_tiny_20260917-100000.report.html",
-                                        "Hitlog (failing responses)"))
-        summary, garak_view, _, _ = self.call("/show_report", "tiny_20260917-110000.report.html",
-                                              "Full report (report.jsonl)")
-        self.assertIn("Incomplete run", summary)
+        self.assertEqual(len(files), 5)
+        self.assertIn("evil", self.call("/read_raw", hitlog))
+
+        summary, garak_view, *_ = self.call("/reports_ticked", [complete, stopped], full)
+        self.assertIn("Incomplete run", summary)  # the newly ticked one is shown
         self.assertIn("stopped before garak wrote its report", garak_view)
 
-        _, note = self.call("/delete_report", "tiny_20260917-110000.report.html", True)
-        self.assertIn("Deleted report tiny_20260917-110000", note)
+        listing, select_all, *_rest = self.call("/delete_reports", [stopped], True, full)
+        self.assertIn("Deleted 1 report", _rest[-1])
+        self.assertEqual((listing["value"], select_all["value"]), ([], False), "the list clears after deleting")
         self.assertEqual([p.name for p in self.runs.glob("tiny_20260917-110000.*")], [])
         self.assertTrue(list(self.runs.glob("hf.co_x_tiny_20260917-100000.*")), "other reports must be kept")
+
+    def test_select_all_reports(self):
+        listing, *_ = self.call("/select_all_reports", True, "Full report (report.jsonl)")
+        self.assertEqual(len(listing["value"]), len(list(self.runs.glob("*.report.jsonl"))))
+        listing, *_ = self.call("/select_all_reports", False, "Full report (report.jsonl)")
+        self.assertEqual(listing["value"], [])
 
     def test_report_delete_rejects_unknown_names(self):
         from gradio_client.exceptions import AppError
         with self.assertRaises(AppError):  # Gradio only accepts names the Reports list offers
-            self.call("/delete_report", "../../etc/passwd.report.html", True)
+            self.call("/delete_reports", ["../../etc/passwd.report.html"], True, "Full report (report.jsonl)")
         self.assertTrue(list(self.runs.glob("hf.co_x_tiny_20260917-100000.*")))
 
 

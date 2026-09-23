@@ -168,8 +168,8 @@ class VersionPicking(unittest.TestCase):
             versions, note, *_ = list(app.list_versions(app.SRC_HF, "prism-ml/x-gguf"))[-1]
         self.assertEqual(versions["value"], "F16", "a format Ollama can load must be the recommended one")
         labels = dict((v, lbl) for lbl, v in versions["choices"] if v)
-        self.assertIn("needs its own llama.cpp build", labels["PQ2_0"])
-        self.assertNotIn("needs its own", labels["F16"])
+        self.assertIn("Ollama can't load this format", labels["PQ2_0"])
+        self.assertNotIn("can't load", labels["F16"])
         self.assertIn("PTQ1_0, PQ2_0 are in a format Ollama cannot load", note)
 
     def test_fit_label(self):
@@ -642,12 +642,15 @@ class HuggingFaceImport(TempDataTest):
                 self.assertEqual(d["state"], "done", d["msg"])
                 self.assertEqual(len(created), 1)
 
-    def test_other_http_errors_still_fail(self):
-        with mock.patch.object(app.requests, "post",
-                               return_value=FakeResponse({"error": "pull model manifest: file does not exist"}, status=400)):
-            d, _ = self.run_worker(self.fake_get([]))
-        self.assertEqual(d["state"], "failed")
-        self.assertIn("HTTP 400", d["msg"])
+    def test_tag_ollama_rejects_is_downloaded_directly(self):
+        """Ollama resolves hf.co tags its own way and answers 400 "The specified tag is not available"; the file is
+        in the repository, so the app fetches it itself instead of failing."""
+        rejected = FakeResponse({"error": "The specified tag is not available in the repository. Please use another "
+                                          "tag or \"latest\""}, status=400)
+        with mock.patch.object(app.requests, "post", return_value=rejected):
+            d, created = self.run_worker(self.fake_get([[b"GGUF", b"data"]]))
+        self.assertEqual(d["state"], "done", d["msg"])
+        self.assertEqual(len(created), 1)
 
     def test_interrupted_download_resumes_with_range(self):
         def flaky():
@@ -673,7 +676,8 @@ class HuggingFaceImport(TempDataTest):
         with mock.patch.object(app.requests, "get", side_effect=self.fake_get([])):
             app._download_worker(ref)
         self.assertEqual(app._downloads[ref]["state"], "failed")
-        self.assertIn("no single-file GGUF for Q3_K_L", app._downloads[ref]["msg"])
+        self.assertIn("no GGUF file for Q3_K_L", app._downloads[ref]["msg"])
+        self.assertIn("It has: IQ4_K_M, Q4_K_M", app._downloads[ref]["msg"], "say which versions the repo has")
 
     def test_missing_repository_fails_clearly(self):
         d, _ = self.run_worker(self.fake_get([], tree=404))
@@ -1187,20 +1191,55 @@ class Reports(TempDataTest):
         self.assertIn("Incomplete run", summary)
         self.assertNotIn("Traceback", garak_view)
 
-    def test_delete_report_only_removes_that_run(self):
-        write_run(app.GARAK_RUNS, "m_20260917-100000")
-        write_run(app.GARAK_RUNS, "m_20260917-100000x")
-        app.delete_report("m_20260917-100000.report.html", True)
+    def test_delete_reports_removes_only_the_ticked_runs(self):
+        for prefix in ("m_20260917-100000", "m_20260917-100000x", "m_20260917-110000"):
+            write_run(app.GARAK_RUNS, prefix)
+        picked = ["m_20260917-100000.report.html", "m_20260917-110000.report.html"]
+        listing, select_all, button, selected, shown, *_rest, note = app.delete_reports(picked, True, picked[0], "raw")
         left = sorted(p.name for p in app.GARAK_RUNS.iterdir())
-        self.assertTrue(left and all("100000x" in n for n in left), left)
+        self.assertTrue(left and all(n.startswith("m_20260917-100000x.") for n in left), left)
+        self.assertIn("Deleted 2 reports", note)
+        self.assertEqual(selected, [])
+        self.assertEqual(button["value"], "Delete reports")
+        self.assertFalse(button["interactive"])
+        self.assertEqual(shown, "m_20260917-100000x.report.html", "the viewer moves to a report that still exists")
 
-    def test_delete_report_rejects_unknown_names(self):
+    def test_delete_reports_needs_confirmation_and_known_names(self):
         write_run(app.GARAK_RUNS, "m_20260917-100000")
         (app.GARAK_RUNS / ".hidden").write_text("x")
-        for bad in ("x", ".report.html", "../m_20260917-100000.report.html"):
-            app.delete_report(bad, True)
+        app.delete_reports(["m_20260917-100000.report.html"], False, None, "raw")  # dialog cancelled
+        for bad in (["x"], [".report.html"], ["../m_20260917-100000.report.html"], []):
+            app.delete_reports(bad, True, None, "raw")
         self.assertTrue((app.GARAK_RUNS / ".hidden").exists())
         self.assertEqual(len(list(app.GARAK_RUNS.glob("m_*"))), 3)
+
+    def test_delete_button_counts_what_is_ticked(self):
+        write_run(app.GARAK_RUNS, "m_20260917-100000")
+        write_run(app.GARAK_RUNS, "m_20260917-110000")
+        names = [n for _, n in app.reports()]
+        self.assertEqual(app.delete_label([])["value"], "Delete reports")
+        self.assertEqual(app.delete_label(names[:1])["value"], "Delete 1 report")
+        self.assertEqual(app.delete_label(names)["value"], "Delete 2 reports")
+
+    def test_ticking_a_report_shows_it(self):
+        write_run(app.GARAK_RUNS, "m_20260917-100000")
+        write_run(app.GARAK_RUNS, "m_20260917-110000")
+        newest, older = (n for _, n in app.reports())
+        button, picked, shown, summary, *_ = app.reports_ticked([older], [], newest, "Full report (report.jsonl)")
+        self.assertEqual(shown, older, "the report just ticked is the one displayed")
+        self.assertEqual(picked, [older])
+        self.assertIn("LLM security assessment", summary)
+        _, picked, shown, *_ = app.reports_ticked([], [older], older, "Full report (report.jsonl)")
+        self.assertEqual((picked, shown), ([], older), "unticking only changes what Delete would remove")
+
+    def test_select_all_ticks_every_report(self):
+        write_run(app.GARAK_RUNS, "m_20260917-100000")
+        write_run(app.GARAK_RUNS, "m_20260917-110000")
+        listing, button, picked, *_ = app.select_all_reports(True, None, "Full report (report.jsonl)")
+        self.assertEqual(len(listing["value"]), 2)
+        self.assertEqual(button["value"], "Delete 2 reports")
+        listing, button, picked, *_ = app.select_all_reports(False, None, "Full report (report.jsonl)")
+        self.assertEqual((listing["value"], picked), ([], []))
 
     def test_show_report_rejects_paths_outside_runs(self):
         secret = self.tmp / "secret.report.html"

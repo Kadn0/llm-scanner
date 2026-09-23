@@ -1212,32 +1212,74 @@ def hf_find_repos(query):
 # The quantization at the end of a GGUF filename, with any prefix it carries: Q4_K_M, IQ3_XS, UD-Q5_K_XL, BF16, and
 # repository-specific ones such as PQ2_0 or PTQ1_0. It must follow a separator, so "PQ2_0" is never read as "Q2_0".
 QUANT_IN_NAME = re.compile(r"(?:^|[-_.])((?:UD-)?[A-Za-z]{0,3}(?:Q\d[\w.]*|BF16|F16|F32|FP16|MXFP4[\w.]*))\.gguf$", re.I)
+SHARD_IN_NAME = re.compile(r"-\d{5}-of-\d{5}")
+NOT_A_MODEL = ("mmproj", "imatrix", "mtp")  # companion files, not models to run
 
-
-# Quantizations Ollama's own llama.cpp can load. Some repositories ship formats that need their own llama.cpp build
-# (for example Prism's ternary PQ2_0 and PTQ1_0); those are offered but marked, because Ollama cannot run them.
-STANDARD_QUANT = re.compile(r"^(?:UD-)?(?:I?Q\d(?:_\w+)*|TQ\d_\d|BF16|F16|F32|FP16|MXFP4(?:_\w+)*)$", re.I)
+# The quantizations Ollama's own llama.cpp can load. Repositories also ship formats that only their authors' build
+# can run (Prism's PQ2_0, PTQ1_0, Q2_g64, dspark-*); those are listed but marked, because Ollama cannot load them.
+STANDARD_QUANT = re.compile(r"^(?:UD-)?(?:F16|F32|BF16|FP16|Q4_[01]|Q5_[01]|Q8_0|Q[2-8]_K(?:_[SMLXsmlx]{1,2})?"
+                            r"|IQ[1-4]_(?:XXS|XS|S|M|NL)(?:_XL)?|TQ[12]_0|MXFP4(?:_MOE)?)$", re.I)
 
 
 def runs_in_ollama(tag):
     return bool(STANDARD_QUANT.match(tag.split(":", 1)[-1]))
 
 
+def hf_gguf_catalog(repo):
+    """([(tag, path, size)] of runnable GGUF files, [(path, size)] of image projectors) in a Hugging Face repo.
+
+    A file's tag is what tells it apart from the others in the repo, so it matches what the repository shows:
+    Q4_K_M, UD-Q5_K_XL, PQ2_0, dspark-bf16. Repositories name their files differently, so the shared part of the
+    names is dropped rather than guessing which part is the quantization."""
+    res = requests.get(f"{HF_API}/models/{repo_from_text(repo)}/tree/main", params={"recursive": "true"}, timeout=30)
+    _check_response(res, f"Listing files of {repo}")
+    ggufs = [(e["path"], int(e.get("size") or 0)) for e in res.json()
+             if e.get("path", "").lower().endswith(".gguf") and not SHARD_IN_NAME.search(e["path"].lower())]
+    models = [g for g in ggufs if not any(k in g[0].lower() for k in NOT_A_MODEL)]
+    projectors = [g for g in ggufs if "mmproj" in g[0].lower()]
+    stems = [path.rsplit("/", 1)[-1][:-5] for path, _ in models]
+    shared = os.path.commonprefix(stems) if len(stems) > 1 else ""
+    cut = max(shared.rfind(c) for c in "-_.")
+    shared = shared[:cut + 1] if cut >= 0 else ""
+    catalog = []
+    for (path, size), stem in zip(models, stems):
+        tag = stem[len(shared):] if shared else ""
+        if not tag:  # one file, or a name that is all shared: fall back to the quantization in it
+            m = QUANT_IN_NAME.search(f"{stem}.gguf")
+            tag = m.group(1) if m else stem
+        catalog.append((tag, path, size))
+    return catalog, projectors
+
+
+_hf_meta = {}
+
+
+def _short_count(n):
+    return f"{n / 1e6:.1f}M".replace(".0M", "M") if n >= 1e6 else f"{n / 1e3:.0f}k" if n >= 1000 else str(n)
+
+
+def hf_repo_info(repo):
+    """What Hugging Face says about a repository: base model, licence, downloads, likes. {} if it can't be read."""
+    repo = repo_from_text(repo)
+    if repo not in _hf_meta:
+        try:
+            d = requests.get(f"{HF_API}/models/{repo}", timeout=15).json()
+            card = d.get("cardData") or {}
+            base = card.get("base_model")
+            _hf_meta[repo] = {"base": (base[0] if isinstance(base, list) else base) or "",
+                              "license": card.get("license") or "", "downloads": d.get("downloads") or 0,
+                              "likes": d.get("likes") or 0, "gated": bool(d.get("gated"))}
+        except Exception:
+            _hf_meta[repo] = {}
+    return _hf_meta[repo]
+
+
 def hf_versions(repo):
-    """[(size_gb, tag)] for single-file GGUF quantizations in a Hugging Face repo."""
-    res = requests.get(f"{HF_API}/models/{repo_from_text(repo)}/tree/main", params={"recursive": "true"}, timeout=15)
-    res.raise_for_status()
-    opts = {}
-    for f in res.json():
-        name = f.get("path", "").split("/")[-1]
-        low = name.lower()
-        if (not low.endswith(".gguf") or any(k in low for k in ("mmproj", "imatrix", "mtp"))
-                or re.search(r"-\d{5}-of-\d{5}", low)):
-            continue
-        m = QUANT_IN_NAME.search(name)
-        if m:
-            opts[m.group(1)] = f.get("size", 0) / 1e9
-    return sorted((size, tag) for tag, size in opts.items())
+    """[(size_gb, tag)] for single-file GGUF versions in a Hugging Face repo."""
+    sizes = {}
+    for tag, _, size in hf_gguf_catalog(repo)[0]:
+        sizes.setdefault(tag, size / 1e9)
+    return sorted((size, tag) for tag, size in sizes.items())
 
 
 def ollama_find(query):
@@ -1333,15 +1375,30 @@ def search_models(source, query):
 
 
 def list_versions(source, repo):
-    """Load versions for the chosen repository/model and auto-select the best fit for the GPU."""
+    """Load the versions of the chosen repository/model, describe it, and pick the best one this PC can run."""
     hide = gr.update(visible=False)
     if not repo:
         yield gr.update(choices=[PLEASE_CHOOSE], value="", interactive=False), "", gr.update(interactive=False), hide
         return
     yield (gr.update(choices=[LOADING], value="", interactive=False), "", gr.update(interactive=False),
            loading_screen("Loading versions", repo))
+    projectors, about = [], []
     try:
-        opts = ollama_versions(repo) if source == SRC_OLLAMA else hf_versions(repo)
+        if source == SRC_OLLAMA:
+            opts = ollama_versions(repo)
+            desc = _ollama_meta.get(repo, {}).get("desc", "")
+            about = [desc] if desc else []
+        else:
+            catalog, projectors = hf_gguf_catalog(repo)
+            sizes = {}
+            for tag, _, size in catalog:
+                sizes.setdefault(tag, size / 1e9)
+            opts = sorted((size, tag) for tag, size in sizes.items())
+            info = hf_repo_info(repo)
+            about = [f"Based on {info['base'].split('/')[-1]}." if info.get("base") else "",
+                     f"{info['license']} licence." if info.get("license") else "",
+                     f"{_short_count(info['downloads'])} downloads on Hugging Face." if info.get("downloads") else "",
+                     "Sees images (the repository includes a vision projector)." if projectors else ""]
     except Exception as e:
         yield (gr.update(choices=[PLEASE_CHOOSE], value="", interactive=False),
                note_html(f"Could not list versions: {e}", "error"), gr.update(interactive=False), hide)
@@ -1352,24 +1409,31 @@ def list_versions(source, repo):
         yield (gr.update(choices=[PLEASE_CHOOSE], value="", interactive=False), note_html(msg, "error"),
                gr.update(interactive=False), hide)
         return
-    usable = [o for o in opts if runs_in_ollama(o[1])]
+    # Ollama's own library only lists models it can run; Hugging Face repositories also hold other formats.
+    check_format = source != SRC_OLLAMA
+    usable = [o for o in opts if runs_in_ollama(o[1])] if check_format else list(opts)
     best = best_version(usable or opts)  # never recommend a format Ollama can't load
     choices = [PLEASE_CHOOSE] + [
-        (f"{tag.split(':', 1)[-1]}   {size:.1f} GB   " + (fit_label(size) if runs_in_ollama(tag) else
-                                                          "needs its own llama.cpp build")
+        (f"{tag.split(':', 1)[-1]}   {size:.1f} GB   " + (fit_label(size) if not check_format or runs_in_ollama(tag)
+                                                          else "Ollama can't load this format")
          + ("   (Recommended)" if tag == best else ""), tag) for size, tag in opts]
     size = next(sz for sz, t in opts if t == best)
-    desc = _ollama_meta.get(repo, {}).get("desc", "") if source == SRC_OLLAMA else ""
-    why = (f"Auto-selected {best.split(':', 1)[-1]} ({size:.1f} GB), the largest version under {VRAM_BUDGET_GB} GB "
-           "so it runs fully on your GPU." if size <= VRAM_BUDGET_GB else
-           f"No version fits under {VRAM_BUDGET_GB} GB, so the smallest ({size:.1f} GB) was selected; it will "
-           "run partly in system memory.")
-    skipped = [t for _, t in opts if not runs_in_ollama(t)]
+    short = best.split(":", 1)[-1]
+    if not usable:
+        why = (f"Ollama can't load any version in this repository, so none will run here. {short} is selected only "
+               "so you can try it.")
+    elif size <= VRAM_BUDGET_GB:
+        why = (f"Recommended: {short} ({size:.1f} GB), the largest version that fits your {VRAM_BUDGET_GB} GB of "
+               "video memory, so it runs fully on the GPU.")
+    else:
+        why = (f"No version fits your {VRAM_BUDGET_GB} GB of video memory, so the smallest Ollama can load "
+               f"({short}, {size:.1f} GB) is selected; it runs partly in system memory and is slower.")
+    skipped = [t for _, t in opts if check_format and not runs_in_ollama(t)]
     if skipped:
-        why += (f" {', '.join(skipped)} " + ("is" if len(skipped) == 1 else "are") +
-                " in a format Ollama cannot load: it needs the llama.cpp build from the model's authors.")
+        why += (f" {', '.join(skipped[:6])} " + ("is" if len(skipped) == 1 else "are") + " in a format Ollama "
+                "cannot load; running those needs the llama.cpp build from the model's authors.")
     yield (gr.update(choices=choices, value=best, interactive=True),
-           note_html((desc + " " if desc else "") + why), gr.update(interactive=True), hide)
+           note_html(" ".join([p for p in about if p] + [why])), gr.update(interactive=True), hide)
 
 
 def version_changed(repo, version):
@@ -1456,20 +1520,22 @@ HF_DOWNLOADS = DATA_DIR / "hf-downloads"  # GGUF files waiting to be imported in
 
 
 def _hf_gguf_files(repo, tag):
-    """[(path, size)] to import for an Ollama quantization tag like Q4_K_M: the model's GGUF file, plus the image
-    projector (mmproj) if the repo has one, which vision models need to see images."""
-    res = requests.get(f"{HF_API}/models/{repo}/tree/main", params={"recursive": "true"}, timeout=30)
-    _check_response(res, f"Listing files of {repo}")
-    ggufs = [(e["path"], int(e.get("size") or 0)) for e in res.json() if e.get("path", "").lower().endswith(".gguf")]
-    stem = lambda path: path.rsplit("/", 1)[-1][:-5]  # noqa: E731
-    wanted = re.compile(rf"(^|[-_.]){re.escape(tag.removesuffix('.gguf'))}$", re.I)
-    models = [g for g in ggufs if "mmproj" not in g[0].lower() and wanted.search(stem(g[0]))]
-    if not models:
-        raise PermanentDownloadError(f"{repo} has no single-file GGUF for {tag}")
-    files = [min(models, key=lambda g: len(g[0]))]
-    projectors = [g for g in ggufs if "mmproj" in g[0].lower()]
-    if projectors:  # prefer the one matching the model's quantization, then full precision
-        rank = lambda g: (not wanted.search(stem(g[0])), not re.search(r"f16|bf16", stem(g[0]), re.I), g[1])  # noqa: E731
+    """[(path, size)] to import for a version tag: the model's GGUF file, plus the image projector (mmproj) if the
+    repo has one, which vision models need to see images."""
+    catalog, projectors = hf_gguf_catalog(repo)
+    wanted = tag.removesuffix(".gguf")
+    matches = [(path, size) for t, path, size in catalog if t.lower() == wanted.lower()]
+    if not matches:  # older download queues and hand-typed tags: match the end of the file name
+        ends_with = re.compile(rf"(^|[-_.]){re.escape(wanted)}$", re.I)
+        matches = [(path, size) for _, path, size in catalog if ends_with.search(path.rsplit("/", 1)[-1][:-5])]
+    if not matches:
+        have = ", ".join(sorted({t for t, _, _ in catalog})[:8]) or "none"
+        raise PermanentDownloadError(f"{repo} has no GGUF file for {tag}. It has: {have}")
+    files = [min(matches, key=lambda g: len(g[0]))]
+    if projectors:  # prefer the projector matching the model's quantization, then full precision
+        stem = lambda path: path.rsplit("/", 1)[-1][:-5]  # noqa: E731
+        rank = lambda g: (wanted.lower() not in stem(g[0]).lower(),  # noqa: E731
+                          not re.search(r"f16|bf16", stem(g[0]), re.I), g[1])
         files.append(min(projectors, key=rank))
     return files
 
@@ -1606,7 +1672,7 @@ def _download_worker(ref):
             continue
         layers = {}
         try:
-            if d.get("direct"):  # Ollama can't fetch this one itself
+            if d.get("direct"):  # Ollama couldn't fetch this one itself
                 if _hf_import(ref, d):
                     d.update(state="done", msg="Done", finished=time.time())
                     _set_pending(ref, False)
@@ -1617,7 +1683,7 @@ def _download_worker(ref):
                                stream=True, timeout=(10, 120)) as r:
                 if r.status_code >= 400:  # Ollama reports some failures, including the Xet redirect, this way
                     message = response_error(r, f"Pulling {ref}")
-                    if ref.startswith("hf.co/") and "redirect" in message:
+                    if ref.startswith("hf.co/"):  # whatever Ollama makes of it, we can fetch the file ourselves
                         d["direct"] = True
                         continue
                     raise PermanentDownloadError(message)
@@ -1628,7 +1694,7 @@ def _download_worker(ref):
                         continue
                     ev = json.loads(line)  # a line cut off mid-transfer raises, and is retried like any drop
                     if "error" in ev:
-                        if ref.startswith("hf.co/") and "redirect" in ev["error"]:
+                        if ref.startswith("hf.co/"):  # blocked redirect, unknown tag, ...: download it ourselves
                             d["direct"] = True
                             break
                         raise PermanentDownloadError(ev["error"])
@@ -2837,9 +2903,34 @@ def _known_report(name):
     return bool(name) and name in {n for _, n in reports()}
 
 
-def refresh_reports():
+def delete_label(selected):
+    n = len(selected or [])
+    return gr.update(value=f"Delete {n} report{'s' if n != 1 else ''}" if n else "Delete reports", interactive=bool(n))
+
+
+def report_list_state(selected=(), shown=None):
+    """The report list, the Select all box and the Delete button after the list of runs has changed."""
     r = reports()
-    return gr.update(choices=r, value=r[0][1] if r else None)
+    names = {n for _, n in r}
+    selected = [n for n in (selected or []) if n in names]
+    shown = shown if shown in names else (r[0][1] if r else None)
+    return (gr.update(choices=r, value=selected), gr.update(value=bool(selected) and len(selected) == len(r)),
+            delete_label(selected), selected, shown)
+
+
+def reports_ticked(selected, previous, shown, which):
+    """Ticking a report shows it; unticking only changes what Delete would remove."""
+    selected = selected or []
+    added = [n for n in selected if n not in (previous or [])]
+    shown = added[-1] if added else (shown if _known_report(shown) else (selected[0] if selected else None))
+    return (delete_label(selected), selected, shown, *show_report(shown, which))
+
+
+def select_all_reports(on, shown, which):
+    names = [n for _, n in reports()]
+    selected = names if on else []
+    shown = shown if _known_report(shown) else (names[0] if names else None)
+    return gr.update(value=selected), delete_label(selected), selected, shown, *show_report(shown, which)
 
 
 RAW_LIMIT = 2_000_000  # characters shown in the raw viewer; the full file is always downloadable
@@ -2883,17 +2974,28 @@ def show_report(name, which="Full report (report.jsonl)"):
     return summary, garak_view, read_raw(name, which), files
 
 
-def delete_report(name, confirmed):
-    """Permanently delete every file from one scan run (garak report, raw JSONL, hitlog, summary, CSV)."""
-    if not confirmed or not _known_report(name):
-        return gr.update(), gr.update()
+def _delete_run(name):
+    """Every file of one scan run: garak report, raw JSONL, hitlog, summary, CSV. Returns how many were deleted."""
     prefix = name[:-len(".report.html")]
     removed = 0
     for f in list(GARAK_RUNS.iterdir()):
         if f.is_file() and f.name.startswith(prefix + "."):
             f.unlink()
             removed += 1
-    return refresh_reports(), note_html(f"Deleted report {prefix} ({removed} files).")
+    return removed
+
+
+def delete_reports(names, confirmed, shown, which):
+    """Delete the ticked runs and everything they wrote (garak report, raw JSONL, hitlog, summary, CSV)."""
+    names = [n for n in (names or []) if _known_report(n)]
+    if not confirmed or not names:
+        return (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), *(gr.update(),) * 4, gr.update())
+    files = sum(_delete_run(n) for n in names)
+    if shown in names:
+        shown = None
+    listing, select_all, button, selected, shown = report_list_state([], shown)
+    note = note_html(f"Deleted {len(names)} report{'s' if len(names) != 1 else ''} ({files} files).")
+    return listing, select_all, button, selected, shown, *show_report(shown, which), note
 
 
 def open_report(name):
@@ -3267,12 +3369,18 @@ with gr.Blocks(title="LLM Scanner") as ui:
             with gr.Column(elem_classes="card"):
                 gr.HTML('<h2>Reports</h2><p class="sub">Results from previous scans, newest first. The security '
                         'summary is written for analysts; the garak report and raw data are the unmodified originals.</p>')
-                with gr.Row(equal_height=True):
-                    rep = gr.Dropdown(label="Report", choices=reports(), scale=4)
+                _reports = reports()
+                rep_list = gr.CheckboxGroup(choices=_reports, value=[], show_label=False, elem_classes="report-list")
+                with gr.Row(equal_height=True, elem_classes="report-actions"):
+                    rep_all = gr.Checkbox(label="Select all", value=False, scale=0, min_width=130,
+                                          elem_classes="select-all")
                     rep_open = gr.Button("Open summary in browser", variant="secondary", scale=0, min_width=220)
-                    rep_delete = gr.Button("Delete report", variant="stop", scale=0, min_width=150, elem_classes="rep-delete")
+                    rep_delete = gr.Button("Delete reports", variant="stop", scale=0, min_width=170, interactive=False,
+                                           elem_classes="reps-delete")
                 rep_status = gr.HTML(elem_classes="note")
                 rep_confirm = gr.Checkbox(value=False, visible=False)
+                rep_picked = gr.State([])                                   # what is ticked, to spot new ticks
+                rep_shown = gr.State(_reports[0][1] if _reports else None)  # the report the tabs below display
                 with gr.Accordion("Download files (summary HTML, findings CSV, garak HTML, raw JSONL)", open=False):
                     rep_files = gr.File(show_label=False, file_count="multiple")
             with gr.Tabs(elem_classes="subtabs"):
@@ -3374,21 +3482,29 @@ with gr.Blocks(title="LLM Scanner") as ui:
     scan_model.change(model_hint, scan_model, [model_note, tmo], show_progress="hidden")
     scan_btn.click(run_scan, [scan_model, scan_type, selected, gens, tmo, thinking],
                    [scan_log, scan_btn, stop_btn, scan_progress], show_progress="hidden").then(
-        refresh_reports, outputs=rep, show_progress="hidden")
+        report_list_state, [rep_picked, rep_shown], [rep_list, rep_all, rep_delete, rep_picked, rep_shown],
+        show_progress="hidden")
     stop_btn.click(stop_scan, outputs=scan_log, show_progress="hidden")
 
     # reports
-    rep.change(show_report, [rep, raw_pick], [rep_summary, rep_view, raw_view, rep_files], show_progress="hidden")
-    raw_pick.change(read_raw, [rep, raw_pick], raw_view, show_progress="hidden")
-    rep_open.click(open_report, rep, show_progress="hidden")
-    rep_delete.click(delete_report, [rep, rep_confirm], [rep, rep_status],
-                     js="(name, c) => [name, !!name]", show_progress="hidden")
+    view_outputs = [rep_summary, rep_view, raw_view, rep_files]
+    rep_list.input(reports_ticked, [rep_list, rep_picked, rep_shown, raw_pick],
+                   [rep_delete, rep_picked, rep_shown, *view_outputs], show_progress="hidden")
+    rep_all.input(select_all_reports, [rep_all, rep_shown, raw_pick],
+                  [rep_list, rep_delete, rep_picked, rep_shown, *view_outputs], show_progress="hidden")
+    raw_pick.change(read_raw, [rep_shown, raw_pick], raw_view, show_progress="hidden")
+    rep_open.click(open_report, rep_shown, show_progress="hidden")
+    rep_delete.click(delete_reports, [rep_list, rep_confirm, rep_shown, raw_pick],
+                     [rep_list, rep_all, rep_delete, rep_picked, rep_shown, *view_outputs, rep_status],
+                     js="(names, c, shown, which) => [names, !!(names && names.length), shown, which]",
+                     show_progress="hidden")
 
     ui.load(refresh_all, chat_state, [models_version, scan_model, status, scan_type, group_pick, chat_model],
             show_progress="hidden").then(
         model_hint, scan_model, [model_note, tmo], show_progress="hidden").then(
-        refresh_reports, outputs=rep, show_progress="hidden").then(
-        show_report, [rep, raw_pick], [rep_summary, rep_view, raw_view, rep_files], show_progress="hidden")
+        report_list_state, [rep_picked, rep_shown], [rep_list, rep_all, rep_delete, rep_picked, rep_shown],
+        show_progress="hidden").then(
+        show_report, [rep_shown, raw_pick], [rep_summary, rep_view, raw_view, rep_files], show_progress="hidden")
 
 KEEP_BACKUPS = 3  # previous versions kept in data/backups after updates
 

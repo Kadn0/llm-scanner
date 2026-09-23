@@ -148,14 +148,11 @@
       const name = btn.closest('.mt-row')?.querySelector('.mt-cell')?.innerText || 'this image model';
       return ['Delete image model?', `${name} will be removed from this computer. Its files are deleted from disk.`];
     }
-    if (btn.matches('.rep-delete')) {
-      const report = [...document.querySelectorAll('input[role="combobox"]')].find((i) => i.getAttribute('aria-label') === 'Report')?.value;
-      if (!report) return null;
-      return ['Delete report?', `${report.trim()} and all of its files will be permanently deleted. This cannot be undone.`];
-    }
-    if (btn.matches('.oc-stop')) {
-      return ['Stop Ollama?', 'Loaded models are unloaded, and chats, scans and model downloads that need Ollama will '
-        + 'wait until you start it again.', 'Stop Ollama'];
+    if (btn.matches('.reps-delete')) {
+      const n = btn.closest('.card')?.querySelectorAll('.report-list input:checked').length || 0;
+      const what = n === 1 ? 'The selected report' : `The ${n} selected reports`;
+      return ['Delete reports?', `${what} and all of their files will be permanently deleted. This cannot be undone.`,
+        n === 1 ? 'Delete report' : 'Delete reports'];
     }
     if (btn.matches('.dl-del')) {
       return ['Delete download?', `${btn.dataset.ref} will be stopped and removed from downloads, and its partially downloaded data deleted. Use pause instead to continue it later.`, 'Delete download'];
@@ -164,7 +161,7 @@
   };
 
   document.addEventListener('click', async (e) => {
-    const btn = e.target.closest('button.chat-del, button.row-del, button.rep-delete, button.dl-del, button.g-del, button.oc-stop');
+    const btn = e.target.closest('button.chat-del, button.row-del, button.reps-delete, button.dl-del, button.g-del, button.oc-stop');
     if (!btn) return;
     if (btn.dataset.confirmed === '1') { delete btn.dataset.confirmed; return; }  // let the confirmed click through
     e.preventDefault();

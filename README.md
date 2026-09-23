@@ -182,6 +182,13 @@ It lists what will be deleted and asks before doing anything.
 
 ## Changelog
 
+- **1.1.0**: Downloading a Hugging Face model no longer fails on a name Ollama doesn't recognise. Versions are named
+  the way the repository names them (`dspark-bf16`, `PQ2_0`, `UD-Q5_K_XL`), and if Ollama refuses a tag for any
+  reason the app fetches the file itself. Versions in a format Ollama cannot load are marked and never recommended,
+  and the recommended version is the largest one that fits this PC's video memory. The version list also shows what
+  the model is: base model, licence, downloads and whether it can see images. Reports are now a list with a tick box
+  each, a Select all box and a Delete button that counts what is ticked. Long download names no longer push the
+  pause and delete buttons out of reach.
 - **1.0.16**: Version names of Hugging Face models are read in full, so repository-specific quantizations such as
   `PQ2_0` are no longer offered as `Q2_0` and then fail to download. Versions in a format Ollama cannot load (they
   need the model author's own llama.cpp build) are marked in the list and never recommended.
