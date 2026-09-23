@@ -91,6 +91,136 @@
   });
   document.addEventListener('scroll', hideTip, true);
 
+  // Repository/Version options only reach the page as plain text ("PQ2_0   7.5 GB VRAM + 2.3 GB RAM",
+  // "llama3.2   1.2M pulls   tools, vision"), so lay each one out instead of one run-on line: repository results
+  // get a name plus muted meta on the right; version rows get the name left-aligned (with a red no-entry icon
+  // beside it, hover-explained via the data-tip box above, when Ollama can't load that format), its VRAM/RAM
+  // split centered in grey, and Recommended on the right. An unsupported version stays pickable, just greyed out.
+  const CANNOT_LOAD = "Ollama can't load this format";
+  const splitOption = (li) => {
+    const raw = (li.getAttribute('aria-label') || '').trim();
+    if (li.dataset.fmted === raw) return null;
+    li.dataset.fmted = raw;
+    if (raw === 'Please choose' || !raw) return null;
+    const parts = raw.split(/ {2,}/).filter(Boolean);
+    if (parts.length < 2) return null;
+    const check = li.querySelector('.inner-item');
+    li.textContent = '';
+    if (check) li.appendChild(check);
+    return parts;
+  };
+  const formatRepoOption = (li) => {
+    const parts = splitOption(li);
+    if (!parts) return;
+    const name = document.createElement('span');
+    name.className = 'opt-name';
+    name.textContent = parts[0];
+    li.appendChild(name);
+    const meta = document.createElement('span');
+    meta.className = 'opt-meta';
+    const rest = parts.slice(1);
+    const addNote = (text, cls = 'opt-note') => {
+      const n = document.createElement('span');
+      n.className = cls;
+      n.textContent = text;
+      meta.appendChild(n);
+    };
+    const pulls = rest.find((p) => p.endsWith(' pulls'));
+    if (pulls) {  // Ollama library result: name, pulls, use cases
+      addNote(pulls, 'opt-pulls');
+      const caps = rest.find((p) => p !== pulls);
+      if (caps) addNote(caps, 'opt-caps');
+    } else if (/^\(.*\)$/.test(rest[0])) {  // Hugging Face repo result: name, (modified: ...)
+      addNote(rest[0].slice(1, -1), 'opt-badge modified');
+    } else {
+      rest.forEach((p) => addNote(p));
+    }
+    li.appendChild(meta);
+  };
+  const formatVersionOption = (li) => {
+    const parts = splitOption(li);
+    if (!parts) return;
+    const rest = parts.slice(1);
+    const recommended = rest[rest.length - 1] === '(Recommended)';
+    const body = recommended ? rest.slice(0, -1) : rest;
+    const unsupported = body.includes(CANNOT_LOAD);
+    const spec = unsupported ? (body.find((p) => p !== CANNOT_LOAD) || '') : body.join('   ');
+    if (unsupported) li.classList.add('unsupported-row');
+    const left = document.createElement('span');
+    left.className = 'opt-left';
+    if (unsupported) {
+      const badge = document.createElement('span');
+      badge.className = 'opt-badge unsupported';
+      badge.dataset.tipTitle = parts[0];
+      badge.dataset.tip = "Ollama cannot load this format; running it needs the llama.cpp build from the model's own authors.";
+      badge.innerHTML = '<svg viewBox="0 0 16 16" class="x-icon" aria-hidden="true">'
+        + '<circle cx="8" cy="8" r="6.5"/><path d="M5.3 5.3l5.4 5.4M10.7 5.3l-5.4 5.4"/></svg>';
+      left.appendChild(badge);
+    }
+    const name = document.createElement('span');
+    name.className = 'opt-name';
+    name.textContent = parts[0];
+    left.appendChild(name);
+    li.appendChild(left);
+    const mid = document.createElement('span');
+    mid.className = 'opt-mid';
+    if (spec) mid.textContent = `(${spec})`;
+    li.appendChild(mid);
+    if (recommended) {
+      const right = document.createElement('span');
+      right.className = 'opt-badge recommended opt-right';
+      right.textContent = 'Recommended';
+      li.appendChild(right);
+    }
+  };
+  const formatPickerOptions = () => {
+    document.querySelectorAll('#repo-dd .option-list .item').forEach(formatRepoOption);
+    document.querySelectorAll('#version-dd .option-list .item, #scan-model-dd .option-list .item')
+      .forEach(formatVersionOption);
+  };
+  new MutationObserver(formatPickerOptions).observe(document.body, {subtree: true, childList: true});
+  formatPickerOptions();
+  // Reports: the box ticks a report (for Select all / Delete); clicking its name shows that report without ticking
+  // it. The report being shown is highlighted, and stays highlighted when the list is redrawn.
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const reportRows = () => [...document.querySelectorAll('.report-list label')];
+  let viewing = null;
+  const markViewing = () => {
+    const rows = reportRows();
+    if (!rows.some((l) => norm(l.textContent) === viewing)) viewing = rows.length ? norm(rows[0].textContent) : null;
+    rows.forEach((l) => l.classList.toggle('viewing', norm(l.textContent) === viewing));
+  };
+  document.addEventListener('click', (e) => {
+    const row = e.target.closest('.report-list label');
+    if (!row) return;
+    if (e.target.matches('input[type="checkbox"]')) {
+      if (e.target.checked) { viewing = norm(row.textContent); markViewing(); }  // a new tick is shown, as before
+      return;
+    }
+    e.preventDefault();  // the name was clicked: don't toggle the box
+    viewing = norm(row.textContent);
+    markViewing();
+    const box = document.querySelector('#rep-view-label textarea, #rep-view-label input');
+    box.value = viewing;
+    box.dispatchEvent(new Event('input', {bubbles: true}));
+    setTimeout(() => document.querySelector('#rep-view-btn').click(), 80);
+  }, true);
+  const highlightStale = () => reportRows().some((l) => l.classList.contains('viewing') !== (norm(l.textContent) === viewing))
+    || (viewing === null && reportRows().length > 0);
+  new MutationObserver(() => { if (highlightStale()) markViewing(); }).observe(document.body, {subtree: true, childList: true});
+
+  // Gradio picks the option from the mousedown target's data-index, which only the <li> has; a press on the
+  // name, icon or spec inside it is passed on to the <li> so the option is still chosen.
+  window.addEventListener('mousedown', (e) => {
+    const li = e.target.closest?.(
+      '#repo-dd .option-list .item, #version-dd .option-list .item, #scan-model-dd .option-list .item');
+    if (!li || li === e.target) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    li.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window, button: e.button,
+                                                   clientX: e.clientX, clientY: e.clientY}));
+  }, true);
+
   // Scrolling an open dropdown list (repository, version, ...) must not scroll the page behind it, even when the
   // list is too short to scroll or has reached its end.
   document.addEventListener('wheel', (e) => {

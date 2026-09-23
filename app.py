@@ -86,12 +86,13 @@ def _detect_vram_budget():
 VRAM_BUDGET_GB = _detect_vram_budget()  # auto-selected versions aim for the largest file that stays under this
 
 
-def fit_label(size_gb):
+def fit_breakdown(size_gb):
+    """How a version's weights split across video memory and system memory when loaded."""
     if size_gb <= VRAM_BUDGET_GB:
-        return "fits on GPU, fast"
+        return f"{size_gb:.1f} GB VRAM"
     if size_gb <= VRAM_BUDGET_GB + ram_gb() * 0.6:
-        return "GPU + system memory, slower"
-    return "too large for this PC"
+        return f"{VRAM_BUDGET_GB:.1f} GB VRAM + {size_gb - VRAM_BUDGET_GB:.1f} GB RAM"
+    return f"{size_gb:.1f} GB — too large for this PC"
 
 
 def gpu_live():
@@ -672,6 +673,38 @@ def model_names():
     return [m["name"] for m in list_models()]
 
 
+_load_problems = {}  # (name, digest) -> Ollama's error reading the model, "" if it reads fine
+
+
+def load_problem(m):
+    """Why Ollama can't load an installed model ("" if it can). Ollama lists every model it has, but only finds out
+    that a file is in a format it can't read (Prism's PQ2_0, for example) when it opens it, so ask once per file."""
+    key = (m["name"], m.get("digest"))
+    if key not in _load_problems:
+        try:
+            r = requests.post(f"{OLLAMA}/api/show", json={"model": m["name"]}, timeout=10)
+        except Exception:
+            return ""  # Ollama unreachable: say nothing rather than mark a good model
+        if r.ok:
+            _load_problems[key] = ""
+        else:
+            try:
+                err = str(r.json().get("error") or "") or f"HTTP {r.status_code}"
+                _load_problems[key] = re.sub(r'^read GGUF metadata "[^"]*": ', "", err)  # drop the blob path
+            except ValueError:
+                _load_problems[key] = f"HTTP {r.status_code}"
+    return _load_problems[key]
+
+
+def scan_model_choices():
+    """(choices, first runnable name) for the Scan tab. A model Ollama can't load stays listed but is marked, and
+    app.js greys it out with an explanation."""
+    models = list_models()
+    bad = {m["name"] for m in models if load_problem(m)}
+    choices = [(m["name"] + (f"   {CANNOT_LOAD}" if m["name"] in bad else ""), m["name"]) for m in models]
+    return choices, next((m["name"] for m in models if m["name"] not in bad), None)
+
+
 MODEL_COLUMNS = ("Model", "Size", "Parameters", "Quantization", "Added", "")
 
 
@@ -1214,6 +1247,7 @@ def hf_find_repos(query):
 QUANT_IN_NAME = re.compile(r"(?:^|[-_.])((?:UD-)?[A-Za-z]{0,3}(?:Q\d[\w.]*|BF16|F16|F32|FP16|MXFP4[\w.]*))\.gguf$", re.I)
 SHARD_IN_NAME = re.compile(r"-\d{5}-of-\d{5}")
 NOT_A_MODEL = ("mmproj", "imatrix", "mtp")  # companion files, not models to run
+CANNOT_LOAD = "Ollama can't load this format"  # exact text app.js matches to grey out a version and swap in the icon
 
 # The quantizations Ollama's own llama.cpp can load. Repositories also ship formats that only their authors' build
 # can run (Prism's PQ2_0, PTQ1_0, Q2_g64, dspark-*); those are listed but marked, because Ollama cannot load them.
@@ -1414,8 +1448,8 @@ def list_versions(source, repo):
     usable = [o for o in opts if runs_in_ollama(o[1])] if check_format else list(opts)
     best = best_version(usable or opts)  # never recommend a format Ollama can't load
     choices = [PLEASE_CHOOSE] + [
-        (f"{tag.split(':', 1)[-1]}   {size:.1f} GB   " + (fit_label(size) if not check_format or runs_in_ollama(tag)
-                                                          else "Ollama can't load this format")
+        (f"{tag.split(':', 1)[-1]}   " + (fit_breakdown(size) if not check_format or runs_in_ollama(tag)
+                                          else f"{size:.1f} GB   {CANNOT_LOAD}")
          + ("   (Recommended)" if tag == best else ""), tag) for size, tag in opts]
     size = next(sz for sz, t in opts if t == best)
     short = best.split(":", 1)[-1]
@@ -1641,12 +1675,83 @@ def _partial_files(ref):
     return []
 
 
+# Ollama keeps an unfinished pull as sha256-<digest>-partial (plus -partial-N progress records) in its blobs folder and
+# never removes it by itself, so a deleted download's layers are tracked here and deleted with it.
+OLLAMA_BLOBS = Path(os.environ.get("OLLAMA_MODELS") or Path.home() / ".ollama/models") / "blobs"
+PULL_LAYERS_FILE = DATA_DIR / "pull_layers.json"  # {ref: [layer digests]} for Ollama pulls not yet finished
+ORPHAN_PARTIAL_SECS = 900  # at startup, a partial layer no download owns is deleted once untouched this long
+
+
+def _pull_layers():
+    try:
+        known = json.loads(PULL_LAYERS_FILE.read_text())
+        return known if isinstance(known, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _remember_layers(ref, digests):
+    with _dl_lock:
+        known = _pull_layers()
+        if set(digests) <= set(known.get(ref, [])):
+            return
+        known[ref] = sorted(set(known.get(ref, [])) | set(digests))
+        PULL_LAYERS_FILE.write_text(json.dumps(known, indent=2))
+
+
+def _forget_layers(ref):
+    with _dl_lock:
+        known = _pull_layers()
+        if known.pop(ref, None) is not None:
+            PULL_LAYERS_FILE.write_text(json.dumps(known, indent=2))
+
+
+def _ollama_partials(digests=None):
+    """Ollama's partial-layer files, for the given digests ("sha256:<hex>") or all of them."""
+    if not OLLAMA_BLOBS.is_dir():
+        return []
+    wanted = None if digests is None else {dg.replace(":", "-") for dg in digests}
+    return [f for f in OLLAMA_BLOBS.glob("sha256-*-partial*")
+            if wanted is None or f.name.split("-partial", 1)[0] in wanted]
+
+
+def _drop_pull_data(ref):
+    """Delete the partial layers an unfinished Ollama pull left, except any another queued download still needs.
+    Waits briefly for Ollama to stop writing them after the pull was cancelled."""
+    known = _pull_layers()
+    mine = set(known.get(ref, []))
+    others = {dg for r, _ in _pending() if r != ref for dg in known.get(r, [])}
+    files = _ollama_partials(mine - others)
+    for _ in range(20):
+        sizes = {f: f.stat().st_mtime for f in files if f.exists()}
+        time.sleep(0.5)
+        if all(f.exists() and f.stat().st_mtime == m for f, m in sizes.items()):
+            break
+    for f in files:
+        f.unlink(missing_ok=True)
+    _forget_layers(ref)
+
+
+def orphaned_ollama_partials():
+    """Partial layers no download owns (left by downloads deleted before layers were tracked, or by a crash) that
+    have not been touched for a while. Nothing is claimed while a queued download's layers are unknown."""
+    pending = [r for r, _ in _pending() if not r.startswith("image:")]
+    known = _pull_layers()
+    if any(r not in known for r in pending):
+        return []
+    owned = {dg.replace(":", "-") for r in pending for dg in known[r]}
+    cutoff = time.time() - ORPHAN_PARTIAL_SECS
+    return [f for f in _ollama_partials()
+            if f.name.split("-partial", 1)[0] not in owned and f.stat().st_mtime < cutoff]
+
+
 def _worker_stopped(ref, d):
     """A worker left its loop without finishing: deleted (partial data removed) or paused (kept to resume)."""
     if d["cancel"]:
         if d.get("hidden"):
             for f in _partial_files(ref):
                 f.unlink(missing_ok=True)
+            _drop_pull_data(ref)
         d.update(state="cancelled", msg="Cancelled")
         _set_pending(ref, False)
     elif d.get("pause"):  # (if it was resumed meanwhile, _run_download starts it again)
@@ -1699,6 +1804,8 @@ def _download_worker(ref):
                             break
                         raise PermanentDownloadError(ev["error"])
                     if ev.get("digest") and ev.get("total"):
+                        if ev["digest"] not in layers:
+                            _remember_layers(ref, [ev["digest"]])
                         layers[ev["digest"]] = (ev.get("completed", 0), ev["total"])
                         done = sum(c for c, _ in layers.values())
                         total = sum(t for _, t in layers.values())
@@ -1708,6 +1815,7 @@ def _download_worker(ref):
                     if ev.get("status") == "success":
                         d.update(state="done", msg="Done", finished=time.time())
                         _set_pending(ref, False)
+                        _forget_layers(ref)
                         _dl_finished["count"] += 1
                         return
             if d["cancel"] or d.get("pause") or d.get("direct"):
@@ -1735,8 +1843,8 @@ def prioritize_download(ref):
 
 
 def remove_download(ref):
-    """Trash icon on a download: stop it and remove it from the list, deleting its partial data. (Ollama discards
-    partial data of its own pulls the next time it starts, since nothing references it.)"""
+    """Trash icon on a download: stop it and remove it from the list, deleting its partial data, including the
+    partial layers of an Ollama pull (a running worker deletes those itself once it has stopped)."""
     d = _downloads.get(ref)
     if not d:
         return gr.update(), gr.update()
@@ -1745,12 +1853,14 @@ def remove_download(ref):
         if d["state"] in ACTIVE:
             d["cancel"] = True
         running = d.get("running")
-    if not running:  # nothing will clean up after it, e.g. a paused download
+    if not running:  # nothing will clean up after it, e.g. a paused, stalled or failed download
         for f in _partial_files(ref):
             f.unlink(missing_ok=True)
         if d["state"] in ACTIVE:
             d.update(state="cancelled", msg="Cancelled")
     _set_pending(ref, False)
+    if not running:
+        threading.Thread(target=_drop_pull_data, args=(ref,), daemon=True).start()
     if _priority["ref"] == ref:
         _priority["ref"] = None
     return note_html(f"Deleted {download_label(ref)} from downloads."), ""
@@ -2715,6 +2825,10 @@ def model_hint(name):
     """Explain how the chosen model will run on this hardware and pick a sensible timeout."""
     if not name:
         return "", gr.update()
+    problem = next((load_problem(m) for m in list_models() if m["name"] == name), "")
+    if problem:
+        return (f"**This model can't run, so it can't be scanned.** Ollama can't load it ({problem}). Models in "
+                "formats like PQ2_0 or PTQ1_0 need the llama.cpp build from the model's authors."), gr.update()
     size, caps = model_info(name)
     g = gpu_live()
     vram = g[3] if g else 0
@@ -2744,14 +2858,16 @@ class ScanProgress:
     DETECT = re.compile(r"^\s*([\w.]+)/([\w.]+):\s+\d+%\|.*?(\d+)/(\d+)")
     RESULT = re.compile(r"^\s*([\w.]+)\s+[\w.]+:\s+(PASS|FAIL)\b")
 
-    def __init__(self):
+    def __init__(self, probes=(), done=(), failed=()):
+        """probes/done/failed carry over a resumed scan, whose garak run only lists the probes still to do."""
         self.start = time.time()
-        self.probes, self.done, self.failed = [], set(), set()
+        self.probes, self.done, self.failed = list(probes), set(done), set(failed)
         self.current, self.frac, self.phase = None, 0.0, "Starting garak"
 
     def feed(self, line):
         if m := self.QUEUE.search(line):
-            self.probes = [x.strip() for x in m.group(1).split(",") if x.strip()]
+            if not self.probes:
+                self.probes = [x.strip() for x in m.group(1).split(",") if x.strip()]
             self.phase = "Loading model"
         elif m := self.PROMPTS.match(line):
             self.current, n, total = m.group(1), int(m.group(2)), int(m.group(3))
@@ -2807,6 +2923,11 @@ def run_scan(model, scan_type, selected, generations, timeout, thinking=False):
     if not ollama_up():
         yield "Ollama is not running. Start it at the top of the page.", gr.update(), gr.update(), gr.update()
         return
+    problem = next((load_problem(m) for m in list_models() if m["name"] == model), "")
+    if problem:
+        yield (f"{model} can't be scanned: Ollama can't load this model ({problem}). Choose a model that runs.",
+               gr.update(), gr.update(), gr.update())
+        return
     probes, err = resolve_scan(scan_type, selected)
     if err:
         yield err, gr.update(), gr.update(), gr.update()
@@ -2815,34 +2936,93 @@ def run_scan(model, scan_type, selected, generations, timeout, thinking=False):
         yield ("A scan is already running. Wait for it to finish, or click Stop to end it.", gr.update(),
                gr.update(interactive=True), gr.update())
         return
+    if _resume["waiting"]:
+        yield ("An interrupted scan is about to resume. Click Stop to cancel it first.", gr.update(),
+               gr.update(interactive=True), gr.update())
+        return
     if _image_proc.get("p") and _image_proc["p"].poll() is None:
         yield "An image is being generated on the GPU. Start the scan once it finishes.", gr.update(), gr.update(), gr.update()
         return
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", model)
-    prefix = f"{safe}_{time.strftime('%Y%m%d-%H%M%S')}"
-    gen_opts = {"timeout": int(timeout)}
-    if thinking:
+    job = {"model": model, "scan_type": scan_type, "requested": probes or [], "queue": [], "done": [], "failed": [],
+           "generations": int(generations), "timeout": int(timeout), "thinking": bool(thinking),
+           "prefix": f"{safe}_{time.strftime('%Y%m%d-%H%M%S')}", "parts": 1, "stalls": 0}
+    _save_scan_job(job)
+    _launch_scan(job)
+    yield from follow_scan()
+
+
+# A running scan is saved to SCAN_JOB with the probes garak has finished. If LLM Scanner stops or the computer shuts
+# down mid-scan, the next start runs the unfinished probes as a new part of the same scan (garak can't append to a
+# report, so each part has its own report). Finishing, failing on its own, or Stop removes the file.
+SCAN_JOB = DATA_DIR / "scan_job.json"
+MAX_STALLED_RESUMES = 3  # give up on a scan that is interrupted this many times in a row without finishing a probe
+OLLAMA_WAIT_SECS = 600  # after a reboot, how long a resume waits for Ollama to come up
+_scan = {"head": "", "buf": [], "cur": [""], "progress": ScanProgress(), "reader": None, "end": "", "ok": False,
+         "user_stop": False}
+_resume = {"waiting": False}
+
+
+def _save_scan_job(job):
+    tmp = SCAN_JOB.with_suffix(".tmp")
+    tmp.write_text(json.dumps(job), encoding="utf-8")
+    tmp.replace(SCAN_JOB)
+
+
+def _load_scan_job():
+    try:
+        job = json.loads(SCAN_JOB.read_text(encoding="utf-8"))
+        return job if isinstance(job, dict) and job.get("model") else None
+    except (OSError, ValueError):
+        return None
+
+
+def _remaining_probes(job):
+    """Probes still to run: garak's queue minus the finished ones, or the original request if garak never got as far
+    as listing its queue."""
+    return [p for p in job["queue"] if p not in job["done"]] if job["queue"] else job["requested"]
+
+
+def _launch_scan(job, note=""):
+    """Start garak for the job's unfinished probes. Output goes to _scan so any open page can show it."""
+    part = job["parts"]
+    prefix = job["prefix"] + (f"_part{part}" if part > 1 else "")
+    gen_opts = {"timeout": job["timeout"]}
+    if job["thinking"]:
         gen_opts["max_tokens"] = 4096  # leave room for the reasoning before the answer
-    runner = str(APP_DIR / "garak_runner.py")
-    cmd = [PY, runner, "--target_type", "ollama.OllamaGeneratorChat", "--target_name", model,
-           "--generations", str(int(generations)), "--report_prefix", prefix,
+    cmd = [PY, str(APP_DIR / "garak_runner.py"), "--target_type", "ollama.OllamaGeneratorChat",
+           "--target_name", job["model"], "--generations", str(job["generations"]), "--report_prefix", prefix,
            "--generator_options", json.dumps({"ollama": {"OllamaGeneratorChat": gen_opts}})]
-    if probes:
-        cmd += ["--probes", ",".join(probes)]
+    remaining = _remaining_probes(job)
+    if remaining:
+        cmd += ["--probes", ",".join(remaining)]
     env = os.environ | {"PYTHONUNBUFFERED": "1", "TERM": "dumb", "PYTHONIOENCODING": "utf-8",
-                        "LLM_SCANNER_THINK": "1" if thinking else "0", "LLM_SCANNER_MODEL": model}
-    head = "garak " + " ".join(cmd[2:]) + "\n\n"
-    progress = ScanProgress()
-    yield head, gr.update(interactive=False), gr.update(interactive=True), progress.html()
+                        "LLM_SCANNER_THINK": "1" if job["thinking"] else "0", "LLM_SCANNER_MODEL": job["model"]}
+    progress = ScanProgress(job["queue"], job["done"], job["failed"])
+    buf, cur = [], [""]
+    _scan.update(head=note + "garak " + " ".join(cmd[2:]) + "\n\n", buf=buf, cur=cur, progress=progress, end="",
+                 ok=False, user_stop=False)
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, start_new_session=True)
     _proc["p"] = p
-    buf, cur = [], [""]
+
+    def record(line):
+        """Save what garak has finished. A probe counts once garak has moved on to the next one, since its
+        remaining detectors may still be scoring it."""
+        progress.feed(line)
+        changed = False
+        if not job["queue"] and progress.probes:
+            job["queue"], changed = list(progress.probes), True
+        finished = sorted(progress.done - {progress.current})
+        if finished != job["done"]:
+            job["done"], job["failed"], changed = finished, sorted(progress.failed & set(finished)), True
+        if changed and not _scan["user_stop"]:
+            _save_scan_job(job)
 
     def on_text(text):
         for c in EMOJI.sub("", ANSI.sub("", text)):
             if c in "\n\r":
                 if cur[0]:
-                    progress.feed(cur[0])
+                    record(cur[0])
                 if c == "\n":
                     if "%|" in cur[0] and buf and "%|" in buf[-1]:
                         buf[-1] = cur[0]  # keep only the latest progress bar line
@@ -2857,24 +3037,109 @@ def run_scan(model, scan_type, selected, generations, timeout, thinking=False):
     def on_exit():  # also runs if the page was closed during the scan
         if _proc["p"] is p:
             _proc["p"] = None
+        rc = p.returncode
+        _scan["ok"] = rc == 0
+        if rc == 0:
+            _scan["end"] = "Scan complete. Open Reports to view the results."
+        elif _scan["user_stop"]:
+            _scan["end"] = "Scan stopped."
+        elif rc > 0:
+            _scan["end"] = f"Scan stopped: garak exited with code {rc}."
+        else:  # killed by a signal the user didn't send (out of memory, shutdown): leave the job to resume
+            _scan["end"] = "Scan interrupted. It will continue from where it stopped the next time LLM Scanner starts."
+        if rc >= 0 or _scan["user_stop"]:
+            SCAN_JOB.unlink(missing_ok=True)
         unload_models()  # free memory as soon as the scan is over
 
-    reader = pump_output(p, on_text, on_exit)
-    while reader.is_alive():
+    _scan["reader"] = pump_output(p, on_text, on_exit)
+
+
+def _scan_log(limit=None):
+    lines = _scan["buf"][-limit:] if limit else _scan["buf"]
+    return _scan["head"] + "\n".join(lines + _scan["cur"])
+
+
+def follow_scan():
+    """Stream the current scan to a page until it ends: the page that started it, or one opened later."""
+    reader = _scan["reader"]
+    while reader and reader.is_alive():
+        yield _scan_log(400), gr.update(interactive=False), gr.update(interactive=True), _scan["progress"].html()
         reader.join(1.0)
-        if reader.is_alive():
-            yield head + "\n".join(buf[-400:] + cur), gr.update(), gr.update(), progress.html()
-    ok = p.returncode == 0
-    end = "Scan complete. Open Reports to view the results." if ok else f"Scan stopped (exit code {p.returncode})."
-    yield (head + "\n".join(buf + cur) + f"\n\n{end}", gr.update(interactive=True), gr.update(interactive=False),
-           progress.html("done" if ok else "stopped"))
+    yield (_scan_log() + f"\n\n{_scan['end']}", gr.update(interactive=True), gr.update(interactive=False),
+           _scan["progress"].html("done" if _scan["ok"] else "stopped"))
+
+
+def attach_scan():
+    """On page load, show a scan that is already running or about to resume, instead of 'No scan running'."""
+    shown = False
+    while _resume["waiting"]:
+        if not shown:
+            yield ("A scan was interrupted when LLM Scanner stopped. It will resume as soon as Ollama is running.",
+                   gr.update(interactive=False), gr.update(interactive=True), IDLE_PROGRESS)
+            shown = True
+        time.sleep(1)
+    if _scan_running() or (_scan["reader"] and _scan["reader"].is_alive()):
+        yield from follow_scan()
+    elif shown:  # the resume was cancelled or could not start
+        yield "No scan running.", gr.update(interactive=True), gr.update(interactive=False), IDLE_PROGRESS
+    else:
+        yield gr.update(), gr.update(), gr.update(), gr.update()
+
+
+def resume_interrupted_scan():
+    """Continue a scan that LLM Scanner's stop, a crash or a shutdown cut short (runs once at startup)."""
+    _resume["waiting"] = True
+    try:
+        job = _load_scan_job()
+        if not job:
+            return
+        remaining = _remaining_probes(job)
+        if job["queue"] and not remaining:
+            SCAN_JOB.unlink(missing_ok=True)  # every probe finished; only the exit was missed
+            return
+        deadline = time.time() + OLLAMA_WAIT_SECS
+        while not ollama_up():
+            if not SCAN_JOB.exists():  # Stop was pressed while waiting
+                return
+            if time.time() > deadline:
+                print("Interrupted scan not resumed: Ollama did not start. It will be tried again next start.", flush=True)
+                return
+            time.sleep(5)
+        if not SCAN_JOB.exists():  # Stop was pressed while waiting
+            return
+        if job["model"] not in model_names():
+            print(f"Interrupted scan dropped: {job['model']} is no longer installed.", flush=True)
+            SCAN_JOB.unlink(missing_ok=True)
+            return
+        job["stalls"] = job["stalls"] + 1 if len(job["done"]) == job.get("done_at_resume", -1) else 0
+        if job["stalls"] >= MAX_STALLED_RESUMES:
+            print(f"Interrupted scan dropped: it stopped {job['stalls']} times in a row without progress.", flush=True)
+            SCAN_JOB.unlink(missing_ok=True)
+            return
+        job["parts"] += 1
+        job["done_at_resume"] = len(job["done"])
+        _save_scan_job(job)
+        left = (f"{len(remaining)} of {len(job['queue'])} probes left" if job["queue"]
+                else "garak had not started probing yet, so the scan starts over")
+        earlier = ", ".join(job["prefix"] + (f"_part{n}" if n > 1 else "") for n in range(1, job["parts"]))
+        note = (f"Resumed after LLM Scanner was stopped: {left}. Results from before the interruption are in "
+                f"{'report' if job['parts'] == 2 else 'reports'} {earlier}; this part is saved as "
+                f"{job['prefix']}_part{job['parts']}.\n")
+        print(note.strip(), flush=True)
+        _launch_scan(job, note)
+    finally:
+        _resume["waiting"] = False
 
 
 def stop_scan():
+    _scan["user_stop"] = True
+    SCAN_JOB.unlink(missing_ok=True)  # also cancels a resume that is still waiting for Ollama
     p = _proc.get("p")
     if p and p.poll() is None:
         os.killpg(p.pid, signal.SIGTERM)
         return "Stopping scan..."
+    if _resume["waiting"]:
+        return "Resume cancelled."
     return "No scan is running."
 
 
@@ -2924,6 +3189,12 @@ def reports_ticked(selected, previous, shown, which):
     added = [n for n in selected if n not in (previous or [])]
     shown = added[-1] if added else (shown if _known_report(shown) else (selected[0] if selected else None))
     return (delete_label(selected), selected, shown, *show_report(shown, which))
+
+
+def view_report(label, shown, which):
+    """Clicking a report's name (not its box) shows that report without ticking it."""
+    name = next((n for lbl, n in reports() if " ".join(lbl.split()) == " ".join((label or "").split())), None) or shown
+    return (name, *show_report(name, which))
 
 
 def select_all_reports(on, shown, which):
@@ -3015,12 +3286,13 @@ def model_choices_changed(chat):
     """Keep model dropdowns in sync after a download finishes or a model is deleted."""
     names = model_names()
     locked = bool(chat and chat.get("messages") and chat.get("model"))
-    return gr.update(choices=names), (model_lock(chat) if locked else gr.update(choices=names))
+    return gr.update(choices=scan_model_choices()[0]), (model_lock(chat) if locked else gr.update(choices=names))
 
 
 def refresh_all(chat=None):
     names = model_names()
-    upd = gr.update(choices=names, value=names[0] if names else None)
+    scan_choices_, runnable = scan_model_choices()
+    upd = gr.update(choices=scan_choices_, value=runnable)
     locked = bool(chat and chat.get("messages") and chat.get("model"))
     chat_upd = model_lock(chat) if locked else gr.update(choices=names, value=names[0] if names else None,
                                                           interactive=True, label="Model")
@@ -3117,9 +3389,10 @@ with gr.Blocks(title="LLM Scanner") as ui:
                             search_btn = gr.Button("Search", variant="primary", scale=1, min_width=120)
                         with gr.Row():
                             repo = gr.Dropdown(label="Repository", choices=[PLEASE_CHOOSE], value="", scale=3,
-                                               min_width=300, elem_classes="required", interactive=False)
+                                               min_width=300, elem_classes="required", elem_id="repo-dd", interactive=False)
                             version = gr.Dropdown(label="Version", choices=[PLEASE_CHOOSE], value="", scale=2,
-                                                  min_width=300, interactive=False, elem_classes="required")
+                                                  min_width=300, interactive=False, elem_classes="required",
+                                                  elem_id="version-dd")
                         search_note = gr.HTML(elem_classes="note")
                         with gr.Row():
                             pull_btn = gr.Button("Download", variant="primary", scale=0, min_width=160, interactive=False)
@@ -3342,7 +3615,8 @@ with gr.Blocks(title="LLM Scanner") as ui:
                 gr.HTML(f'<h2>Run a scan <span class="ver-badge">garak {html.escape(GARAK_VERSION)}</span></h2>'
                         '<p class="sub">garak sends attack prompts to the model and checks its responses.</p>')
                 with gr.Row():
-                    scan_model = gr.Dropdown(label="Model", choices=model_names(), scale=1, min_width=280)
+                    scan_model = gr.Dropdown(label="Model", choices=scan_model_choices()[0], scale=1, min_width=280,
+                                             elem_id="scan-model-dd")
                     scan_type = gr.Dropdown(label="Scan type", choices=scan_choices(), value="Quick check",
                                             scale=1, min_width=280)
                 model_note = gr.Markdown(elem_classes="note")
@@ -3374,10 +3648,13 @@ with gr.Blocks(title="LLM Scanner") as ui:
                 with gr.Row(equal_height=True, elem_classes="report-actions"):
                     rep_all = gr.Checkbox(label="Select all", value=False, scale=0, min_width=130,
                                           elem_classes="select-all")
-                    rep_open = gr.Button("Open summary in browser", variant="secondary", scale=0, min_width=220)
+                    rep_open = gr.Button("Open summary in browser", variant="secondary", scale=0, min_width=220,
+                                         elem_classes="rep-open")
                     rep_delete = gr.Button("Delete reports", variant="stop", scale=0, min_width=170, interactive=False,
                                            elem_classes="reps-delete")
                 rep_status = gr.HTML(elem_classes="note")
+                rep_view_label = gr.Textbox(elem_id="rep-view-label", elem_classes="hidden-control", container=False)
+                rep_view_btn = gr.Button("view", elem_id="rep-view-btn", elem_classes="hidden-control")
                 rep_confirm = gr.Checkbox(value=False, visible=False)
                 rep_picked = gr.State([])                                   # what is ticked, to spot new ticks
                 rep_shown = gr.State(_reports[0][1] if _reports else None)  # the report the tabs below display
@@ -3485,6 +3762,10 @@ with gr.Blocks(title="LLM Scanner") as ui:
         report_list_state, [rep_picked, rep_shown], [rep_list, rep_all, rep_delete, rep_picked, rep_shown],
         show_progress="hidden")
     stop_btn.click(stop_scan, outputs=scan_log, show_progress="hidden")
+    ui.load(attach_scan, outputs=[scan_log, scan_btn, stop_btn, scan_progress], show_progress="hidden",
+            concurrency_limit=None).then(
+        report_list_state, [rep_picked, rep_shown], [rep_list, rep_all, rep_delete, rep_picked, rep_shown],
+        show_progress="hidden")
 
     # reports
     view_outputs = [rep_summary, rep_view, raw_view, rep_files]
@@ -3494,6 +3775,8 @@ with gr.Blocks(title="LLM Scanner") as ui:
                   [rep_list, rep_delete, rep_picked, rep_shown, *view_outputs], show_progress="hidden")
     raw_pick.change(read_raw, [rep_shown, raw_pick], raw_view, show_progress="hidden")
     rep_open.click(open_report, rep_shown, show_progress="hidden")
+    rep_view_btn.click(view_report, [rep_view_label, rep_shown, raw_pick], [rep_shown, *view_outputs],
+                       show_progress="hidden")
     rep_delete.click(delete_reports, [rep_list, rep_confirm, rep_shown, raw_pick],
                      [rep_list, rep_all, rep_delete, rep_picked, rep_shown, *view_outputs, rep_status],
                      js="(names, c, shown, which) => [names, !!(names && names.length), shown, which]",
@@ -3529,13 +3812,14 @@ def clean_leftovers():
     backups = DATA_DIR / "backups"
     if backups.exists():
         doomed += sorted((d for d in backups.iterdir() if d.is_dir()), key=lambda d: d.stat().st_mtime)[:-KEEP_BACKUPS]
+    doomed += orphaned_ollama_partials()
     files = size = 0
     for path in doomed:
         if not path.exists():
             continue
         for f in ([path] if path.is_file() else [p for p in path.rglob("*") if p.is_file() and not p.is_symlink()]):
             files += 1
-            size += f.stat().st_size
+            size += f.stat().st_blocks * 512  # disk actually used; Ollama's partial layers are sparse
         shutil.rmtree(path, ignore_errors=True) if path.is_dir() else path.unlink(missing_ok=True)
     return files, size
 
@@ -3579,6 +3863,9 @@ if __name__ == "__main__":
         if files:
             print(f"Removed {files} leftover files ({size / 1e9:.1f} GB)", flush=True)
         resume_pending_downloads()
+        if _load_scan_job():
+            _resume["waiting"] = True  # set before the page can load, so it shows the pending resume
+            threading.Thread(target=resume_interrupted_scan, daemon=True).start()
         threading.Thread(target=check_updates, daemon=True).start()  # once at startup; after that, on request
     ui.queue().launch(server_name="127.0.0.1", server_port=int(os.environ.get("LLM_SCANNER_PORT", 7861)),
                       inbrowser="--no-browser" not in sys.argv, allowed_paths=[str(GARAK_RUNS), str(ATTACH_DIR), str(IMAGES_DIR)],

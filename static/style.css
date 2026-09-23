@@ -244,6 +244,27 @@ button.row-del:hover { background:#3a1d1d url("data:image/svg+xml,%3Csvg xmlns='
 .dl-toggle.resume:hover { background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%232997ff' stroke='none'%3E%3Cpath d='M8 5.6v12.8a1 1 0 0 0 1.5.86l10.2-6.4a1 1 0 0 0 0-1.72L9.5 4.74A1 1 0 0 0 8 5.6z'/%3E%3C/svg%3E"); }
 .dl-state.paused { color:#a1a1a6; } .fill.paused { background:#6e6e73; }
 .dl-del:hover { background:#3a1d1d url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23ff453a' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 6h18'/%3E%3Cpath d='M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2'/%3E%3Cpath d='M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6'/%3E%3Cpath d='M10 11v6'/%3E%3Cpath d='M14 11v6'/%3E%3C/svg%3E") center / 16px 16px no-repeat; opacity:1; }
+/* Repository/Version pickers, built by app.js from the plain-text option since Gradio choices carry no markup.
+   Repository: name on the left, pulls/format info as muted meta on the right.
+   Version: no-entry icon + name left-aligned, its VRAM/RAM split centered in grey, Recommended on the right;
+   an unsupported version is greyed out (name + spec only, the icon stays red) but is still selectable. */
+#repo-dd .option-list .item, :is(#version-dd, #scan-model-dd) .option-list .item { display:flex !important; align-items:center; gap:10px;
+       justify-content:flex-start; text-align:left; }
+#repo-dd .opt-name, :is(#version-dd, #scan-model-dd) .opt-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0;
+       color:#f5f5f7; text-align:left; }
+#repo-dd .opt-meta { display:flex; align-items:center; gap:8px; flex:0 0 auto; margin-left:auto; font-size:12.5px;
+       color:#86868b; white-space:nowrap; }
+#repo-dd .opt-badge.modified { color:#ff9f0a; }
+#repo-dd .opt-badge.recommended, :is(#version-dd, #scan-model-dd) .opt-badge.recommended { color:#30d158; font-weight:600; }
+:is(#version-dd, #scan-model-dd) .opt-left { display:flex; align-items:center; gap:6px; flex:0 0 auto; min-width:0; }
+:is(#version-dd, #scan-model-dd) .opt-mid { flex:1 1 auto; text-align:center; font-size:12.5px; color:#86868b; white-space:nowrap;
+       overflow:hidden; text-overflow:ellipsis; padding:0 8px; }
+:is(#version-dd, #scan-model-dd) .opt-right { flex:0 0 auto; }
+:is(#version-dd, #scan-model-dd) .item.unsupported-row .opt-name, :is(#version-dd, #scan-model-dd) .item.unsupported-row .opt-mid { color:#6e6e73; }
+:is(#version-dd, #scan-model-dd) .opt-badge.unsupported { display:inline-flex; flex:0 0 auto; cursor:help; }
+:is(#version-dd, #scan-model-dd) .opt-badge.unsupported .x-icon { width:15px; height:15px; stroke:#ff453a; fill:none; stroke-width:1.6;
+       stroke-linecap:round; }
+
 /* dropdowns: long values end with an ellipsis instead of covering the arrow */
 .gradio-container .secondary-wrap { position:relative; }
 .gradio-container .secondary-wrap input[role="combobox"] { text-overflow:ellipsis; white-space:nowrap; overflow:hidden;
@@ -476,7 +497,7 @@ button[role="tab"], .segmented label { transition:color .3s ease, background-col
 .probe-info .pi-chip:hover { background:#0a2540; }
 .probe-list label { cursor:help; }
 /* hover explanation panel (placed by static/app.js) */
-.tip-box { position:fixed; z-index:10000; max-width:320px; background:rgba(28,28,30,.97); border:1px solid #2d2d2f;
+.tip-box { position:fixed; z-index:2147483646; max-width:320px;  /* above Gradio's open dropdown list (2147480000) */ background:rgba(28,28,30,.97); border:1px solid #2d2d2f;
         border-radius:12px; padding:10px 12px; box-shadow:0 10px 30px rgba(0,0,0,.5); pointer-events:none; opacity:0;
         transform:translateY(-3px); transition:opacity .15s ease, transform .15s ease; visibility:hidden; }
 .tip-box.show { opacity:1; transform:none; visibility:visible; }
@@ -518,14 +539,23 @@ button[role="tab"], .segmented label { transition:color .3s ease, background-col
 .top-row > .update-box { flex:0 1 460px !important; margin:28px 0 0 !important; }
 @media (max-width: 900px) { .top-row { flex-wrap:wrap !important; } .top-row > .update-box { flex:1 1 100% !important; margin:0 !important; } }
 
-/* Models tab: the Downloads card and the chat card end at the same height */
+/* Models tab: the left cards are as tall as their content, and the chat card takes the height of that column
+   (its messages scroll inside) instead of forcing its own, so neither side is padded with empty space. */
 .models-row { align-items:stretch !important; }
 .models-left { display:flex !important; flex-direction:column !important; }
-.models-left > .downloads-card { flex:1 1 auto !important; }
+.models-left > .card { flex:0 0 auto !important; }
+.models-left > .downloads-card { flex:1 1 auto !important; }  /* only grows if the chat card is the taller one */
 .models-row > .chat-card { align-self:stretch !important; position:static; display:flex !important; flex-direction:column !important; }
 .models-row > .chat-card > .chat-layout { flex:1 1 auto !important; align-items:stretch !important; }
 .models-row .chat-main { display:flex !important; flex-direction:column !important; }
-.models-row .chat-main > .chat { flex:1 1 auto !important; height:auto !important; min-height:60vh; }
+.models-row .chat-main > .chat { flex:1 1 0 !important; height:0 !important; min-height:420px; }
+/* The chat list runs the full height of the chat card and scrolls inside it; a long list never stretches the card. */
+@media (min-width: 901px) {
+  .models-row .chat-sidebar { max-height:none !important; align-self:stretch !important; contain:size; }
+}
+
+/* Status lines under forms take no room until they have something to say. */
+.block.note:has(.prose.note:empty), .block.note:has(.html-container:empty) { display:none !important; }
 .update-box .html-container { padding:0 !important; }
 .update-box > .block:has(.html-container:empty), .update-box > .html-container:empty { display:none !important; }
 /* compact update box with a grey close (x) button in its corner */
@@ -569,3 +599,11 @@ a.mt-model-name:hover { color:#2997ff !important; text-decoration:underline !imp
 .report-list label.selected, .report-list label:has(input:checked) { background:#0a1d33 !important; }
 .report-actions { align-items:center !important; margin-top:10px; }
 .report-actions .select-all label { background:transparent !important; border:none !important; padding-left:2px !important; }
+
+/* Reports: with reports ticked, the actions are about the selection (Select all, Delete); with none ticked, about the
+   report being viewed (Open in browser). */
+.card:has(.report-list input:checked) .report-actions .rep-open { display:none !important; }
+.card:has(.report-list):not(:has(.report-list input:checked)) .report-actions .select-all { display:none !important; }
+.report-list label { cursor:pointer; }
+.report-list label.viewing { box-shadow:inset 3px 0 0 #2997ff; }
+.report-list label.viewing:not(:has(input:checked)) { background:#1d1d1f !important; }

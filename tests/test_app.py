@@ -61,7 +61,8 @@ class TempDataTest(unittest.TestCase):
             "IMAGES_DIR": data / "images", "IMAGE_MODEL_DIR": data / "image-models",
             "SHARED_DIR": data / "image-models" / "shared", "CUSTOM_IMAGE_FILE": data / "image_models.json",
             "GROUPS_FILE": data / "probe_groups.json", "DOWNLOADS_FILE": data / "downloads.json",
-            "GARAK_RUNS": self.tmp / "garak_runs", "CHAT_INDEX": app.ChatIndex(),
+            "GARAK_RUNS": self.tmp / "garak_runs", "CHAT_INDEX": app.ChatIndex(), "SCAN_JOB": data / "scan_job.json",
+            "OLLAMA_BLOBS": self.tmp / "ollama-blobs", "PULL_LAYERS_FILE": data / "pull_layers.json",
         }
         for name, value in patches.items():
             p = mock.patch.object(app, name, value)
@@ -172,11 +173,11 @@ class VersionPicking(unittest.TestCase):
         self.assertNotIn("can't load", labels["F16"])
         self.assertIn("PTQ1_0, PQ2_0 are in a format Ollama cannot load", note)
 
-    def test_fit_label(self):
+    def test_fit_breakdown(self):
         with mock.patch.object(app, "VRAM_BUDGET_GB", 7.5), mock.patch.object(app, "ram_gb", return_value=32):
-            self.assertEqual(app.fit_label(7), "fits on GPU, fast")
-            self.assertEqual(app.fit_label(20), "GPU + system memory, slower")
-            self.assertEqual(app.fit_label(40), "too large for this PC")
+            self.assertEqual(app.fit_breakdown(7), "7.0 GB VRAM")
+            self.assertEqual(app.fit_breakdown(20), "7.5 GB VRAM + 12.5 GB RAM")
+            self.assertEqual(app.fit_breakdown(40), "40.0 GB \u2014 too large for this PC")
 
 
 # ---------------------------------------------------------------- chats
@@ -1081,7 +1082,7 @@ class ScanProgressTests(unittest.TestCase):
         self.assertIn("image", first[0])
 
 
-class ScanSurvivesPageClose(unittest.TestCase):
+class ScanSurvivesPageClose(TempDataTest):
     """Closing or reloading the page stops Gradio from iterating the scan generator. The scan must keep running
     (its output drained so it can't block on a full pipe) and clean up when it ends."""
 
@@ -1111,6 +1112,94 @@ class ScanSurvivesPageClose(unittest.TestCase):
             self.assertEqual(proc.poll(), 0, "the scan process blocked after the page was closed")
             self.assertIsNone(app._proc["p"], "the app still thinks a scan is running")
             unload.assert_called()
+
+
+class ScanResume(TempDataTest):
+    """A scan cut short by LLM Scanner stopping (or the computer shutting down) continues at the next start with only
+    the probes it had not finished; one that finished, failed on its own or was stopped by the user does not."""
+    GARAK = ("import os, signal, sys\n"
+             "print('queue of probes: a.A, b.B, c.C', flush=True)\n"
+             "print('probes.a.A: 100%|####| 2/2', flush=True)\n"
+             "print('a.A                  det.D: FAIL  ok on 1/2', flush=True)\n"
+             "print('probes.b.B:  50%|##  | 1/2', flush=True)\n"
+             "{end}\n")
+
+    def run_fake_scan(self, end):
+        script = self.tmp / "fake_garak.py"
+        script.write_text(self.GARAK.format(end=end))
+        real_popen = app.subprocess.Popen
+        with mock.patch.object(app, "ollama_up", return_value="1"), mock.patch.object(app, "unload_models"), \
+                mock.patch.object(app.subprocess, "Popen", side_effect=lambda cmd, **kw: real_popen(
+                    [sys.executable, str(script)], **kw)):
+            gen = app.run_scan("m", "Quick check", [], 1, 60)
+            *_, last = gen
+        return last
+
+    def resume(self, installed=("m",)):
+        launched = []
+        with mock.patch.object(app, "ollama_up", return_value="1"), \
+                mock.patch.object(app, "model_names", return_value=list(installed)), \
+                mock.patch.object(app, "_launch_scan", side_effect=lambda job, note="": launched.append((job, note))):
+            app.resume_interrupted_scan()
+        self.assertFalse(app._resume["waiting"])
+        return launched
+
+    def test_killed_scan_resumes_with_unfinished_probes(self):
+        log, *_ = self.run_fake_scan("os.kill(os.getpid(), signal.SIGKILL)")
+        self.assertIn("next time LLM Scanner starts", log)
+        job = json.loads(app.SCAN_JOB.read_text())
+        self.assertEqual(job["queue"], ["a.A", "b.B", "c.C"])
+        self.assertEqual(job["done"], ["a.A"], "b.B was still running, so it must be run again")
+        self.assertEqual(job["failed"], ["a.A"])
+        (job, note), = self.resume()
+        self.assertEqual(app._remaining_probes(job), ["b.B", "c.C"])
+        self.assertEqual(job["parts"], 2)
+        self.assertIn("2 of 3 probes left", note)
+        self.assertIn(job["prefix"] + "_part2", note)
+
+    def test_resumed_command_and_progress(self):
+        job = {"model": "m", "scan_type": "Quick check", "requested": [], "queue": ["a.A", "b.B", "c.C"],
+               "done": ["a.A"], "failed": [], "generations": 2, "timeout": 60, "thinking": False,
+               "prefix": "m_1", "parts": 2, "stalls": 0}
+        with mock.patch.object(app.subprocess, "Popen") as popen, mock.patch.object(app, "pump_output"):
+            popen.return_value.pid = 1
+            app._launch_scan(job, "Resumed\n")
+        cmd = popen.call_args[0][0]
+        self.assertEqual(cmd[cmd.index("--probes") + 1], "b.B,c.C")
+        self.assertEqual(cmd[cmd.index("--report_prefix") + 1], "m_1_part2")
+        app._scan["progress"].feed("queue of probes: b.B, c.C")
+        self.assertEqual(len(app._scan["progress"].probes), 3, "progress must count the whole scan, not just this part")
+        self.assertAlmostEqual(app._scan["progress"].percent(), 100 / 3)
+        app._proc["p"] = None
+
+    def test_finished_failed_or_stopped_scans_do_not_resume(self):
+        for end in ("sys.exit(0)", "sys.exit(1)"):
+            self.run_fake_scan(end)
+            self.assertFalse(app.SCAN_JOB.exists(), end)
+            self.assertEqual(self.resume(), [])
+        app._save_scan_job({"model": "m"})
+        app.stop_scan()
+        self.assertFalse(app.SCAN_JOB.exists(), "Stop must cancel a pending resume")
+
+    def test_gives_up_on_missing_model_or_repeated_stalls(self):
+        job = {"model": "m", "scan_type": "x", "requested": [], "queue": ["a.A", "b.B"], "done": ["a.A"],
+               "failed": [], "generations": 1, "timeout": 60, "thinking": False, "prefix": "m_1", "parts": 2,
+               "stalls": 0, "done_at_resume": 1}
+        app._save_scan_job(job)
+        self.assertEqual(self.resume(installed=()), [])
+        self.assertFalse(app.SCAN_JOB.exists())
+        for attempt in range(app.MAX_STALLED_RESUMES - 1):
+            app._save_scan_job(dict(job, stalls=attempt))
+            self.assertEqual(len(self.resume()), 1)
+        app._save_scan_job(dict(job, stalls=app.MAX_STALLED_RESUMES - 1))
+        self.assertEqual(self.resume(), [], "a scan that keeps dying on the same probe must not loop forever")
+        self.assertFalse(app.SCAN_JOB.exists())
+
+    def test_everything_done_just_clears_the_job(self):
+        app._save_scan_job({"model": "m", "requested": [], "queue": ["a.A"], "done": ["a.A"], "failed": [],
+                            "parts": 1, "stalls": 0})
+        self.assertEqual(self.resume(), [])
+        self.assertFalse(app.SCAN_JOB.exists())
 
 
 # ---------------------------------------------------------------- reports
