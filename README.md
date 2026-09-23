@@ -7,7 +7,8 @@ security weaknesses with [garak](https://github.com/NVIDIA/garak). It runs entir
 ## Features
 
 - **Models**: search Hugging Face or the Ollama library, with automatic version choice for your GPU. Downloads
-  resume after interruptions and can be prioritized.
+  resume after interruptions and can be prioritized. The gear on the Add a model card holds a Hugging Face
+  access token, for gated and private models.
 - **Chat**: saved conversations with search, attachments (images for vision models, text/PDF/Word for any
   model), and time and token stats for every reply.
 - **Images**: text-to-image with Z-Image, FLUX.1, and Stable Diffusion 1.5 / XL through stable-diffusion.cpp,
@@ -90,7 +91,8 @@ To install from a clone instead: `git clone https://github.com/Kadn0/llm-scanner
 ## Move to a new machine (optional)
 
 A fresh install starts empty: no models, chats, images, or reports. If you do want to bring your chats, images,
-probe groups, and scan reports along (models are never copied), export them on the old machine:
+probe groups, and scan reports along (models and your Hugging Face token are never copied), export them on the old
+machine:
 
 ```bash
 ~/llm-scanner/export-data.sh
@@ -182,6 +184,18 @@ It lists what will be deleted and asks before doing anything.
 
 ## Changelog
 
+- **1.1.2**: A gear in the top-right of **Add a model** opens a Hugging Face access token, so gated models (the
+  ones whose conditions you accept on their Hugging Face page) and models in your private repositories can be
+  downloaded, and searches and downloads are no longer limited to what Hugging Face allows anonymously. The
+  repository list shows the size of the version this PC would download, and marks gated and private repositories,
+  which say what is needed when you pick one. The
+  token is checked with Hugging Face before it is saved, is stored on this computer only in `data/settings.json`
+  where just your account can read it, is never shown in full again, and is left out of `export-data.sh` archives.
+  A download Hugging Face refuses now says whether a token is missing or the account it belongs to has no access
+  to that model. If you already have `HF_TOKEN` set on this machine, it is used when nothing is saved in the app.
+  A scan can now be paused and resumed: the model stays loaded and the scan carries on from the same probe, and
+  the time it spent paused is left out of the estimate of how long is left. Chat times over a minute are shown as
+  minutes and seconds instead of a long run of seconds.
 - **1.1.1**: A scan cut short by LLM Scanner stopping or the computer shutting down resumes at the next start with
   only the probes it had not finished (saved as a new part of the same scan), and the Scan tab shows a running scan
   after the page is reloaded. Deleting a download also deletes the partial data Ollama kept for it, and leftover

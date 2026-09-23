@@ -130,10 +130,21 @@
       addNote(pulls, 'opt-pulls');
       const caps = rest.find((p) => p !== pulls);
       if (caps) addNote(caps, 'opt-caps');
-    } else if (/^\(.*\)$/.test(rest[0])) {  // Hugging Face repo result: name, (modified: ...)
-      addNote(rest[0].slice(1, -1), 'opt-badge modified');
-    } else {
-      rest.forEach((p) => addNote(p));
+    } else {  // Hugging Face repo result: name, download size, (private, gated), (modified: ...)
+      rest.forEach((p) => {
+        if (!/^\(.*\)$/.test(p)) return addNote(p, 'opt-size');
+        const text = p.slice(1, -1);
+        if (!text.startsWith('modified:')) return addNote(text, 'opt-badge restricted');
+        const badge = document.createElement('span');   // a warning icon, explained by the tip box above
+        badge.className = 'opt-badge warn';
+        badge.dataset.tipTitle = 'Modified model';
+        badge.dataset.tip = 'This model has been altered to remove the refusals the original was trained with '
+          + '(abliterated, uncensored or heretic). It answers requests the original declines, which is useful for '
+          + 'security testing but means its output needs care.';
+        badge.innerHTML = '<svg viewBox="0 0 16 16" class="warn-icon" aria-hidden="true">'
+          + '<circle cx="8" cy="8" r="6.5"/><path d="M8 4.5v4.2"/><path d="M8 10.9v.6"/></svg>';
+        meta.appendChild(badge);
+      });
     }
     li.appendChild(meta);
   };

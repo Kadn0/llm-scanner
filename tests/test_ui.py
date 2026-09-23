@@ -74,6 +74,11 @@ class FakeOllama(BaseHTTPRequestHandler):
             return self.html(rows)
         if self.path == "/api/version":
             return self.reply({"version": "0.34.2"})
+        if self.path == "/api/whoami-v2":  # stands in for Hugging Face when a token is saved behind the gear
+            token = self.headers.get("Authorization", "")
+            if token != "Bearer hf_a_valid_test_token":
+                return self.reply({"error": "Invalid credentials"}, 401)
+            return self.reply({"name": "test-account"})
         if self.path == "/api/tags":
             return self.reply({"models": self.models})
         if self.path == "/api/ps":
@@ -172,6 +177,8 @@ class AppPages(unittest.TestCase):
         env = os.environ | {"LLM_SCANNER_CHECK": "1", "LLM_SCANNER_PORT": str(port), "LLM_SCANNER_DATA": str(cls.data),
                             "LLM_SCANNER_GARAK_RUNS": str(cls.runs), "LLM_SCANNER_SD_DIR": str(sd),
                             "OLLAMA_URL": f"http://127.0.0.1:{cls.ollama.server_port}",
+                            "LLM_SCANNER_HF_API": f"http://127.0.0.1:{cls.ollama.server_port}/api",
+                            "HF_TOKEN": "", "HUGGING_FACE_HUB_TOKEN": "", "HUGGINGFACE_TOKEN": "",
                             "LLM_SCANNER_OLLAMA_WEB": f"http://127.0.0.1:{cls.ollama.server_port}"}
         cls.log = open(cls.tmp / "app.log", "wb")
         cls.proc = subprocess.Popen([PY, "app.py", "--no-browser"], cwd=APP_DIR, env=env, stdout=cls.log,
@@ -380,6 +387,31 @@ class AppPages(unittest.TestCase):
         with self.assertRaises(AppError):  # Gradio only accepts names the Reports list offers
             self.call("/delete_reports", ["../../etc/passwd.report.html"], True, "Full report (report.jsonl)")
         self.assertTrue(list(self.runs.glob("hf.co_x_tiny_20260917-100000.*")))
+
+    # ------------------------------------------------------------ settings page
+    def test_save_check_and_remove_a_hugging_face_token(self):
+        settings = self.data / "settings.json"
+        self.addCleanup(lambda: self.call("/remove_hf_token"))
+        self.assertIn("No token set", self.call("/hf_token_status"))
+
+        box, note = self.call("/save_hf_token", "hf_the_wrong_token")  # the fake Hugging Face rejects it
+        self.assertIn("rejected", note)
+        self.assertFalse(settings.exists(), "a token Hugging Face refuses is not saved")
+
+        box, note = self.call("/save_hf_token", "  hf_a_valid_test_token  ")
+        self.assertIn("test-account", note)
+        self.assertEqual(box["value"], "")
+        self.assertEqual(json.loads(settings.read_text())["hf_token"], "hf_a_valid_test_token")
+        self.assertEqual(settings.stat().st_mode & 0o777, 0o600)
+        self.assertIn(">Saved token hf_\u2026oken is in use.<", self.call("/hf_token_status"))
+
+        box, note = self.call("/remove_hf_token")
+        self.assertIn("No token set", note)
+        self.assertEqual(json.loads(settings.read_text()), {})
+
+    def test_saving_an_empty_token_is_refused(self):
+        _, note = self.call("/save_hf_token", "   ")
+        self.assertIn("Enter a token", note)
 
 
 if __name__ == "__main__":

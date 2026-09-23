@@ -3,6 +3,7 @@
 import base64
 import bisect
 import codecs
+import concurrent.futures
 import functools
 import html
 import importlib.metadata
@@ -16,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -30,10 +32,11 @@ DATA_DIR = Path(os.environ.get("LLM_SCANNER_DATA") or APP_DIR / "data")  # overr
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 OLLAMA = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
-HF_API = "https://huggingface.co/api"
+HF_API = os.environ.get("LLM_SCANNER_HF_API") or "https://huggingface.co/api"  # overridable for tests
 OLLAMA_WEB = os.environ.get("LLM_SCANNER_OLLAMA_WEB", "https://ollama.com")  # overridable for tests
 GARAK_RUNS = Path(os.environ.get("LLM_SCANNER_GARAK_RUNS") or Path.home() / ".local/share/garak/garak_runs")
 GROUPS_FILE = DATA_DIR / "probe_groups.json"
+SETTINGS_FILE = DATA_DIR / "settings.json"  # saved preferences, including the Hugging Face token
 PY = sys.executable
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 EMOJI = re.compile("[\U0001F000-\U0001FAFF☀-➿⬀-⯿️‍]+ ?")
@@ -56,6 +59,73 @@ PRESETS = {
 }
 
 _proc = {"p": None}
+
+
+# ---------------------------------------------------------------- settings
+def read_settings():
+    """Everything saved in settings.json, or {} when nothing has been saved yet."""
+    try:
+        saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return saved if isinstance(saved, dict) else {}
+
+
+def write_settings(values):
+    """Save settings so only this user can read them: the Hugging Face token is a credential."""
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = SETTINGS_FILE.with_name(SETTINGS_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(values, indent=2), encoding="utf-8")
+    tmp.chmod(0o600)
+    tmp.replace(SETTINGS_FILE)  # replace in one step, so a crash can't leave a half-written file
+
+
+# The variables Hugging Face's own tools read, so a login already set up on this machine is picked up.
+HF_TOKEN_ENV = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN")
+
+
+def hf_token():
+    """The Hugging Face access token: the one saved in the app, otherwise one from the environment."""
+    saved = str(read_settings().get("hf_token") or "").strip()
+    return saved or next((v for n in HF_TOKEN_ENV if (v := str(os.environ.get(n) or "").strip())), "")
+
+
+def _is_hf_url(url):
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    return host == "huggingface.co" or host.endswith(".huggingface.co")
+
+
+def hf_headers(url=None):
+    """The Authorization header for Hugging Face when a token is set, {} when there is none.
+
+    Only ever added for huggingface.co itself: downloads are redirected to Hugging Face's Xet storage on another
+    domain, and requests drops the header again on a cross-host redirect. A credential must not follow a request
+    off the host it was meant for."""
+    if url is not None and not _is_hf_url(url):
+        return {}
+    token = hf_token()
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def mask_token(token):
+    """A token shown back to the user: enough to recognize it, not enough to use it."""
+    return f"{token[:3]}\u2026{token[-4:]}" if len(token) > 12 else "\u2026" if token else ""
+
+
+def hf_whoami(token):
+    """(account name, error) for a token. Both empty means Hugging Face couldn't be reached to check it."""
+    try:
+        res = requests.get(f"{HF_API}/whoami-v2", headers={"Authorization": f"Bearer {token}"}, timeout=15)
+    except Exception:
+        return "", ""
+    if res.status_code in (401, 403):
+        return "", "Hugging Face rejected this token. Check it was copied in full and has read access."
+    if not res.ok:
+        return "", ""
+    try:
+        return str(res.json().get("name") or ""), ""
+    except ValueError:
+        return "", ""
 
 
 # ---------------------------------------------------------------- system helpers
@@ -178,7 +248,7 @@ def activity_html():
         items.append(f'Model loaded: <b>{html.escape(m["name"])}</b> ({size / 1e9:.1f} GB, {where}{mins})')
     p = _proc.get("p")
     if p and p.poll() is None:
-        items.append("Scan running")
+        items.append("Scan paused" if _scan.get("paused") else "Scan running")
     ip = _image_proc.get("p")
     if ip and ip.poll() is None:
         items.append("Generating an image")
@@ -676,6 +746,20 @@ def model_names():
 _load_problems = {}  # (name, digest) -> Ollama's error reading the model, "" if it reads fine
 
 
+GGUF_BLOB_PREFIX = re.compile(r'read GGUF metadata "[^"]*":\s*')
+
+
+def readable_ollama_error(err):
+    """Ollama's error made fit to show: it quotes the blob's file path, which means nothing to the reader, and a
+    format it cannot read needs saying what to do about it."""
+    text = GGUF_BLOB_PREFIX.sub("", str(err)).strip()
+    if re.search(r"unsupported tensor|size overflows", text):
+        return (f"{text}\n\nThis model's file is in a format Ollama cannot read. Running it needs the llama.cpp "
+                "build from the model's own authors, so download a standard quantization instead. The Models tab "
+                "marks the versions Ollama cannot load.")
+    return text
+
+
 def load_problem(m):
     """Why Ollama can't load an installed model ("" if it can). Ollama lists every model it has, but only finds out
     that a file is in a format it can't read (Prism's PQ2_0, for example) when it opens it, so ask once per file."""
@@ -690,7 +774,7 @@ def load_problem(m):
         else:
             try:
                 err = str(r.json().get("error") or "") or f"HTTP {r.status_code}"
-                _load_problems[key] = re.sub(r'^read GGUF metadata "[^"]*": ', "", err)  # drop the blob path
+                _load_problems[key] = GGUF_BLOB_PREFIX.sub("", err)  # short here: it labels a row in a dropdown
             except ValueError:
                 _load_problems[key] = f"HTTP {r.status_code}"
     return _load_problems[key]
@@ -771,10 +855,19 @@ def new_totals():
     return {"replies": 0, "seconds": 0.0, "prompt": 0, "output": 0}
 
 
+def _fmt_duration(sec):
+    """A chat duration: tenths of a second under a minute, then minutes, then hours."""
+    if sec < 60:
+        return f"{sec:.1f} s"
+    m, s = divmod(int(round(sec)), 60)
+    h, m = divmod(m, 60)
+    return f"{h} h {m} min" if h else f"{m} min {s} s"
+
+
 def chat_totals_md(t):
     if not t["replies"]:
         return "No messages yet."
-    return (f"**This chat:** {t['replies']} {'reply' if t['replies'] == 1 else 'replies'} &nbsp;·&nbsp; {t['seconds']:.1f} s &nbsp;·&nbsp; "
+    return (f"**This chat:** {t['replies']} {'reply' if t['replies'] == 1 else 'replies'} &nbsp;·&nbsp; {_fmt_duration(t['seconds'])} &nbsp;·&nbsp; "
             f"{t['prompt']:,} prompt tokens &nbsp;·&nbsp; {t['output']:,} response tokens &nbsp;·&nbsp; "
             f"{t['prompt'] + t['output']:,} total")
 
@@ -985,7 +1078,7 @@ def chat_respond(chat):
                     continue
                 ev = json.loads(line)
                 if "error" in ev:
-                    answer += f"\n\nError: {ev['error']}"
+                    answer += f"\n\nError: {readable_ollama_error(ev['error'])}"
                     break
                 msg = ev.get("message", {})
                 if msg.get("content") or msg.get("thinking"):
@@ -1002,17 +1095,17 @@ def chat_respond(chat):
                         save_chat(chat, index=False)
                     yield chat, display_messages(chat), gr.update(), gr.update(), gr.update()
     except Exception as e:
-        answer += f"\n\nError: {e}"
+        answer += f"\n\nError: {readable_ollama_error(e)}"
     wall = time.time() - t0
-    parts = [f"{wall:.1f} s"]
+    parts = [_fmt_duration(wall)]
     if final:
         ns = 1e9
         p_tok, o_tok = final.get("prompt_eval_count", 0), final.get("eval_count", 0)
         load = final.get("load_duration", 0) / ns
         if load >= 0.5:
-            parts.append(f"{load:.1f} s model load")
+            parts.append(f"{_fmt_duration(load)} model load")
         if first_token:
-            parts.append(f"{first_token - t0:.1f} s to first token")
+            parts.append(f"{_fmt_duration(first_token - t0)} to first token")
         parts.append(f"{p_tok:,} prompt + {o_tok:,} response tokens")
         if final.get("eval_duration"):
             parts.append(f"{o_tok / (final['eval_duration'] / ns):.1f} tokens/s")
@@ -1232,14 +1325,57 @@ def note_html(text, kind=""):
     return f'<div class="note-line {kind}">{spinner}{html.escape(text)}</div>' if text else ""
 
 
+_hf_size_cache = {}
+
+
+def hf_download_size(repo):
+    """GB of the version this PC would actually download from a repository, 0.0 if it can't be worked out.
+
+    Not the repository's total, and not Hugging Face's own totalFileSize either: that one reports the
+    full-precision file, so a 27B repo would read 53.8 GB next to versions that run here perfectly well."""
+    if repo not in _hf_size_cache:
+        try:
+            opts = hf_versions(repo)
+            usable = [o for o in opts if runs_in_ollama(o[1])] or opts
+            best = best_version(usable)
+            _hf_size_cache[repo] = next((size for size, tag in usable if tag == best), 0.0)
+        except Exception:
+            _hf_size_cache[repo] = 0.0
+    return _hf_size_cache[repo]
+
+
 def hf_find_repos(query):
+    """([{id, size, gated, private}], cleaned query) for the GGUF repositories matching a search.
+
+    expand[] is what makes Hugging Face report gated; the default search returns neither that nor any usable size.
+    Sizes need one file listing per repository, so they are fetched together and remembered."""
     q = repo_from_text(query)
     if "/" in q and q.lower().endswith("gguf"):
-        return [q], q
-    res = requests.get(f"{HF_API}/models", timeout=15, params={
-        "search": q.split("/")[-1], "filter": "gguf", "sort": "downloads", "limit": 25})
+        return [{"id": q, "size": hf_download_size(q), "gated": False, "private": False}], q
+    res = requests.get(f"{HF_API}/models", timeout=15, headers=hf_headers(), params={
+        "search": q.split("/")[-1], "filter": "gguf", "sort": "downloads", "limit": 25,
+        "expand[]": ["gated", "private"]})
     res.raise_for_status()
-    return [m["id"] for m in res.json()], q
+    found = res.json()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+        sizes = list(pool.map(hf_download_size, [m["id"] for m in found]))
+    return [{"id": m["id"], "size": size, "gated": bool(m.get("gated")), "private": bool(m.get("private"))}
+            for m, size in zip(found, sizes)], q
+
+
+def hf_repo_marks(repo):
+    """What follows a repository's name in the list: its size, how access is restricted, how it was modified.
+
+    Each part is separated by a run of spaces, which static/app.js turns into muted meta on the right of the row.
+    A token is what makes private and gated repositories appear in search at all, so they are marked to explain
+    why a download may still need conditions accepted on Hugging Face first."""
+    out = f"   {repo['size']:.1f} GB" if repo.get("size") else ""
+    limits = [word for word, on in (("private", repo.get("private")), ("gated", repo.get("gated"))) if on]
+    if limits:
+        out += f"   ({', '.join(limits)})"
+    if UNCENSORED_RE.search(repo["id"]):
+        out += "   (modified: abliterated / uncensored)"
+    return out
 
 
 # The quantization at the end of a GGUF filename, with any prefix it carries: Q4_K_M, IQ3_XS, UD-Q5_K_XL, BF16, and
@@ -1265,7 +1401,8 @@ def hf_gguf_catalog(repo):
     A file's tag is what tells it apart from the others in the repo, so it matches what the repository shows:
     Q4_K_M, UD-Q5_K_XL, PQ2_0, dspark-bf16. Repositories name their files differently, so the shared part of the
     names is dropped rather than guessing which part is the quantization."""
-    res = requests.get(f"{HF_API}/models/{repo_from_text(repo)}/tree/main", params={"recursive": "true"}, timeout=30)
+    res = requests.get(f"{HF_API}/models/{repo_from_text(repo)}/tree/main", params={"recursive": "true"},
+                       headers=hf_headers(), timeout=30)
     _check_response(res, f"Listing files of {repo}")
     ggufs = [(e["path"], int(e.get("size") or 0)) for e in res.json()
              if e.get("path", "").lower().endswith(".gguf") and not SHARD_IN_NAME.search(e["path"].lower())]
@@ -1297,12 +1434,13 @@ def hf_repo_info(repo):
     repo = repo_from_text(repo)
     if repo not in _hf_meta:
         try:
-            d = requests.get(f"{HF_API}/models/{repo}", timeout=15).json()
+            d = requests.get(f"{HF_API}/models/{repo}", headers=hf_headers(), timeout=15).json()
             card = d.get("cardData") or {}
             base = card.get("base_model")
             _hf_meta[repo] = {"base": (base[0] if isinstance(base, list) else base) or "",
                               "license": card.get("license") or "", "downloads": d.get("downloads") or 0,
-                              "likes": d.get("likes") or 0, "gated": bool(d.get("gated"))}
+                              "likes": d.get("likes") or 0, "gated": bool(d.get("gated")),
+                              "private": bool(d.get("private"))}
         except Exception:
             _hf_meta[repo] = {}
     return _hf_meta[repo]
@@ -1389,8 +1527,7 @@ def search_models(source, query):
             found = f"Found {len(results)} models in the Ollama library. Choose one to see its versions."
         else:
             repos, q = hf_find_repos(query)
-            choices = [(r + ("   (modified: abliterated / uncensored)" if UNCENSORED_RE.search(r) else ""), r)
-                       for r in repos]
+            choices = [(r["id"] + hf_repo_marks(r), r["id"]) for r in repos]
             found = f"Found {len(repos)} GGUF repositories, sorted by downloads. Choose one to see its versions."
             if "/" in q and not q.lower().endswith("gguf"):
                 found = f"{q} is not in GGUF format, so these are converted versions of it. " + found
@@ -1429,7 +1566,11 @@ def list_versions(source, repo):
                 sizes.setdefault(tag, size / 1e9)
             opts = sorted((size, tag) for tag, size in sizes.items())
             info = hf_repo_info(repo)
-            about = [f"Based on {info['base'].split('/')[-1]}." if info.get("base") else "",
+            gated = ("Gated: accept this model's conditions on its Hugging Face page" +
+                     ("." if hf_token() else ", then add a token with the gear above.")) if info.get("gated") else ""
+            about = ["Private: only your Hugging Face account can see this repository." if info.get("private") else "",
+                     gated,
+                     f"Based on {info['base'].split('/')[-1]}." if info.get("base") else "",
                      f"{info['license']} licence." if info.get("license") else "",
                      f"{_short_count(info['downloads'])} downloads on Hugging Face." if info.get("downloads") else "",
                      "Sees images (the repository includes a vision projector)." if projectors else ""]
@@ -1527,13 +1668,26 @@ def _check_response(response, operation):
     response.raise_for_status()
 
 
+def _hf_denied(name, response):
+    """Hugging Face refused a download: say whether a token is missing, or the account simply has no access."""
+    detail = response_error(response, f"Downloading {name}")
+    if not hf_token():
+        return (f"{detail}. This model is gated or private. Accept its conditions on its Hugging Face page, then "
+                "add a Hugging Face token with the gear on the Add a model card.")
+    return (f"{detail}. The Hugging Face token in use doesn't grant access to this model. Accept its conditions "
+            "on its Hugging Face page, or save a token from an account that has access.")
+
+
 def fetch_file(url, dest, size, should_stop, on_progress):
     """Download url to dest, resuming from dest.part with an HTTP range request. Returns False if should_stop()
     interrupted it (the partial file is kept), True once dest is complete."""
     part = dest.with_name(dest.name + ".part")
     have = part.stat().st_size if part.exists() else 0
     headers = {"Range": f"bytes={have}-"} if have else {}
+    headers.update(hf_headers(url))  # gated and private models; dropped again on the redirect to Xet storage
     with requests.get(url, headers=headers, stream=True, timeout=(15, 120), allow_redirects=True) as r:
+        if r.status_code in (401, 403) and _is_hf_url(url):
+            raise PermanentDownloadError(_hf_denied(dest.name, r))
         if r.status_code != 416:  # 416: the partial file is already complete
             _check_response(r, f"Downloading {dest.name}")
             if have and r.status_code != 206:  # server ignored the range: start this file over
@@ -2088,7 +2242,8 @@ def detect_family(repo):
 
 def image_repo_files(repo, family):
     """[(size_gb, path)] of files usable as the main model for this family."""
-    res = requests.get(f"{HF_API}/models/{repo}/tree/main", params={"recursive": "true"}, timeout=15)
+    res = requests.get(f"{HF_API}/models/{repo}/tree/main", params={"recursive": "true"}, headers=hf_headers(),
+                       timeout=15)
     res.raise_for_status()
     opts = []
     for f in res.json():
@@ -2108,7 +2263,8 @@ def image_repo_files(repo, family):
 
 def _remote_size(repo, path):
     try:
-        head = requests.head(HF_RESOLVE.format(repo=repo, path=path), allow_redirects=True, timeout=15)
+        url = HF_RESOLVE.format(repo=repo, path=path)
+        head = requests.head(url, headers=hf_headers(url), allow_redirects=True, timeout=15)
         return int(head.headers.get("content-length", 0)) / 1e9
     except Exception:
         return 0.0
@@ -2130,7 +2286,7 @@ def image_search(query):
         else:
             seen, repos = set(), []
             for extra in ({"filter": "gguf"}, {}):
-                res = requests.get(f"{HF_API}/models", timeout=15, params={
+                res = requests.get(f"{HF_API}/models", timeout=15, headers=hf_headers(), params={
                     "search": q, "pipeline_tag": "text-to-image", "sort": "downloads", "limit": 20, **extra})
                 res.raise_for_status()
                 for m in res.json():
@@ -2261,7 +2417,8 @@ def _image_download_worker(ref):
         try:
             sizes = []
             for repo, path, _ in files:
-                head = requests.head(HF_RESOLVE.format(repo=repo, path=path), allow_redirects=True, timeout=20)
+                url = HF_RESOLVE.format(repo=repo, path=path)
+                head = requests.head(url, headers=hf_headers(url), allow_redirects=True, timeout=20)
                 _check_response(head, f"Checking {path}")
                 sizes.append(int(head.headers.get("content-length", 0)))
             total = sum(sizes)
@@ -2863,6 +3020,21 @@ class ScanProgress:
         self.start = time.time()
         self.probes, self.done, self.failed = list(probes), set(done), set(failed)
         self.current, self.frac, self.phase = None, 0.0, "Starting garak"
+        self.paused_at, self.paused_total = None, 0.0
+
+    def pause(self):
+        if self.paused_at is None:
+            self.paused_at = time.time()
+
+    def resume(self):
+        if self.paused_at is not None:
+            self.paused_total += time.time() - self.paused_at
+            self.paused_at = None
+
+    def running_secs(self):
+        """Time the scan has actually been working, so a pause does not inflate the estimate of what is left."""
+        held = (time.time() - self.paused_at) if self.paused_at is not None else 0.0
+        return max(0.0, time.time() - self.start - self.paused_total - held)
 
     def feed(self, line):
         if m := self.QUEUE.search(line):
@@ -2890,17 +3062,21 @@ class ScanProgress:
         return min(100.0, 100 * (len(self.done) + partial) / n)
 
     def html(self, state="running"):
-        n, pct, elapsed = len(self.probes), self.percent(), time.time() - self.start
+        n, pct, elapsed = len(self.probes), self.percent(), self.running_secs()
         if state == "done":
             pct, title = 100.0, "Scan complete"
         elif state == "stopped":
             title = "Scan stopped"
+        elif state == "paused":
+            title = "Scan paused"
         elif self.current and n:
             idx = min(n, len(self.done) + (0 if self.current in self.done else 1))
             title = f"Probe {idx} of {n} &nbsp;·&nbsp; <span class='mono'>{html.escape(self.current)}</span>"
         else:
             title = self.phase
         meta = [f"Elapsed {_fmt_secs(elapsed)}"]
+        if state == "paused":
+            meta.append("The model stays loaded; press Resume to continue")
         if state == "running":
             meta.insert(0, html.escape(self.phase))
             if pct >= 2:
@@ -2918,30 +3094,32 @@ IDLE_PROGRESS = '<div class="scanprog idle"><div class="sp-top"><span>No scan ru
 
 def run_scan(model, scan_type, selected, generations, timeout, thinking=False):
     if not model:
-        yield "Select a model to scan.", gr.update(), gr.update(), gr.update()
+        yield "Select a model to scan.", gr.update(), gr.update(), gr.update(), gr.update()
         return
     if not ollama_up():
-        yield "Ollama is not running. Start it at the top of the page.", gr.update(), gr.update(), gr.update()
+        yield ("Ollama is not running. Start it at the top of the page.", gr.update(), gr.update(), gr.update(),
+               gr.update())
         return
     problem = next((load_problem(m) for m in list_models() if m["name"] == model), "")
     if problem:
         yield (f"{model} can't be scanned: Ollama can't load this model ({problem}). Choose a model that runs.",
-               gr.update(), gr.update(), gr.update())
+               gr.update(), gr.update(), gr.update(), gr.update())
         return
     probes, err = resolve_scan(scan_type, selected)
     if err:
-        yield err, gr.update(), gr.update(), gr.update()
+        yield err, gr.update(), gr.update(), gr.update(), gr.update()
         return
     if _proc.get("p") and _proc["p"].poll() is None:  # e.g. started before this page was reloaded
         yield ("A scan is already running. Wait for it to finish, or click Stop to end it.", gr.update(),
-               gr.update(interactive=True), gr.update())
+               gr.update(interactive=True), gr.update(), gr.update())
         return
     if _resume["waiting"]:
         yield ("An interrupted scan is about to resume. Click Stop to cancel it first.", gr.update(),
-               gr.update(interactive=True), gr.update())
+               gr.update(interactive=True), gr.update(), gr.update())
         return
     if _image_proc.get("p") and _image_proc["p"].poll() is None:
-        yield "An image is being generated on the GPU. Start the scan once it finishes.", gr.update(), gr.update(), gr.update()
+        yield ("An image is being generated on the GPU. Start the scan once it finishes.", gr.update(), gr.update(),
+               gr.update(), gr.update())
         return
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", model)
     job = {"model": model, "scan_type": scan_type, "requested": probes or [], "queue": [], "done": [], "failed": [],
@@ -2959,7 +3137,7 @@ SCAN_JOB = DATA_DIR / "scan_job.json"
 MAX_STALLED_RESUMES = 3  # give up on a scan that is interrupted this many times in a row without finishing a probe
 OLLAMA_WAIT_SECS = 600  # after a reboot, how long a resume waits for Ollama to come up
 _scan = {"head": "", "buf": [], "cur": [""], "progress": ScanProgress(), "reader": None, "end": "", "ok": False,
-         "user_stop": False}
+         "user_stop": False, "paused": False}
 _resume = {"waiting": False}
 
 
@@ -3001,7 +3179,7 @@ def _launch_scan(job, note=""):
     progress = ScanProgress(job["queue"], job["done"], job["failed"])
     buf, cur = [], [""]
     _scan.update(head=note + "garak " + " ".join(cmd[2:]) + "\n\n", buf=buf, cur=cur, progress=progress, end="",
-                 ok=False, user_stop=False)
+                 ok=False, user_stop=False, paused=False)
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, start_new_session=True)
     _proc["p"] = p
 
@@ -3063,10 +3241,11 @@ def follow_scan():
     """Stream the current scan to a page until it ends: the page that started it, or one opened later."""
     reader = _scan["reader"]
     while reader and reader.is_alive():
-        yield _scan_log(400), gr.update(interactive=False), gr.update(interactive=True), _scan["progress"].html()
+        yield (_scan_log(400), gr.update(interactive=False), gr.update(interactive=True),
+               _scan["progress"].html("paused" if _scan.get("paused") else "running"), gr.update(interactive=True))
         reader.join(1.0)
     yield (_scan_log() + f"\n\n{_scan['end']}", gr.update(interactive=True), gr.update(interactive=False),
-           _scan["progress"].html("done" if _scan["ok"] else "stopped"))
+           _scan["progress"].html("done" if _scan["ok"] else "stopped"), gr.update(value="Pause", interactive=False))
 
 
 def attach_scan():
@@ -3075,15 +3254,17 @@ def attach_scan():
     while _resume["waiting"]:
         if not shown:
             yield ("A scan was interrupted when LLM Scanner stopped. It will resume as soon as Ollama is running.",
-                   gr.update(interactive=False), gr.update(interactive=True), IDLE_PROGRESS)
+                   gr.update(interactive=False), gr.update(interactive=True), IDLE_PROGRESS,
+                   gr.update(value="Pause", interactive=False))
             shown = True
         time.sleep(1)
     if _scan_running() or (_scan["reader"] and _scan["reader"].is_alive()):
         yield from follow_scan()
     elif shown:  # the resume was cancelled or could not start
-        yield "No scan running.", gr.update(interactive=True), gr.update(interactive=False), IDLE_PROGRESS
+        yield ("No scan running.", gr.update(interactive=True), gr.update(interactive=False), IDLE_PROGRESS,
+               gr.update(value="Pause", interactive=False))
     else:
-        yield gr.update(), gr.update(), gr.update(), gr.update()
+        yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
 
 
 def resume_interrupted_scan():
@@ -3131,11 +3312,33 @@ def resume_interrupted_scan():
         _resume["waiting"] = False
 
 
+def toggle_scan_pause():
+    """Suspend the running garak process, or let it continue. Ollama keeps the model loaded either way, so a
+    resumed scan carries straight on instead of starting the probe again."""
+    p = _proc.get("p")
+    if not (p and p.poll() is None):
+        _scan["paused"] = False
+        return gr.update(value="Pause", interactive=False)
+    if _scan.get("paused"):
+        os.killpg(p.pid, signal.SIGCONT)
+        _scan["paused"] = False
+        _scan["progress"].resume()
+        return gr.update(value="Pause")
+    os.killpg(p.pid, signal.SIGSTOP)
+    _scan["paused"] = True
+    _scan["progress"].pause()
+    return gr.update(value="Resume")
+
+
 def stop_scan():
     _scan["user_stop"] = True
     SCAN_JOB.unlink(missing_ok=True)  # also cancels a resume that is still waiting for Ollama
     p = _proc.get("p")
     if p and p.poll() is None:
+        if _scan.get("paused"):  # a suspended process cannot act on SIGTERM until it is allowed to run again
+            os.killpg(p.pid, signal.SIGCONT)
+            _scan["paused"] = False
+            _scan["progress"].resume()
         os.killpg(p.pid, signal.SIGTERM)
         return "Stopping scan..."
     if _resume["waiting"]:
@@ -3300,6 +3503,49 @@ def refresh_all(chat=None):
             gr.update(choices=group_choices()), chat_upd)
 
 
+# ---------------------------------------------------------------- settings tab
+def hf_token_status():
+    """The line under the token box: where the token in use comes from, or that there isn't one."""
+    saved = str(read_settings().get("hf_token") or "").strip()
+    if saved:
+        return note_html(f"Saved token {mask_token(saved)} is in use.")
+    env = next((n for n in HF_TOKEN_ENV if str(os.environ.get(n) or "").strip()), "")
+    if env:
+        return note_html(f"No token saved here. Using {env} from this machine's environment.")
+    return note_html("No token set. Public models work without one; gated and private models need it.")
+
+
+def save_hf_token(token):
+    """Save the token from the gear on the Add a model card, once Hugging Face has confirmed it works."""
+    token = (token or "").strip()
+    if not token:
+        return gr.update(), note_html("Enter a token first, or use Remove to delete the saved one.", "error")
+    who, error = hf_whoami(token)
+    if error:
+        return gr.update(), note_html(error, "error")
+    write_settings({**read_settings(), "hf_token": token})
+    _hf_meta.clear()  # repository details were read without the token; gated repos may look different with it
+    if who:
+        return gr.update(value=""), note_html(f"Saved. Hugging Face recognizes this token as {who}.")
+    return gr.update(value=""), note_html(
+        f"Saved token {mask_token(token)}. Hugging Face couldn't be reached to check it.")
+
+
+def remove_hf_token():
+    """Forget the saved token. An environment variable, if there is one, applies again."""
+    settings = read_settings()
+    if settings.pop("hf_token", None):
+        write_settings(settings)
+        _hf_meta.clear()
+    return gr.update(value=""), hf_token_status()
+
+
+def toggle_hf_panel(is_open):
+    """The gear on the Add a model card opens and closes the token box, leaving the box empty each time."""
+    opening = not is_open
+    return opening, gr.update(visible=opening), gr.update(value=""), hf_token_status()
+
+
 # ---------------------------------------------------------------- look and feel
 FONT = [gr.themes.GoogleFont("Inter"), "-apple-system", "BlinkMacSystemFont", "Helvetica Neue", "sans-serif"]
 MONO = [gr.themes.GoogleFont("JetBrains Mono"), "SF Mono", "ui-monospace", "monospace"]
@@ -3381,6 +3627,21 @@ with gr.Blocks(title="LLM Scanner") as ui:
                 with gr.Column(scale=2, min_width=480, elem_classes="models-left"):
                     with gr.Column(elem_classes="card add-model-card"):
                         gr.HTML('<h2>Add a model</h2><p class="sub">Choose where to search, then search by name or paste a link.</p>')
+                        hf_gear_btn = gr.Button("", scale=0, min_width=0, elem_classes="card-gear")
+                        hf_panel_open = gr.State(False)
+                        with gr.Column(visible=False, elem_classes="hf-token-panel") as hf_panel:
+                            gr.HTML('<h3>Hugging Face access token</h3><p class="sub">Needed for gated models (the '
+                                    'ones whose conditions you accept on their Hugging Face page) and for your '
+                                    'private repositories. Public models work without one. Create a token with read '
+                                    'access at <a href="https://huggingface.co/settings/tokens" target="_blank" '
+                                    'rel="noopener">huggingface.co/settings/tokens</a>. It is kept on this computer '
+                                    'only and left out of data exports.</p>')
+                            hf_token_box = gr.Textbox(label="Token", type="password", placeholder="hf_...",
+                                                      max_lines=1, elem_classes="hf-token")
+                            with gr.Row(equal_height=True):
+                                hf_save_btn = gr.Button("Save", variant="primary", scale=0, min_width=120)
+                                hf_remove_btn = gr.Button("Remove", variant="stop", scale=0, min_width=120)
+                            hf_token_note = gr.HTML(hf_token_status(), elem_classes="note")
                         search_loading = gr.HTML(visible=False, elem_classes="search-loading")
                         source = gr.Radio([SRC_HF, SRC_OLLAMA], value=SRC_HF, show_label=False, elem_classes="segmented")
                         with gr.Row(equal_height=True):
@@ -3631,6 +3892,7 @@ with gr.Blocks(title="LLM Scanner") as ui:
                                            info="Closer to real-world use, but much slower. Off by default.", value=False)
                 with gr.Row():
                     scan_btn = gr.Button("Start scan", variant="primary", scale=0, min_width=160)
+                    pause_btn = gr.Button("Pause", variant="secondary", interactive=False, scale=0, min_width=120)
                     stop_btn = gr.Button("Stop", variant="stop", interactive=False, scale=0, min_width=120)
             with gr.Column(elem_classes="card"):
                 gr.HTML('<h2>Activity</h2>')
@@ -3689,6 +3951,14 @@ with gr.Blocks(title="LLM Scanner") as ui:
                          show_progress="hidden")
     refresh_btn.click(refresh_all, chat_state, [models_version, scan_model, status, scan_type, group_pick, chat_model],
                       show_progress="hidden")
+
+    # the Hugging Face token, behind the gear on the Add a model card
+    hf_gear_btn.click(toggle_hf_panel, hf_panel_open, [hf_panel_open, hf_panel, hf_token_box, hf_token_note],
+                      show_progress="hidden")
+    for trigger in (hf_save_btn.click, hf_token_box.submit):
+        trigger(save_hf_token, hf_token_box, [hf_token_box, hf_token_note], show_progress="hidden")
+    hf_remove_btn.click(remove_hf_token, outputs=[hf_token_box, hf_token_note], show_progress="hidden")
+    ui.load(hf_token_status, outputs=hf_token_note, show_progress="hidden")
 
     # models
     source.change(source_changed, source, [query, repo, version, search_note, pull_btn], show_progress="hidden")
@@ -3758,11 +4028,12 @@ with gr.Blocks(title="LLM Scanner") as ui:
     ui.load(group_info, [group_pick, selected], group_about, show_progress="hidden")
     scan_model.change(model_hint, scan_model, [model_note, tmo], show_progress="hidden")
     scan_btn.click(run_scan, [scan_model, scan_type, selected, gens, tmo, thinking],
-                   [scan_log, scan_btn, stop_btn, scan_progress], show_progress="hidden").then(
+                   [scan_log, scan_btn, stop_btn, scan_progress, pause_btn], show_progress="hidden").then(
         report_list_state, [rep_picked, rep_shown], [rep_list, rep_all, rep_delete, rep_picked, rep_shown],
         show_progress="hidden")
+    pause_btn.click(toggle_scan_pause, outputs=pause_btn, show_progress="hidden")
     stop_btn.click(stop_scan, outputs=scan_log, show_progress="hidden")
-    ui.load(attach_scan, outputs=[scan_log, scan_btn, stop_btn, scan_progress], show_progress="hidden",
+    ui.load(attach_scan, outputs=[scan_log, scan_btn, stop_btn, scan_progress, pause_btn], show_progress="hidden",
             concurrency_limit=None).then(
         report_list_state, [rep_picked, rep_shown], [rep_list, rep_all, rep_delete, rep_picked, rep_shown],
         show_progress="hidden")

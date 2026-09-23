@@ -153,9 +153,21 @@ button.sm { height:34px !important; max-height:34px; align-self:center; white-sp
 .scanprog .sp-bar { height:8px; background:#2a2a2c; border-radius:4px; overflow:hidden; margin:12px 0 8px; }
 .scanprog .sp-bar div { height:100%; background:linear-gradient(90deg,#0071e3,#2997ff); border-radius:4px; transition:width .6s ease; }
 .scanprog.done .sp-bar div { background:#30d158; } .scanprog.stopped .sp-bar div { background:#ff9f0a; }
+.scanprog.paused .sp-bar div { background:#8e8e93; }
 .scanprog .sp-meta { color:#86868b; font-size:13px; }
 .scanprog.idle .sp-top { color:#86868b; font-weight:400; }
 .add-model-card { position:relative; }
+/* the gear in the card's top-right corner opens the Hugging Face token box below the heading */
+button.card-gear { position:absolute !important; top:22px; right:22px; z-index:15; width:32px !important;
+        height:32px !important; min-width:0 !important; padding:0 !important; border-radius:50% !important;
+        border:none !important; opacity:.6; box-shadow:none !important;
+        background:transparent url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23a1a1a6' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='3'/%3E%3Cpath d='M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z'/%3E%3C/svg%3E") center / 18px 18px no-repeat !important; }
+button.card-gear:hover { opacity:1; background-color:#232325 !important; }
+.hf-token-panel { background:#121213; border:1px solid #232325; border-radius:14px; padding:18px !important;
+        margin:4px 0 12px; gap:10px !important; animation:fadein .2s ease; }
+.hf-token-panel h3 { font-size:16px; font-weight:600; letter-spacing:-.01em; margin:0 0 4px; color:#f5f5f7; }
+.hf-token-panel .sub { color:#86868b; font-size:13.5px; line-height:1.45; margin:0; }
+.hf-token-panel .note { min-height:0; }
 .search-loading { position:absolute !important; inset:0; z-index:20; margin:0 !important; border-radius:18px;
                   background:rgba(22,22,23,.86) !important; backdrop-filter:blur(6px); display:flex !important;
                   align-items:center; justify-content:center; animation:fadein .15s ease; }
@@ -254,7 +266,11 @@ button.row-del:hover { background:#3a1d1d url("data:image/svg+xml,%3Csvg xmlns='
        color:#f5f5f7; text-align:left; }
 #repo-dd .opt-meta { display:flex; align-items:center; gap:8px; flex:0 0 auto; margin-left:auto; font-size:12.5px;
        color:#86868b; white-space:nowrap; }
-#repo-dd .opt-badge.modified { color:#ff9f0a; }
+#repo-dd .opt-badge.restricted { color:#2997ff; }
+#repo-dd .opt-badge.warn { display:inline-flex; flex:0 0 auto; cursor:help; }
+#repo-dd .opt-badge.warn .warn-icon { width:15px; height:15px; fill:none; stroke:#ffd60a; stroke-width:1.6;
+       stroke-linecap:round; }
+#repo-dd .opt-size { color:#86868b; font-variant-numeric:tabular-nums; }
 #repo-dd .opt-badge.recommended, :is(#version-dd, #scan-model-dd) .opt-badge.recommended { color:#30d158; font-weight:600; }
 :is(#version-dd, #scan-model-dd) .opt-left { display:flex; align-items:center; gap:6px; flex:0 0 auto; min-width:0; }
 :is(#version-dd, #scan-model-dd) .opt-mid { flex:1 1 auto; text-align:center; font-size:12.5px; color:#86868b; white-space:nowrap;

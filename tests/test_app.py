@@ -63,6 +63,7 @@ class TempDataTest(unittest.TestCase):
             "GROUPS_FILE": data / "probe_groups.json", "DOWNLOADS_FILE": data / "downloads.json",
             "GARAK_RUNS": self.tmp / "garak_runs", "CHAT_INDEX": app.ChatIndex(), "SCAN_JOB": data / "scan_job.json",
             "OLLAMA_BLOBS": self.tmp / "ollama-blobs", "PULL_LAYERS_FILE": data / "pull_layers.json",
+            "SETTINGS_FILE": data / "settings.json",
         }
         for name, value in patches.items():
             p = mock.patch.object(app, name, value)
@@ -104,6 +105,13 @@ class TextHelpers(unittest.TestCase):
         self.assertEqual(app._fmt_secs(5), "5s")
         self.assertEqual(app._fmt_secs(65), "1m 5s")
         self.assertEqual(app._fmt_secs(3700), "1h 1m")
+
+    def test_fmt_duration_switches_to_minutes_past_a_minute(self):
+        self.assertEqual(app._fmt_duration(5.24), "5.2 s")
+        self.assertEqual(app._fmt_duration(59.9), "59.9 s")
+        self.assertEqual(app._fmt_duration(60), "1 min 0 s")
+        self.assertEqual(app._fmt_duration(154.7), "2 min 35 s")
+        self.assertEqual(app._fmt_duration(3700), "1 h 1 min")
 
     def test_human_size(self):
         self.assertEqual(app._human_size(10), "1 KB")
@@ -178,6 +186,184 @@ class VersionPicking(unittest.TestCase):
             self.assertEqual(app.fit_breakdown(7), "7.0 GB VRAM")
             self.assertEqual(app.fit_breakdown(20), "7.5 GB VRAM + 12.5 GB RAM")
             self.assertEqual(app.fit_breakdown(40), "40.0 GB \u2014 too large for this PC")
+
+
+# ---------------------------------------------------------------- settings and the Hugging Face token
+class HuggingFaceToken(TempDataTest):
+    TOKEN = "hf_abcdefghijklmnop"
+
+    def setUp(self):
+        super().setUp()
+        env = mock.patch.dict(os.environ, {n: "" for n in app.HF_TOKEN_ENV})  # ignore a real login on this machine
+        env.start()
+        self.addCleanup(env.stop)
+        app._hf_meta.clear()
+
+    def save(self, token, response=None, offline=False):
+        kw = {"side_effect": OSError("offline")} if offline else {"return_value": response or FakeResponse({"name": "kadn"})}
+        with mock.patch.object(app.requests, "get", **kw):
+            return app.save_hf_token(token)
+
+    def test_nothing_saved_reads_as_empty(self):
+        self.assertEqual(app.read_settings(), {})
+        self.assertEqual(app.hf_token(), "")
+        self.assertEqual(app.hf_headers(), {})
+
+    def test_an_unreadable_settings_file_is_ignored(self):
+        for text in ("not json at all", '["a list, not an object"]'):
+            app.SETTINGS_FILE.write_text(text, encoding="utf-8")
+            self.assertEqual(app.read_settings(), {})
+            self.assertEqual(app.hf_token(), "")
+
+    def test_a_saved_token_is_used_and_kept_private(self):
+        app.write_settings({"hf_token": self.TOKEN})
+        self.assertEqual(app.hf_token(), self.TOKEN)
+        self.assertEqual(app.hf_headers(), {"Authorization": f"Bearer {self.TOKEN}"})
+        self.assertEqual(app.SETTINGS_FILE.stat().st_mode & 0o777, 0o600, "a credential must not be world-readable")
+
+    def test_the_environment_is_a_fallback_and_a_saved_token_wins(self):
+        with mock.patch.dict(os.environ, {"HF_TOKEN": "hf_from_the_environment"}):
+            self.assertEqual(app.hf_token(), "hf_from_the_environment")
+            app.write_settings({"hf_token": self.TOKEN})
+            self.assertEqual(app.hf_token(), self.TOKEN)
+
+    def test_the_token_only_goes_to_hugging_face(self):
+        """Downloads redirect to Xet storage on another domain; the credential must not follow them there."""
+        app.write_settings({"hf_token": self.TOKEN})
+        self.assertIn("Authorization", app.hf_headers("https://huggingface.co/o/r/resolve/main/m.gguf"))
+        for elsewhere in ("https://cas-bridge.xethub.hf.co/x", "https://example.com/huggingface.co/x",
+                          "https://ollama.com/library/qwen3"):
+            self.assertEqual(app.hf_headers(elsewhere), {}, elsewhere)
+
+    def test_mask_token(self):
+        self.assertEqual(app.mask_token(self.TOKEN), "hf_\u2026mnop")
+        self.assertEqual(app.mask_token("short"), "\u2026")
+        self.assertEqual(app.mask_token(""), "")
+
+    def test_saving_checks_the_token_and_reports_the_account(self):
+        box, note = self.save(f"  {self.TOKEN}  ")  # pasted with stray whitespace
+        self.assertEqual(app.hf_token(), self.TOKEN)
+        self.assertEqual(box["value"], "", "the box is cleared so the secret does not sit in the page")
+        self.assertIn("kadn", note)
+
+    def test_a_rejected_token_is_not_saved(self):
+        _, note = self.save("hf_wrong_token_value", FakeResponse({"error": "unauthorized"}, status=401))
+        self.assertEqual(app.hf_token(), "")
+        self.assertIn("rejected", note)
+
+    def test_a_token_is_still_saved_when_hugging_face_cannot_be_reached(self):
+        _, note = self.save(self.TOKEN, offline=True)
+        self.assertEqual(app.hf_token(), self.TOKEN)
+        self.assertIn("be reached to check it", note)  # note_html escapes the apostrophe in "couldn't"
+        self.assertNotIn(self.TOKEN, note, "the note shows a masked token, never the whole one")
+
+    def test_saving_an_empty_box_explains_itself_and_changes_nothing(self):
+        app.write_settings({"hf_token": self.TOKEN})
+        _, note = self.save("   ")
+        self.assertEqual(app.hf_token(), self.TOKEN)
+        self.assertIn("Enter a token", note)
+
+    def test_other_settings_survive_saving_and_removing_a_token(self):
+        app.write_settings({"something_else": "kept"})
+        self.save(self.TOKEN)
+        self.assertEqual(app.read_settings()["something_else"], "kept")
+        app.remove_hf_token()
+        self.assertEqual(app.read_settings(), {"something_else": "kept"})
+        self.assertEqual(app.hf_token(), "")
+
+    def test_removing_falls_back_to_the_environment(self):
+        app.write_settings({"hf_token": self.TOKEN})
+        with mock.patch.dict(os.environ, {"HF_TOKEN": "hf_from_the_environment"}):
+            _, note = app.remove_hf_token()
+            self.assertEqual(app.hf_token(), "hf_from_the_environment")
+            self.assertIn("HF_TOKEN", note)
+
+    def test_the_status_line_never_shows_the_whole_token(self):
+        app.write_settings({"hf_token": self.TOKEN})
+        note = app.hf_token_status()
+        self.assertIn(app.mask_token(self.TOKEN), note)
+        self.assertNotIn(self.TOKEN, note)
+
+    def test_repository_requests_carry_the_token(self):
+        app.write_settings({"hf_token": self.TOKEN})
+        seen = []
+
+        def get(url, **kw):
+            seen.append((kw.get("headers") or {}).get("Authorization"))
+            return FakeResponse([] if "/tree/" in url or url.endswith("/models") else {})
+
+        with mock.patch.object(app.requests, "get", side_effect=get):
+            app.hf_find_repos("smollm")
+            app.hf_gguf_catalog("o/r")
+            app.hf_repo_info("o/r")
+        self.assertEqual(seen, [f"Bearer {self.TOKEN}"] * 3)
+
+    def test_downloads_send_the_token_to_hugging_face_only(self):
+        app.write_settings({"hf_token": self.TOKEN})
+        seen = {}
+
+        def get(url, **kw):
+            seen[url] = kw.get("headers") or {}
+            return FakeResponse(lines=[b"12345678"], status=200)
+
+        hf, xet = "https://huggingface.co/o/r/resolve/main/a.gguf", "https://cas-bridge.xethub.hf.co/a"
+        with mock.patch.object(app.requests, "get", side_effect=get):
+            for url, name in ((hf, "a.gguf"), (xet, "b.gguf")):
+                app.fetch_file(url, self.tmp / name, 8, lambda: False, lambda: None)
+        self.assertEqual(seen[hf]["Authorization"], f"Bearer {self.TOKEN}")
+        self.assertNotIn("Authorization", seen[xet])
+
+    def test_a_refused_download_says_how_to_fix_it(self):
+        denied = FakeResponse({"error": "Access to model o/r is restricted"}, status=403)
+        url = "https://huggingface.co/o/r/resolve/main/m.gguf"
+        with mock.patch.object(app.requests, "get", return_value=denied):
+            with self.assertRaises(app.PermanentDownloadError) as no_token:
+                app.fetch_file(url, self.tmp / "m.gguf", 8, lambda: False, lambda: None)
+            app.write_settings({"hf_token": self.TOKEN})
+            with self.assertRaises(app.PermanentDownloadError) as wrong_token:
+                app.fetch_file(url, self.tmp / "m.gguf", 8, lambda: False, lambda: None)
+        self.assertIn("gear on the Add a model card", str(no_token.exception))
+        self.assertIn("doesn't grant access", str(wrong_token.exception))
+
+    def test_gated_and_private_repositories_are_marked_in_the_list(self):
+        plain = {"id": "o/r", "size": 0.0, "gated": False, "private": False}
+        self.assertEqual(app.hf_repo_marks(plain), "")
+        self.assertEqual(app.hf_repo_marks({**plain, "gated": True}), "   (gated)")
+        self.assertEqual(app.hf_repo_marks({**plain, "private": True}), "   (private)")
+        self.assertEqual(app.hf_repo_marks({**plain, "size": 7.24}), "   7.2 GB")
+        self.assertEqual(app.hf_repo_marks({"id": "o/r-abliterated", "size": 4.0,
+                                            "gated": True, "private": True}),
+                         "   4.0 GB   (private, gated)   (modified: abliterated / uncensored)")
+
+    def test_the_listed_size_is_the_version_this_pc_would_download(self):
+        """Not the repository total, and not Hugging Face's full-precision totalFileSize."""
+        tree = [{"path": "M-Q4_K_M.gguf", "size": 4e9}, {"path": "M-Q6_K.gguf", "size": 7.2e9},
+                {"path": "M-f16.gguf", "size": 54e9}, {"path": "mmproj-F16.gguf", "size": 1e9}]
+        app._hf_size_cache.clear()
+        with mock.patch.object(app, "VRAM_BUDGET_GB", 7.5), \
+             mock.patch.object(app.requests, "get", return_value=FakeResponse(tree)):
+            self.assertEqual(app.hf_download_size("o/r"), 7.2)
+
+    def test_a_repository_whose_files_cannot_be_listed_simply_has_no_size(self):
+        app._hf_size_cache.clear()
+        with mock.patch.object(app.requests, "get", side_effect=OSError("offline")):
+            self.assertEqual(app.hf_download_size("o/r"), 0.0)
+        self.assertEqual(app.hf_repo_marks({"id": "o/r", "size": 0.0}), "")
+
+    def test_search_reports_size_and_gated_and_private_flags(self):
+        found = [{"id": "o/a", "gated": "manual", "private": False}, {"id": "o/b"}]  # gated is a word, not a bool
+        app._hf_size_cache.update({"o/a": 3.5, "o/b": 0.0})
+        with mock.patch.object(app.requests, "get", return_value=FakeResponse(found)) as get:
+            repos, _ = app.hf_find_repos("smollm")
+        self.assertEqual(repos, [{"id": "o/a", "size": 3.5, "gated": True, "private": False},
+                                 {"id": "o/b", "size": 0.0, "gated": False, "private": False}])
+        # gated is only returned when it is asked for by name
+        self.assertEqual(get.call_args.kwargs["params"]["expand[]"], ["gated", "private"])
+
+    def test_startup_cleanup_keeps_the_settings_file(self):
+        app.write_settings({"hf_token": self.TOKEN})
+        app.clean_leftovers()
+        self.assertEqual(app.hf_token(), self.TOKEN)
 
 
 # ---------------------------------------------------------------- chats
@@ -1042,6 +1228,19 @@ class ProbesAndGroups(TempDataTest):
 
 
 class ScanProgressTests(unittest.TestCase):
+    def test_pausing_stops_the_clock_so_the_estimate_stays_honest(self):
+        p = app.ScanProgress()
+        p.start = time.time() - 100  # 100 seconds of work so far
+        p.pause()
+        paused_reading = p.running_secs()
+        time.sleep(0.05)
+        self.assertAlmostEqual(p.running_secs(), paused_reading, delta=0.02, msg="a paused scan must not age")
+        p.resume()
+        self.assertAlmostEqual(p.running_secs(), 100, delta=0.5)
+        self.assertIn("Scan paused", p.html("paused"))
+        self.assertIn("press Resume to continue", p.html("paused"))
+        self.assertNotIn("left", p.html("paused"), "a paused scan has no meaningful estimate")
+
     def test_progress_from_garak_output(self):
         p = app.ScanProgress()
         p.feed("queue of probes: dan.DanInTheWild, goodside.WhoIsRiley")

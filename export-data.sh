@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Export your LLM Scanner data to one file, to restore on another machine with: ./install.sh --data FILE
 # Includes chats (and their attachments), generated images, probe groups, the list of image models you added,
-# scan reports, and the names of your Ollama chat models. Model files themselves are NOT included.
+# scan reports, and the names of your Ollama chat models. Model files themselves are NOT included, and neither is
+# settings.json: it holds your Hugging Face token, which should not travel in a data archive.
 set -euo pipefail
 
 OUT="$HOME/llm-scanner-data-$(date +%Y%m%d-%H%M).tar.gz"
