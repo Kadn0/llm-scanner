@@ -14,6 +14,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+real_sleep = time.sleep  # (some tests shorten app delays by patching time.sleep)
+
 APP_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(APP_DIR))
 os.environ["LLM_SCANNER_CHECK"] = "1"
@@ -1315,7 +1317,8 @@ class ScanSurvivesPageClose(TempDataTest):
 
 class ScanResume(TempDataTest):
     """A scan cut short by LLM Scanner stopping (or the computer shutting down) continues at the next start with only
-    the probes it had not finished; one that finished, failed on its own or was stopped by the user does not."""
+    the probes it had not finished. If garak itself dies mid-scan, the scan restarts from that probe right away, and
+    halts (kept for Continue) if it dies there again. One that finished or was stopped by the user does not resume."""
     GARAK = ("import os, signal, sys\n"
              "print('queue of probes: a.A, b.B, c.C', flush=True)\n"
              "print('probes.a.A: 100%|####| 2/2', flush=True)\n"
@@ -1323,11 +1326,18 @@ class ScanResume(TempDataTest):
              "print('probes.b.B:  50%|##  | 1/2', flush=True)\n"
              "{end}\n")
 
+    def setUp(self):
+        super().setUp()
+        for name in ("_revive_ollama", "unload_models"):  # never touch the real Ollama
+            self.enterContext(mock.patch.object(app, name))
+        self.enterContext(mock.patch.object(app.time, "sleep", side_effect=lambda s: real_sleep(min(s, 0.2))))
+        self.addCleanup(app._scan.update, action=None, job=None, reader=None)
+
     def run_fake_scan(self, end):
         script = self.tmp / "fake_garak.py"
         script.write_text(self.GARAK.format(end=end))
         real_popen = app.subprocess.Popen
-        with mock.patch.object(app, "ollama_up", return_value="1"), mock.patch.object(app, "unload_models"), \
+        with mock.patch.object(app, "ollama_up", return_value="1"), \
                 mock.patch.object(app.subprocess, "Popen", side_effect=lambda cmd, **kw: real_popen(
                     [sys.executable, str(script)], **kw)):
             gen = app.run_scan("m", "Quick check", [], 1, 60)
@@ -1343,18 +1353,29 @@ class ScanResume(TempDataTest):
         self.assertFalse(app._resume["waiting"])
         return launched
 
-    def test_killed_scan_resumes_with_unfinished_probes(self):
-        log, *_ = self.run_fake_scan("os.kill(os.getpid(), signal.SIGKILL)")
-        self.assertIn("next time LLM Scanner starts", log)
+    def test_killed_garak_restarts_from_its_probe_then_halts(self):
+        log, *_, skip = self.run_fake_scan("os.kill(os.getpid(), signal.SIGKILL)")
+        self.assertIn("got stuck on b.B (garak was ended by signal 9) and was restarted from that probe", log)
+        self.assertIn("Scan halted on b.B", log, "dying again on the same probe halts the scan")
+        self.assertTrue(skip["visible"], "Skip probe is offered")
         job = json.loads(app.SCAN_JOB.read_text())
         self.assertEqual(job["queue"], ["a.A", "b.B", "c.C"])
         self.assertEqual(job["done"], ["a.A"], "b.B was still running, so it must be run again")
         self.assertEqual(job["failed"], ["a.A"])
+        self.assertEqual((job["parts"], job["stuck_on"]), (2, "b.B"))
+        self.assertIn("signal 9", job["halted"])
+        self.assertEqual(self.resume(), [], "a halted scan waits for Continue instead of resuming at startup")
+        self.assertTrue(app.SCAN_JOB.exists())
+
+    def test_scan_cut_short_by_a_restart_resumes_with_unfinished_probes(self):
+        app._save_scan_job({"model": "m", "scan_type": "Quick check", "requested": [], "queue": ["a.A", "b.B", "c.C"],
+                            "done": ["a.A"], "failed": ["a.A"], "generations": 1, "timeout": 60, "thinking": False,
+                            "prefix": "m_1", "parts": 1, "stalls": 0})
         (job, note), = self.resume()
         self.assertEqual(app._remaining_probes(job), ["b.B", "c.C"])
         self.assertEqual(job["parts"], 2)
         self.assertIn("2 of 3 probes left", note)
-        self.assertIn(job["prefix"] + "_part2", note)
+        self.assertIn("m_1_part2", note)
 
     def test_resumed_command_and_progress(self):
         job = {"model": "m", "scan_type": "Quick check", "requested": [], "queue": ["a.A", "b.B", "c.C"],
@@ -1371,11 +1392,14 @@ class ScanResume(TempDataTest):
         self.assertAlmostEqual(app._scan["progress"].percent(), 100 / 3)
         app._proc["p"] = None
 
-    def test_finished_failed_or_stopped_scans_do_not_resume(self):
-        for end in ("sys.exit(0)", "sys.exit(1)"):
-            self.run_fake_scan(end)
-            self.assertFalse(app.SCAN_JOB.exists(), end)
-            self.assertEqual(self.resume(), [])
+    def test_finished_or_stopped_scans_do_not_resume(self):
+        self.run_fake_scan("sys.exit(0)")
+        self.assertFalse(app.SCAN_JOB.exists())
+        self.assertEqual(self.resume(), [])
+        log, *_ = self.run_fake_scan("sys.exit(1)")  # a garak error halts the scan, like a stuck probe
+        self.assertIn("garak exited with code 1", json.loads(app.SCAN_JOB.read_text())["halted"])
+        self.assertEqual(app.stop_scan(), "Scan ended. Results from the finished probes are in Reports.")
+        self.assertFalse(app.SCAN_JOB.exists(), "Stop ends a halted scan")
         app._save_scan_job({"model": "m"})
         app.stop_scan()
         self.assertFalse(app.SCAN_JOB.exists(), "Stop must cancel a pending resume")
@@ -1393,6 +1417,112 @@ class ScanResume(TempDataTest):
         app._save_scan_job(dict(job, stalls=app.MAX_STALLED_RESUMES - 1))
         self.assertEqual(self.resume(), [], "a scan that keeps dying on the same probe must not loop forever")
         self.assertFalse(app.SCAN_JOB.exists())
+
+    def test_stall_reasons(self):
+        now = time.time()
+        job = {"timeout": 60, "generations": 2}
+        app._scan.update(job=job, last_progress=now, timeouts=0, errors=0, last_error="")
+        self.assertEqual(app._stall_reason([], now), "")
+        app._scan["timeouts"] = app.STALL_TIMEOUTS
+        self.assertIn("did not answer 3 requests in a row within the 60s", app._stall_reason([], now))
+        app._scan.update(timeouts=0, errors=app.STALL_ERRORS, last_error="ResponseError: boom")
+        self.assertIn("Ollama failed 8 requests in a row (ResponseError: boom)", app._stall_reason([], now))
+        app._scan.update(errors=0, last_progress=now - app.STALL_IDLE_SECS)
+        idle = [(now - app.STALL_IDLE_SECS, {1: 50.0, 2: 9.0}), (now, {1: 51.0, 3: 0.5})]
+        self.assertIn("neither garak nor the model is doing any work", app._stall_reason(idle, now))
+        busy = [(now - app.STALL_IDLE_SECS, {1: 50.0}), (now, {1: 90.0})]
+        self.assertEqual(app._stall_reason(busy, now), "", "a slow model that is still working is not stuck")
+        self.assertEqual(app._stall_reason(idle[1:], now), "", "needs readings across the whole idle window")
+        app._scan["last_progress"] = now - 1800
+        self.assertIn("no progress for 30m", app._stall_reason(busy, now), "far longer than any prompt can take")
+
+    def test_work_secs_counts_garak_and_its_children(self):
+        work = app._work_secs(os.getpid())
+        self.assertIn(os.getpid(), work)
+        self.assertGreater(work[os.getpid()], 0)
+        self.assertEqual(app._work_secs(2 ** 22 + 1).get(2 ** 22 + 1), None, "a finished process is just left out")
+
+    STUCK = ("import sys, time\n"
+             "print('queue of probes: a.A, b.B, c.C', flush=True)\n"
+             "print('probes.a.A: 100%|####| 2/2', flush=True)\n"
+             "print('a.A                  det.D: PASS  ok on 2/2', flush=True)\n"
+             "print('probes.b.B:  50%|##  | 1/2', flush=True)\n"
+             "for i in range(3):\n"
+             "    print('LLM Scanner: request timeout: ReadTimeout: timed out; garak will retry', flush=True)\n"
+             "time.sleep(60)\n")
+    FINISH = ("print('probes.c.C: 100%|####| 1/1', flush=True)\n"
+              "print('c.C                  det.D: PASS  ok on 1/1', flush=True)\n")
+
+    def fake_garak(self, *scripts):
+        """Popen stand-in that runs the given scripts in turn (the last one again for later launches)."""
+        real_popen, cmds = app.subprocess.Popen, []
+
+        def popen(cmd, **kw):
+            path = self.tmp / f"garak{len(cmds)}.py"
+            path.write_text(scripts[min(len(cmds), len(scripts) - 1)])
+            cmds.append(cmd)
+            return real_popen([sys.executable, str(path)], **kw)
+        self.enterContext(mock.patch.object(app.subprocess, "Popen", side_effect=popen))
+        self.enterContext(mock.patch.object(app, "ollama_up", return_value="1"))
+        self.enterContext(mock.patch.object(app, "WATCH_SECS", 0.1))
+        return cmds
+
+    def test_stuck_probe_restarts_then_halts_then_skip_finishes(self):
+        cmds = self.fake_garak(self.STUCK, self.STUCK, self.FINISH)
+        *_, (log, start, stop, progress, pause, cont, skip) = app.run_scan("m", "Quick check", [], 1, 60)
+        self.assertEqual(len(cmds), 2, "restarted once, then halted")
+        self.assertIn("did not answer 3 requests in a row", log)
+        self.assertIn("Scan halted", progress)
+        self.assertIn("Skip probe moves on", progress)
+        self.assertEqual((cont["value"], cont["interactive"], skip["visible"]), ("Continue", True, True))
+        self.assertTrue(start["interactive"] and stop["interactive"] and not pause["interactive"])
+        self.assertIn("Scan halted", app.activity_html())
+        cmd = cmds[1]
+        self.assertEqual(cmd[cmd.index("--probes") + 1], "b.B,c.C")
+        self.assertEqual(cmd[cmd.index("--report_prefix") + 1].rsplit("_", 1)[1], "part2")
+
+        *_, (log, start, stop, progress, pause, cont, skip) = app.skip_stuck_probe(90)
+        cmd = cmds[2]
+        self.assertEqual(cmd[cmd.index("--probes") + 1], "c.C", "the stuck probe is skipped")
+        self.assertIn('"timeout": 90', cmd[cmd.index("--generator_options") + 1], "Continue uses the new timeout")
+        self.assertIn("Response timeout changed from 60s to 90s", log)
+        self.assertIn("Skipped because they got stuck: b.B", log)
+        self.assertIn("Scan complete", progress)
+        self.assertIn("1 skipped", progress)
+        self.assertFalse(app.SCAN_JOB.exists())
+        self.assertFalse(skip["visible"])
+
+    def test_continue_retries_the_stuck_probe(self):
+        cmds = self.fake_garak(self.STUCK, self.STUCK, self.FINISH)
+        list(app.run_scan("m", "Quick check", [], 1, 60))
+        *_, (log, *_rest) = app.recover_scan(60)
+        cmd = cmds[2]
+        self.assertEqual(cmd[cmd.index("--probes") + 1], "b.B,c.C")
+        self.assertIn("Continuing the scan from b.B", log)
+
+    def test_restart_probe_button(self):
+        cmds = self.fake_garak("import time\nprint('queue of probes: a.A, b.B', flush=True)\ntime.sleep(60)\n",
+                               self.FINISH)
+        gen = app.run_scan("m", "Quick check", [], 1, 60)
+        first = next(gen)
+        self.assertEqual((first[5]["value"], first[5]["interactive"]), ("Restart probe", True))
+        next(app.recover_scan(60))
+        states = [v[3] for v in gen]
+        self.assertTrue(any("restarting it" in s for s in states), "the page shows the restart")
+        self.assertIn("Scan complete", states[-1])
+        self.assertEqual(len(cmds), 2)
+
+    def test_pause_does_not_count_as_stuck(self):
+        self.fake_garak("import time\nprint('queue of probes: a.A', flush=True)\ntime.sleep(60)\n")
+        gen = app.run_scan("m", "Quick check", [], 1, 60)
+        next(gen)
+        app.toggle_scan_pause()
+        app._scan["timeouts"] = app.STALL_TIMEOUTS  # would count as stuck if it were running
+        real_sleep(0.5)
+        self.assertIsNone(app._scan["action"])
+        self.assertIn("Scan paused", next(gen)[3])
+        app.stop_scan()
+        list(gen)
 
     def test_everything_done_just_clears_the_job(self):
         app._save_scan_job({"model": "m", "requested": [], "queue": ["a.A"], "done": ["a.A"], "failed": [],

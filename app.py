@@ -23,6 +23,7 @@ from datetime import datetime
 from pathlib import Path
 
 import gradio as gr
+import psutil
 import requests
 
 import analyst_report
@@ -247,8 +248,13 @@ def activity_html():
             pass
         items.append(f'Model loaded: <b>{html.escape(m["name"])}</b> ({size / 1e9:.1f} GB, {where}{mins})')
     p = _proc.get("p")
-    if p and p.poll() is None:
+    if _scan["action"]:
+        items.append('<span class="warn">Scan stuck, restarting</span>' if _scan["action"] == "restart"
+                     else '<span class="warn">Scan stuck, halting</span>')
+    elif p and p.poll() is None:
         items.append("Scan paused" if _scan.get("paused") else "Scan running")
+    elif (job := _load_scan_job()) and job.get("halted"):
+        items.append('<span class="warn">Scan halted, open Scan to continue</span>')
     ip = _image_proc.get("p")
     if ip and ip.poll() is None:
         items.append("Generating an image")
@@ -321,6 +327,7 @@ def pump_output(p, on_text, on_exit):
                 on_text(decoder.decode(chunk))
             except Exception:  # a display problem must never stop the draining
                 pass
+        p.stdout.close()
         p.wait()
         on_exit()
 
@@ -3015,10 +3022,10 @@ class ScanProgress:
     DETECT = re.compile(r"^\s*([\w.]+)/([\w.]+):\s+\d+%\|.*?(\d+)/(\d+)")
     RESULT = re.compile(r"^\s*([\w.]+)\s+[\w.]+:\s+(PASS|FAIL)\b")
 
-    def __init__(self, probes=(), done=(), failed=()):
-        """probes/done/failed carry over a resumed scan, whose garak run only lists the probes still to do."""
+    def __init__(self, probes=(), done=(), failed=(), skipped=()):
+        """probes/done/failed/skipped carry over a resumed scan, whose garak run only lists the probes still to do."""
         self.start = time.time()
-        self.probes, self.done, self.failed = list(probes), set(done), set(failed)
+        self.probes, self.done, self.failed, self.skipped = list(probes), set(done), set(failed), set(skipped)
         self.current, self.frac, self.phase = None, 0.0, "Starting garak"
         self.paused_at, self.paused_total = None, 0.0
 
@@ -3037,6 +3044,7 @@ class ScanProgress:
         return max(0.0, time.time() - self.start - self.paused_total - held)
 
     def feed(self, line):
+        """Read one line of garak output; True if it showed the scan moving forward."""
         if m := self.QUEUE.search(line):
             if not self.probes:
                 self.probes = [x.strip() for x in m.group(1).split(",") if x.strip()]
@@ -3053,22 +3061,34 @@ class ScanProgress:
             self.done.add(m.group(1))
             if m.group(2) == "FAIL":
                 self.failed.add(m.group(1))
+        else:
+            return False
+        return True
 
     def percent(self):
         n = len(self.probes)
         if not n:
             return 0.0
         partial = self.frac if self.current and self.current not in self.done else 0
-        return min(100.0, 100 * (len(self.done) + partial) / n)
+        return min(100.0, 100 * (len(self.done | self.skipped) + partial) / n)
 
-    def html(self, state="running"):
+    def html(self, state="running", notes=(), probe=None):
+        """state: running, paused, recovering, halted, done or stopped. notes are extra lines for the meta row;
+        probe names the probe a recovering or halted scan is stuck on."""
         n, pct, elapsed = len(self.probes), self.percent(), self.running_secs()
+        stuck_on = f" on <span class='mono'>{html.escape(probe)}</span>" if probe else ""
         if state == "done":
             pct, title = 100.0, "Scan complete"
         elif state == "stopped":
             title = "Scan stopped"
         elif state == "paused":
             title = "Scan paused"
+        elif state == "recovering":
+            title = f"Scan stuck{stuck_on}, restarting it"
+        elif state == "halting":
+            title = f"Scan stuck{stuck_on}, stopping it"
+        elif state == "halted":
+            title = f"Scan halted{stuck_on}"
         elif self.current and n:
             idx = min(n, len(self.done) + (0 if self.current in self.done else 1))
             title = f"Probe {idx} of {n} &nbsp;·&nbsp; <span class='mono'>{html.escape(self.current)}</span>"
@@ -3079,65 +3099,97 @@ class ScanProgress:
             meta.append("The model stays loaded; press Resume to continue")
         if state == "running":
             meta.insert(0, html.escape(self.phase))
-            if pct >= 2:
+            if pct >= 2 and not notes:  # (no estimate while requests fail or nothing moves)
                 meta.append(f"About {_fmt_secs(elapsed * (100 - pct) / pct)} left")
         if self.done:
             passed = len(self.done) - len(self.failed)
             meta.append(f"{passed} passed, {len(self.failed)} failed")
-        return (f'<div class="scanprog {state}"><div class="sp-top"><span>{title}</span><span class="sp-pct">{pct:.0f}%</span></div>'
+        if self.skipped:
+            meta.append(f"{len(self.skipped)} skipped")
+        notes = "".join(f'<div class="sp-note">{html.escape(x)}</div>' for x in notes)
+        # The heartbeat changes every second while the page receives updates; app.js warns when it stops.
+        return (f'<div class="scanprog {state}" data-beat="{time.time():.0f}"><div class="sp-top"><span>{title}</span>'
+                f'<span class="sp-pct">{pct:.0f}%</span></div>'
                 f'<div class="sp-bar"><div style="width:{pct:.1f}%"></div></div>'
-                f'<div class="sp-meta">{" &nbsp;·&nbsp; ".join(meta)}</div></div>')
+                f'<div class="sp-meta">{" &nbsp;·&nbsp; ".join(meta)}</div>{notes}</div>')
 
 
 IDLE_PROGRESS = '<div class="scanprog idle"><div class="sp-top"><span>No scan running</span></div></div>'
 
 
+def _scan_view(log, state, progress=None, job=None):
+    """Values for the scan outputs: log, Start, Stop, progress, Pause, Restart probe / Continue, Skip probe.
+    state is idle, running, paused, recovering, halting, halted, done or stopped."""
+    live = state in ("running", "paused", "recovering", "halting")
+    halted = state == "halted"
+    return (log, gr.update(interactive=not live), gr.update(interactive=live or halted),
+            gr.update() if progress is None else progress,
+            gr.update(value="Resume" if state == "paused" else "Pause", interactive=state in ("running", "paused")),
+            gr.update(value="Continue" if halted else "Restart probe", interactive=state in ("running", "paused") or halted),
+            gr.update(visible=halted and bool(job and job.get("stuck_on"))))
+
+
+_UNCHANGED = (gr.update(),) * 6
+
+
 def run_scan(model, scan_type, selected, generations, timeout, thinking=False):
     if not model:
-        yield "Select a model to scan.", gr.update(), gr.update(), gr.update(), gr.update()
+        yield "Select a model to scan.", *_UNCHANGED
         return
     if not ollama_up():
-        yield ("Ollama is not running. Start it at the top of the page.", gr.update(), gr.update(), gr.update(),
-               gr.update())
+        yield "Ollama is not running. Start it at the top of the page.", *_UNCHANGED
         return
     problem = next((load_problem(m) for m in list_models() if m["name"] == model), "")
     if problem:
         yield (f"{model} can't be scanned: Ollama can't load this model ({problem}). Choose a model that runs.",
-               gr.update(), gr.update(), gr.update(), gr.update())
+               *_UNCHANGED)
         return
     probes, err = resolve_scan(scan_type, selected)
     if err:
-        yield err, gr.update(), gr.update(), gr.update(), gr.update()
+        yield err, *_UNCHANGED
         return
-    if _proc.get("p") and _proc["p"].poll() is None:  # e.g. started before this page was reloaded
+    if (_proc.get("p") and _proc["p"].poll() is None) or _scan["action"]:  # e.g. started before this page was reloaded
         yield ("A scan is already running. Wait for it to finish, or click Stop to end it.", gr.update(),
-               gr.update(interactive=True), gr.update(), gr.update())
+               gr.update(interactive=True), *_UNCHANGED[2:])
         return
     if _resume["waiting"]:
         yield ("An interrupted scan is about to resume. Click Stop to cancel it first.", gr.update(),
-               gr.update(interactive=True), gr.update(), gr.update())
+               gr.update(interactive=True), *_UNCHANGED[2:])
         return
     if _image_proc.get("p") and _image_proc["p"].poll() is None:
-        yield ("An image is being generated on the GPU. Start the scan once it finishes.", gr.update(), gr.update(),
-               gr.update(), gr.update())
+        yield "An image is being generated on the GPU. Start the scan once it finishes.", *_UNCHANGED
         return
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", model)
     job = {"model": model, "scan_type": scan_type, "requested": probes or [], "queue": [], "done": [], "failed": [],
-           "generations": int(generations), "timeout": int(timeout), "thinking": bool(thinking),
+           "skipped": [], "generations": int(generations), "timeout": int(timeout), "thinking": bool(thinking),
            "prefix": f"{safe}_{time.strftime('%Y%m%d-%H%M%S')}", "parts": 1, "stalls": 0}
-    _save_scan_job(job)
+    _save_scan_job(job)  # (replaces a halted scan, whose finished parts stay in Reports)
     _launch_scan(job)
     yield from follow_scan()
 
 
 # A running scan is saved to SCAN_JOB with the probes garak has finished. If LLM Scanner stops or the computer shuts
 # down mid-scan, the next start runs the unfinished probes as a new part of the same scan (garak can't append to a
-# report, so each part has its own report). Finishing, failing on its own, or Stop removes the file.
+# report, so each part has its own report). Finishing or Stop removes the file.
+#
+# While a scan runs, a watchdog looks for a stuck probe: requests that keep timing out or failing (garak retries
+# those forever without printing anything), or no progress at all. The first time a probe gets stuck the scan
+# restarts from that probe; if the same probe gets stuck again the scan halts with "halted" in SCAN_JOB, keeping
+# its progress, until the user presses Continue, Skip probe or Stop (also after LLM Scanner restarts).
 SCAN_JOB = DATA_DIR / "scan_job.json"
 MAX_STALLED_RESUMES = 3  # give up on a scan that is interrupted this many times in a row without finishing a probe
 OLLAMA_WAIT_SECS = 600  # after a reboot, how long a resume waits for Ollama to come up
+WATCH_SECS = 10  # how often the watchdog checks a running scan
+STALL_TIMEOUTS = 3  # requests in a row that time out before a probe counts as stuck
+STALL_ERRORS = 8  # requests in a row that Ollama fails before a probe counts as stuck
+STALL_IDLE_SECS = 600  # no progress and no CPU work by garak or the model for this long: stuck
+IDLE_CPU_SECS = 3.0  # CPU seconds over STALL_IDLE_SECS below which garak and the model count as idle
+QUIET_NOTE_SECS = 120  # no progress for this long is mentioned on the progress card
+AUTO_RESTARTS = 1  # automatic restarts of a stuck probe before the scan halts and waits for the user
 _scan = {"head": "", "buf": [], "cur": [""], "progress": ScanProgress(), "reader": None, "end": "", "ok": False,
-         "user_stop": False, "paused": False}
+         "user_stop": False, "paused": False, "job": None, "last_progress": 0.0, "timeouts": 0, "errors": 0,
+         "last_error": "", "action": None, "why": "", "manual": False}
+_scan_lock = threading.RLock()
 _resume = {"waiting": False}
 
 
@@ -3156,15 +3208,19 @@ def _load_scan_job():
 
 
 def _remaining_probes(job):
-    """Probes still to run: garak's queue minus the finished ones, or the original request if garak never got as far
-    as listing its queue."""
-    return [p for p in job["queue"] if p not in job["done"]] if job["queue"] else job["requested"]
+    """Probes still to run: garak's queue minus the finished and skipped ones, or the original request if garak never
+    got as far as listing its queue."""
+    skip = set(job["done"]) | set(job.get("skipped", []))
+    return [p for p in (job["queue"] or job["requested"]) if p not in skip]
+
+
+def _part_name(job, n):
+    return job["prefix"] + (f"_part{n}" if n > 1 else "")
 
 
 def _launch_scan(job, note=""):
     """Start garak for the job's unfinished probes. Output goes to _scan so any open page can show it."""
-    part = job["parts"]
-    prefix = job["prefix"] + (f"_part{part}" if part > 1 else "")
+    prefix = _part_name(job, job["parts"])
     gen_opts = {"timeout": job["timeout"]}
     if job["thinking"]:
         gen_opts["max_tokens"] = 4096  # leave room for the reasoning before the answer
@@ -3176,17 +3232,28 @@ def _launch_scan(job, note=""):
         cmd += ["--probes", ",".join(remaining)]
     env = os.environ | {"PYTHONUNBUFFERED": "1", "TERM": "dumb", "PYTHONIOENCODING": "utf-8",
                         "LLM_SCANNER_THINK": "1" if job["thinking"] else "0", "LLM_SCANNER_MODEL": job["model"]}
-    progress = ScanProgress(job["queue"], job["done"], job["failed"])
+    progress = ScanProgress(job["queue"], job["done"], job["failed"], job.get("skipped", []))
     buf, cur = [], [""]
     _scan.update(head=note + "garak " + " ".join(cmd[2:]) + "\n\n", buf=buf, cur=cur, progress=progress, end="",
-                 ok=False, user_stop=False, paused=False)
+                 ok=False, user_stop=False, paused=False, job=job, last_progress=time.time(), timeouts=0, errors=0,
+                 last_error="")
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, start_new_session=True)
     _proc["p"] = p
 
     def record(line):
         """Save what garak has finished. A probe counts once garak has moved on to the next one, since its
         remaining detectors may still be scoring it."""
-        progress.feed(line)
+        if line.startswith("LLM Scanner: request "):  # garak_runner.py reports failed and recovered requests
+            if line.startswith("LLM Scanner: request answered"):
+                _scan.update(timeouts=0, errors=0)
+            elif line.startswith("LLM Scanner: request timeout"):
+                _scan["timeouts"] += 1
+            else:
+                _scan["errors"] += 1
+                _scan["last_error"] = line.split(": ", 2)[-1].split("; garak will retry")[0]
+            return
+        if progress.feed(line):
+            _scan.update(last_progress=time.time(), timeouts=0, errors=0)
         changed = False
         if not job["queue"] and progress.probes:
             job["queue"], changed = list(progress.probes), True
@@ -3213,23 +3280,200 @@ def _launch_scan(job, note=""):
                 cur[0] += c
 
     def on_exit():  # also runs if the page was closed during the scan
-        if _proc["p"] is p:
-            _proc["p"] = None
-        rc = p.returncode
-        _scan["ok"] = rc == 0
-        if rc == 0:
-            _scan["end"] = "Scan complete. Open Reports to view the results."
-        elif _scan["user_stop"]:
+        with _scan_lock:
+            if _proc["p"] is p:
+                _proc["p"] = None
+            if _scan["action"]:  # ended by _recover_scan, which takes it from here
+                return
+            rc = p.returncode
+            _scan["ok"] = rc == 0
+            failed = rc != 0 and not _scan["user_stop"]
+            if rc == 0:
+                skipped = job.get("skipped", [])
+                _scan["end"] = "Scan complete. Open Reports to view the results." + (
+                    f" Skipped because they got stuck: {', '.join(skipped)}." if skipped else "")
+            elif _scan["user_stop"]:
+                _scan["end"] = "Scan stopped."
+            if not failed:
+                SCAN_JOB.unlink(missing_ok=True)
+        if failed:  # garak failed or was killed (out of memory, ...): restart from this probe, or halt
+            if rc < 0:
+                time.sleep(3)  # if LLM Scanner itself is being shut down, it is gone by now (the job resumes)
+            if not _scan["user_stop"]:
+                _scan_stuck(f"garak exited with code {rc}" if rc > 0 else f"garak was ended by signal {-rc}")
+                return
             _scan["end"] = "Scan stopped."
-        elif rc > 0:
-            _scan["end"] = f"Scan stopped: garak exited with code {rc}."
-        else:  # killed by a signal the user didn't send (out of memory, shutdown): leave the job to resume
-            _scan["end"] = "Scan interrupted. It will continue from where it stopped the next time LLM Scanner starts."
-        if rc >= 0 or _scan["user_stop"]:
-            SCAN_JOB.unlink(missing_ok=True)
         unload_models()  # free memory as soon as the scan is over
 
     _scan["reader"] = pump_output(p, on_text, on_exit)
+    threading.Thread(target=_watch_scan, args=(p,), daemon=True).start()
+
+
+def _work_secs(pid):
+    """{pid: CPU seconds} for garak (and anything it started) and Ollama's model runners: if none of these use the
+    CPU, nothing is happening (even a model running on the GPU keeps a CPU thread busy)."""
+    procs = []
+    try:
+        procs.append(psutil.Process(pid))
+        procs += procs[0].children(recursive=True)
+    except psutil.Error:
+        pass
+    for proc in psutil.process_iter(["name", "cmdline"]):
+        name, cmd = proc.info["name"] or "", proc.info["cmdline"] or []
+        if name.startswith("llama-server") or ("ollama" in name and "runner" in cmd):
+            procs.append(proc)
+    work = {}
+    for proc in procs:
+        try:
+            t = proc.cpu_times()
+            work[proc.pid] = t.user + t.system
+        except psutil.Error:
+            pass
+    return work
+
+
+def _stall_reason(samples, now=None):
+    """Why the running scan looks stuck, or "". samples are (time, _work_secs) readings, oldest first."""
+    job, now = _scan["job"], now or time.time()
+    quiet = now - _scan["last_progress"]
+    if _scan["timeouts"] >= STALL_TIMEOUTS:
+        return (f"the model did not answer {_scan['timeouts']} requests in a row within the {job['timeout']}s "
+                "response timeout")
+    if _scan["errors"] >= STALL_ERRORS:
+        return f"Ollama failed {_scan['errors']} requests in a row ({_scan['last_error']})"
+    if quiet >= STALL_IDLE_SECS and samples and samples[-1][0] - samples[0][0] >= STALL_IDLE_SECS - WATCH_SECS:
+        first, last = samples[0][1], samples[-1][1]
+        if sum(max(0.0, v - first.get(pid, 0.0)) for pid, v in last.items()) < IDLE_CPU_SECS:
+            return f"no progress for {_fmt_secs(quiet)}, and neither garak nor the model is doing any work"
+    if quiet >= max(1800, 2 * job["timeout"] * job["generations"] + 600):  # far longer than a prompt can take
+        return f"no progress for {_fmt_secs(quiet)}"
+    return ""
+
+
+def _watch_scan(p):
+    """Runs alongside each garak process and restarts or halts the scan if it gets stuck."""
+    samples = []
+    while _proc.get("p") is p and p.poll() is None:
+        time.sleep(WATCH_SECS)
+        if _scan["paused"] or _scan["action"]:
+            samples.clear()  # time spent paused is not time stuck
+            continue
+        now = time.time()
+        try:
+            samples.append((now, _work_secs(p.pid)))
+        except Exception:
+            pass
+        samples = [s for s in samples if now - s[0] <= STALL_IDLE_SECS]
+        if _proc.get("p") is p and (reason := _stall_reason(samples, now)):
+            _scan_stuck(reason)
+            return
+
+
+def _stuck_probe(job):
+    progress = _scan["progress"]
+    if progress.current and progress.current not in progress.done:
+        return progress.current
+    return next(iter(_remaining_probes(job)), None)
+
+
+def _scan_stuck(reason, manual=False):
+    """The scan is stuck or garak died mid-scan. Restart garak from the probe it was on, keeping finished probes; if
+    that probe was already restarted, halt instead and let the user decide. manual: the Restart probe button."""
+    with _scan_lock:
+        job = _scan["job"]
+        if not job or _scan["action"] or _scan["user_stop"]:
+            return
+        probe = _stuck_probe(job)
+        count = job.get("stuck_count", 0) + 1 if job.get("stuck_on") == probe else 1
+        job.update(stuck_on=probe, stuck_count=count)
+        halt = not manual and count > AUTO_RESTARTS
+        _scan.update(action="halt" if halt else "restart", why=reason, manual=manual)
+        if SCAN_JOB.exists():
+            _save_scan_job(job)
+        if not manual:
+            print(f"Scan stuck on {probe or 'startup'}: {reason}. {'Halting' if halt else 'Restarting it'}.", flush=True)
+    threading.Thread(target=_recover_scan, args=(job, halt), daemon=True).start()
+
+
+def _end_process(p, grace=15):
+    if not (p and p.poll() is None):
+        return
+    try:
+        os.killpg(p.pid, signal.SIGCONT)  # a paused (stopped) process can't act on SIGTERM
+        os.killpg(p.pid, signal.SIGTERM)
+        p.wait(grace)
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, signal.SIGKILL)
+        p.wait(10)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _revive_ollama():
+    """Unload the model before a stuck probe is retried, and restart Ollama if it no longer answers (a hung runner
+    would otherwise make the retry hang too)."""
+    try:
+        requests.get(f"{OLLAMA}/api/version", timeout=10).raise_for_status()
+        for m in loaded_models():
+            requests.post(f"{OLLAMA}/api/generate", json={"model": m["name"], "keep_alive": 0},
+                          timeout=60).raise_for_status()
+        return
+    except Exception:
+        pass
+    print("Ollama did not respond while recovering a stuck scan; restarting it.", flush=True)
+    _ollama_service("restart", True)
+    deadline = time.time() + 60
+    while not ollama_up() and time.time() < deadline:
+        time.sleep(2)
+
+
+def _recover_scan(job, halt):
+    """Second half of _scan_stuck, on its own thread: end garak, then start the next part or halt."""
+    p, reader = _proc.get("p"), _scan["reader"]
+    _end_process(p)
+    if reader and reader is not threading.current_thread():
+        reader.join(30)
+    _revive_ollama()
+    with _scan_lock:
+        probe, why = job.get("stuck_on"), _scan["why"]
+        if _scan["user_stop"] or not SCAN_JOB.exists():  # Stop was pressed meanwhile
+            _scan.update(action=None, end="Scan stopped.", ok=False)
+            return
+        if halt or not ollama_up():
+            job["halted"] = why if halt else f"{why}; Ollama could not be restarted"
+            _save_scan_job(job)
+            _scan.update(action=None, ok=False, end=f"Scan halted on {probe or 'startup'}: {job['halted']}. "
+                                                     "Finished probes are kept.")
+            return
+        job["parts"] += 1
+        job["done_at_resume"] = len(job["done"])
+        _save_scan_job(job)
+        note = ((f"Restarted {probe or 'the scan'} with the Restart probe button." if _scan["manual"] else
+                 f"The scan got stuck on {probe or 'startup'} ({why}) and was restarted from that probe.") +
+                f" Finished probes are kept in report {_part_name(job, job['parts'] - 1)}; this part is saved as "
+                f"{_part_name(job, job['parts'])}.\n")
+        _launch_scan(job, note)
+        _scan["action"] = None
+
+
+def _scan_notes():
+    """Lines under the progress bar about requests that fail or a probe that has gone quiet."""
+    job = _scan["job"] or {}
+    if _scan["action"]:
+        return [f"Why: {_scan['why']}."]
+    if _scan["paused"]:
+        return []
+    if _scan["timeouts"]:
+        n = _scan["timeouts"]
+        return [f"The model did not answer within the {job.get('timeout')}s response timeout ({n} time"
+                f"{'s' if n != 1 else ''} in a row). garak is retrying; the probe restarts after {STALL_TIMEOUTS}."]
+    if _scan["errors"]:
+        return [f"Ollama failed {_scan['errors']} request{'s' if _scan['errors'] != 1 else ''} in a row "
+                f"({_scan['last_error']}). garak is retrying."]
+    quiet = time.time() - _scan["last_progress"]
+    if quiet >= QUIET_NOTE_SECS:
+        return [f"No progress for {_fmt_secs(quiet)}. If the probe is stuck it restarts automatically."]
+    return []
 
 
 def _scan_log(limit=None):
@@ -3237,34 +3481,70 @@ def _scan_log(limit=None):
     return _scan["head"] + "\n".join(lines + _scan["cur"])
 
 
+def _live_view():
+    state = {"restart": "recovering", "halt": "halting"}.get(_scan["action"]) or (
+        "paused" if _scan["paused"] else "running")
+    probe = (_scan["job"] or {}).get("stuck_on") if _scan["action"] else None
+    return _scan_view(_scan_log(400), state, _scan["progress"].html(state, _scan_notes(), probe))
+
+
+def _halted_view(job):
+    """A scan that got stuck twice on the same probe and is waiting for Continue, Skip probe or Stop."""
+    current = _scan["job"] and _scan["job"].get("prefix") == job["prefix"]
+    progress = _scan["progress"] if current else ScanProgress(job["queue"], job["done"], job["failed"],
+                                                               job.get("skipped", []))
+    notes = [f"Why: {job['halted']}.",
+             "Finished probes are kept. Continue retries this probe (if the model is slow, raise the Response timeout "
+             "under Advanced settings first), Skip probe moves on to the next one, and Stop ends the scan."]
+    log = (_scan_log() + "\n\n" if current else "") + f"Scan halted on {job.get('stuck_on') or 'startup'}."
+    return _scan_view(log, "halted", progress.html("halted", notes, job.get("stuck_on")), job)
+
+
+def _live():
+    return bool((_scan["reader"] and _scan["reader"].is_alive()) or _scan["action"])
+
+
 def follow_scan():
-    """Stream the current scan to a page until it ends: the page that started it, or one opened later."""
-    reader = _scan["reader"]
-    while reader and reader.is_alive():
-        yield (_scan_log(400), gr.update(interactive=False), gr.update(interactive=True),
-               _scan["progress"].html("paused" if _scan.get("paused") else "running"), gr.update(interactive=True))
-        reader.join(1.0)
-    yield (_scan_log() + f"\n\n{_scan['end']}", gr.update(interactive=True), gr.update(interactive=False),
-           _scan["progress"].html("done" if _scan["ok"] else "stopped"), gr.update(value="Pause", interactive=False))
+    """Stream the current scan to a page until it ends, through any restarts of a stuck probe: the page that started
+    it, or one opened later."""
+    while True:
+        reader = _scan["reader"]
+        alive = bool(reader and reader.is_alive())
+        if not alive and not _scan["action"]:
+            if _scan["reader"] is reader:
+                break
+            continue  # a restart just started the next part
+        yield _live_view()
+        if alive:
+            reader.join(1.0)
+        else:
+            time.sleep(1.0)
+    job = _load_scan_job()
+    if job and job.get("halted"):
+        yield _halted_view(job)
+        return
+    state = "done" if _scan["ok"] else "stopped"
+    yield _scan_view(_scan_log() + f"\n\n{_scan['end']}", state, _scan["progress"].html(state))
 
 
 def attach_scan():
-    """On page load, show a scan that is already running or about to resume, instead of 'No scan running'."""
+    """On page load, show a scan that is running, about to resume or halted, instead of 'No scan running'."""
     shown = False
     while _resume["waiting"]:
         if not shown:
-            yield ("A scan was interrupted when LLM Scanner stopped. It will resume as soon as Ollama is running.",
-                   gr.update(interactive=False), gr.update(interactive=True), IDLE_PROGRESS,
-                   gr.update(value="Pause", interactive=False))
+            yield _scan_view("A scan was interrupted when LLM Scanner stopped. It will resume as soon as Ollama is "
+                             "running.", "recovering", IDLE_PROGRESS)
             shown = True
         time.sleep(1)
-    if _scan_running() or (_scan["reader"] and _scan["reader"].is_alive()):
+    job = _load_scan_job()
+    if _scan_running() or _live():
         yield from follow_scan()
+    elif job and job.get("halted"):
+        yield _halted_view(job)
     elif shown:  # the resume was cancelled or could not start
-        yield ("No scan running.", gr.update(interactive=True), gr.update(interactive=False), IDLE_PROGRESS,
-               gr.update(value="Pause", interactive=False))
+        yield _scan_view("No scan running.", "idle", IDLE_PROGRESS)
     else:
-        yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+        yield gr.update(), *_UNCHANGED
 
 
 def resume_interrupted_scan():
@@ -3272,7 +3552,7 @@ def resume_interrupted_scan():
     _resume["waiting"] = True
     try:
         job = _load_scan_job()
-        if not job:
+        if not job or job.get("halted"):  # a halted scan waits for the user
             return
         remaining = _remaining_probes(job)
         if job["queue"] and not remaining:
@@ -3302,26 +3582,78 @@ def resume_interrupted_scan():
         _save_scan_job(job)
         left = (f"{len(remaining)} of {len(job['queue'])} probes left" if job["queue"]
                 else "garak had not started probing yet, so the scan starts over")
-        earlier = ", ".join(job["prefix"] + (f"_part{n}" if n > 1 else "") for n in range(1, job["parts"]))
+        earlier = ", ".join(_part_name(job, n) for n in range(1, job["parts"]))
         note = (f"Resumed after LLM Scanner was stopped: {left}. Results from before the interruption are in "
                 f"{'report' if job['parts'] == 2 else 'reports'} {earlier}; this part is saved as "
-                f"{job['prefix']}_part{job['parts']}.\n")
+                f"{_part_name(job, job['parts'])}.\n")
         print(note.strip(), flush=True)
         _launch_scan(job, note)
     finally:
         _resume["waiting"] = False
 
 
+def _continue_halted(job, timeout, note):
+    """Run the rest of a halted scan as its next part, with the response timeout now set in Advanced settings."""
+    if not ollama_up():
+        yield "Ollama is not running. Start it at the top of the page, then press Continue.", *_UNCHANGED
+        return
+    if _scan_running() or _live():
+        yield "A scan is already running.", *_UNCHANGED
+        return
+    if _image_proc.get("p") and _image_proc["p"].poll() is None:
+        yield "An image is being generated on the GPU. Continue once it finishes.", *_UNCHANGED
+        return
+    if job["queue"] and not _remaining_probes(job):
+        SCAN_JOB.unlink(missing_ok=True)
+        yield _scan_view(note + "No probes are left to run. Open Reports to view the results.", "done",
+                         IDLE_PROGRESS)
+        return
+    job.pop("halted", None)
+    if int(timeout) != job["timeout"]:
+        note += f"Response timeout changed from {job['timeout']}s to {int(timeout)}s. "
+        job["timeout"] = int(timeout)
+    job["parts"] += 1
+    job["done_at_resume"] = len(job["done"])
+    _save_scan_job(job)
+    _launch_scan(job, note + f"This part is saved as {_part_name(job, job['parts'])}.\n")
+    yield from follow_scan()
+
+
+def recover_scan(timeout):
+    """Restart probe while a scan runs (garak is restarted from the probe it is on, keeping finished probes), or
+    Continue a halted scan."""
+    if _scan_running() and not _scan["action"]:
+        _scan_stuck("restarted with the Restart probe button", manual=True)
+        yield gr.update(), *_UNCHANGED  # the page that is following the scan shows the restart
+        return
+    job = _load_scan_job()
+    if not (job and job.get("halted")):
+        yield gr.update(), *_UNCHANGED
+        return
+    yield from _continue_halted(job, timeout, f"Continuing the scan from {job.get('stuck_on') or 'the start'}. ")
+
+
+def skip_stuck_probe(timeout):
+    """Skip the probe a halted scan is stuck on and run the rest."""
+    job = _load_scan_job()
+    if not (job and job.get("halted") and job.get("stuck_on")):
+        yield gr.update(), *_UNCHANGED
+        return
+    probe = job["stuck_on"]
+    job.setdefault("skipped", []).append(probe)
+    job.update(stuck_on=None, stuck_count=0)
+    yield from _continue_halted(job, timeout, f"Skipped {probe}; it is left out of the results. ")
+
+
 def toggle_scan_pause():
     """Suspend the running garak process, or let it continue. Ollama keeps the model loaded either way, so a
     resumed scan carries straight on instead of starting the probe again."""
     p = _proc.get("p")
-    if not (p and p.poll() is None):
-        _scan["paused"] = False
+    if not (p and p.poll() is None) or _scan["action"]:
         return gr.update(value="Pause", interactive=False)
     if _scan.get("paused"):
         os.killpg(p.pid, signal.SIGCONT)
-        _scan["paused"] = False
+        _scan.update(paused=False, last_progress=time.time())  # time spent paused is not time without progress
         _scan["progress"].resume()
         return gr.update(value="Pause")
     os.killpg(p.pid, signal.SIGSTOP)
@@ -3331,8 +3663,14 @@ def toggle_scan_pause():
 
 
 def stop_scan():
+    with _scan_lock:  # (so a stuck probe being restarted can't start its next part after this)
+        return _stop_scan()
+
+
+def _stop_scan():
     _scan["user_stop"] = True
-    SCAN_JOB.unlink(missing_ok=True)  # also cancels a resume that is still waiting for Ollama
+    job = _load_scan_job()
+    SCAN_JOB.unlink(missing_ok=True)  # also cancels a resume that is still waiting for Ollama, or a halted scan
     p = _proc.get("p")
     if p and p.poll() is None:
         if _scan.get("paused"):  # a suspended process cannot act on SIGTERM until it is allowed to run again
@@ -3341,9 +3679,20 @@ def stop_scan():
             _scan["progress"].resume()
         os.killpg(p.pid, signal.SIGTERM)
         return "Stopping scan..."
+    if _scan["action"]:
+        return "Stopping scan..."
     if _resume["waiting"]:
         return "Resume cancelled."
+    if job and job.get("halted"):
+        return "Scan ended. Results from the finished probes are in Reports."
     return "No scan is running."
+
+
+def scan_controls_after_stop():
+    """After Stop on a halted scan nothing streams to the page, so reset the buttons here."""
+    if _scan_running() or _live():
+        return _UNCHANGED
+    return _scan_view("", "stopped", IDLE_PROGRESS)[1:]
 
 
 # ---------------------------------------------------------------- reports
@@ -3893,6 +4242,9 @@ with gr.Blocks(title="LLM Scanner") as ui:
                 with gr.Row():
                     scan_btn = gr.Button("Start scan", variant="primary", scale=0, min_width=160)
                     pause_btn = gr.Button("Pause", variant="secondary", interactive=False, scale=0, min_width=120)
+                    recover_btn = gr.Button("Restart probe", variant="secondary", interactive=False, scale=0,
+                                            min_width=150)
+                    skip_btn = gr.Button("Skip probe", variant="secondary", visible=False, scale=0, min_width=130)
                     stop_btn = gr.Button("Stop", variant="stop", interactive=False, scale=0, min_width=120)
             with gr.Column(elem_classes="card"):
                 gr.HTML('<h2>Activity</h2>')
@@ -4027,13 +4379,19 @@ with gr.Blocks(title="LLM Scanner") as ui:
     group_pick.change(group_info, [group_pick, selected], group_about, show_progress="hidden")
     ui.load(group_info, [group_pick, selected], group_about, show_progress="hidden")
     scan_model.change(model_hint, scan_model, [model_note, tmo], show_progress="hidden")
+    scan_outputs = [scan_log, scan_btn, stop_btn, scan_progress, pause_btn, recover_btn, skip_btn]
     scan_btn.click(run_scan, [scan_model, scan_type, selected, gens, tmo, thinking],
-                   [scan_log, scan_btn, stop_btn, scan_progress, pause_btn], show_progress="hidden").then(
+                   scan_outputs, show_progress="hidden").then(
         report_list_state, [rep_picked, rep_shown], [rep_list, rep_all, rep_delete, rep_picked, rep_shown],
         show_progress="hidden")
     pause_btn.click(toggle_scan_pause, outputs=pause_btn, show_progress="hidden")
-    stop_btn.click(stop_scan, outputs=scan_log, show_progress="hidden")
-    ui.load(attach_scan, outputs=[scan_log, scan_btn, stop_btn, scan_progress, pause_btn], show_progress="hidden",
+    for btn, fn in ((recover_btn, recover_scan), (skip_btn, skip_stuck_probe)):
+        btn.click(fn, tmo, scan_outputs, show_progress="hidden", concurrency_limit=None).then(
+            report_list_state, [rep_picked, rep_shown], [rep_list, rep_all, rep_delete, rep_picked, rep_shown],
+            show_progress="hidden")
+    stop_btn.click(stop_scan, outputs=scan_log, show_progress="hidden").then(
+        scan_controls_after_stop, outputs=scan_outputs[1:], show_progress="hidden")
+    ui.load(attach_scan, outputs=scan_outputs, show_progress="hidden",
             concurrency_limit=None).then(
         report_list_state, [rep_picked, rep_shown], [rep_list, rep_all, rep_delete, rep_picked, rep_shown],
         show_progress="hidden")
@@ -4135,7 +4493,7 @@ if __name__ == "__main__":
         if files:
             print(f"Removed {files} leftover files ({size / 1e9:.1f} GB)", flush=True)
         resume_pending_downloads()
-        if _load_scan_job():
+        if (job := _load_scan_job()) and not job.get("halted"):  # a halted scan waits for Continue
             _resume["waiting"] = True  # set before the page can load, so it shows the pending resume
             threading.Thread(target=resume_interrupted_scan, daemon=True).start()
         threading.Thread(target=check_updates, daemon=True).start()  # once at startup; after that, on request

@@ -154,6 +154,13 @@ button.sm { height:34px !important; max-height:34px; align-self:center; white-sp
 .scanprog .sp-bar div { height:100%; background:linear-gradient(90deg,#0071e3,#2997ff); border-radius:4px; transition:width .6s ease; }
 .scanprog.done .sp-bar div { background:#30d158; } .scanprog.stopped .sp-bar div { background:#ff9f0a; }
 .scanprog.paused .sp-bar div { background:#8e8e93; }
+.scanprog.recovering .sp-bar div, .scanprog.halting .sp-bar div, .scanprog.halted .sp-bar div { background:#ff9f0a; }
+.scanprog.recovering, .scanprog.halting, .scanprog.halted { border-color:rgba(255,159,10,.45); }
+.scanprog .sp-note { color:#ffb340; font-size:13px; margin-top:6px; line-height:1.45; }
+.scanprog.halted .sp-note + .sp-note { color:#a1a1a6; }
+.scanprog.frozen::after { content:"This page stopped receiving updates, so what it shows may be out of date. Reload the page to reconnect; the scan itself keeps running.";
+  display:block; margin-top:10px; padding:8px 10px; border-radius:8px; background:rgba(255,69,58,.12); color:#ff6961; font-size:13px; }
+.activity .warn { color:#ff9f0a; }
 .scanprog .sp-meta { color:#86868b; font-size:13px; }
 .scanprog.idle .sp-top { color:#86868b; font-weight:400; }
 .add-model-card { position:relative; }

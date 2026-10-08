@@ -14,7 +14,8 @@ security weaknesses with [garak](https://github.com/NVIDIA/garak). It runs entir
 - **Images**: text-to-image with Z-Image, FLUX.1, and Stable Diffusion 1.5 / XL through stable-diffusion.cpp,
   with a gallery. Image models can be found through Hugging Face search too.
 - **Scanning**: garak probes, saved probe groups, a live progress bar, and a security-analyst report with OWASP
-  LLM Top 10 mapping, evidence, remediation, and the raw garak data.
+  LLM Top 10 mapping, evidence, remediation, and the raw garak data. Scans can be paused, a stuck probe is
+  detected and restarted, and finished probes are never lost.
 - **Housekeeping**: models load only while in use, a live GPU/RAM status bar, start at boot, and one-click
   verified updates for LLM Scanner, Ollama, and garak.
 
@@ -184,6 +185,17 @@ It lists what will be deleted and asks before doing anything.
 
 ## Changelog
 
+- **1.1.3**: A scan that hangs is now caught instead of sitting frozen. garak retries a request that times out
+  or fails without limit and without printing anything, so a model too slow for the response timeout used to stall
+  a scan forever. The progress card now warns as soon as requests start timing out, and after 3 timeouts in a row,
+  repeated Ollama errors, 10 minutes with no progress and no work by garak or the model, or far longer than any
+  prompt can take, the scan restarts from the probe it was on (unloading the model, and restarting Ollama if it no
+  longer answers), keeping every finished probe. If the same probe gets stuck again, or garak itself crashes there
+  twice, the scan halts and waits: **Continue** retries that probe (with a new Response timeout if you raised it),
+  **Skip probe** moves on without it, and **Stop** ends the scan. A halted scan stays waiting across restarts, and
+  the status bar says when one needs attention. **Restart probe** does the same restart by hand at any time while a
+  scan runs. If the page itself stops receiving updates (sleep, network, a restart), the progress card says so and
+  suggests reloading, so a disconnected page is no longer mistaken for a stuck scan.
 - **1.1.2**: A gear in the top-right of **Add a model** opens a Hugging Face access token, so gated models (the
   ones whose conditions you accept on their Hugging Face page) and models in your private repositories can be
   downloaded, and searches and downloads are no longer limited to what Hugging Face allows anonymously. The

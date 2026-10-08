@@ -454,4 +454,14 @@
     if (b) b.title = b.classList.contains('docs-only')
       ? "Attach documents and text files (this model can't view images)" : 'Attach images, documents, or text files';
   }, 1500);
+  // A running scan's progress card carries a heartbeat that changes every second. If it stops changing, the page
+  // lost its connection to LLM Scanner (sleep, network, server restart) and only looks like the scan is stuck.
+  let beat = null, beatSince = Date.now();
+  setInterval(() => {
+    const card = document.querySelector('.scanprog.running, .scanprog.paused, .scanprog.recovering, .scanprog.halting');
+    if (!card) { beat = null; return; }
+    if (card.dataset.beat !== beat) { beat = card.dataset.beat; beatSince = Date.now(); }
+    card.classList.toggle('frozen', Date.now() - beatSince > 20000);
+  }, 5000);
 }
+

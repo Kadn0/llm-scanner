@@ -18,9 +18,24 @@ model = os.environ.get("LLM_SCANNER_MODEL", "")
 _chat_for_scan = ollama.Client.chat
 
 
+_failing = [False]
+
+
 def _scan_chat(self, *args, **kwargs):
     kwargs.setdefault("keep_alive", "15m")  # Ollama's default is to unload immediately; keep it for the scan
-    return _chat_for_scan(self, *args, **kwargs)
+    try:
+        response = _chat_for_scan(self, *args, **kwargs)
+        if _failing[0]:
+            _failing[0] = False
+            print("LLM Scanner: request answered after a retry", flush=True)
+        return response
+    except Exception as e:
+        _failing[0] = True
+        # garak retries timeouts and Ollama errors without limit and without printing anything, so a model that
+        # never answers would look frozen. LLM Scanner counts these lines to tell a stuck scan from a slow one.
+        kind = "timeout" if "timeout" in type(e).__name__.lower() else "error"
+        print(f"LLM Scanner: request {kind}: {type(e).__name__}: {str(e)[:200]}; garak will retry", flush=True)
+        raise
 
 
 ollama.Client.chat = _scan_chat
