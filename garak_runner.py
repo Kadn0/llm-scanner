@@ -22,7 +22,9 @@ _failing = [False]
 
 
 def _scan_chat(self, *args, **kwargs):
-    kwargs.setdefault("keep_alive", "15m")  # Ollama's default is to unload immediately; keep it for the scan
+    # Keep the model loaded for the whole scan, however long garak spends scoring or the scan is paused (Ollama's
+    # default here is to unload at once). LLM Scanner unloads it when the scan ends, halts or restarts a probe.
+    kwargs.setdefault("keep_alive", -1)
     try:
         response = _chat_for_scan(self, *args, **kwargs)
         if _failing[0]:

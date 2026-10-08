@@ -266,14 +266,35 @@ def activity_html():
     return '<div class="activity">' + " &nbsp;·&nbsp; ".join(items) + "</div>"
 
 
+def _model_tag(name):
+    """Ollama's full name for a model: "llama3" and "llama3:latest" are the same model."""
+    return name if ":" in name.rsplit("/", 1)[-1] else f"{name}:latest"
+
+
+def scanning_model():
+    """The model a running scan is using (it must stay loaded until the scan ends), or None."""
+    job = _scan["job"]
+    return _model_tag(job["model"]) if job and _scan_running() and not _scan["action"] else None
+
+
 def unload_models():
-    """Free RAM/VRAM by unloading every model Ollama has in memory."""
+    """Free RAM/VRAM by unloading every model Ollama has in memory, except the one a running scan is using."""
+    keep = scanning_model()
     for m in loaded_models():
+        if _model_tag(m["name"]) == keep:
+            continue
         try:
             requests.post(f"{OLLAMA}/api/generate", json={"model": m["name"], "keep_alive": 0}, timeout=30)
         except Exception:
             pass
     return status_controls()
+
+
+def unload_button():
+    keep = scanning_model()
+    if keep and any(_model_tag(m["name"]) == keep for m in loaded_models()):
+        gr.Info(f"{keep} stays loaded: a scan is using it. It unloads when the scan ends.")
+    return unload_models()
 
 
 def status_controls():
@@ -1068,6 +1089,16 @@ def chat_respond(chat):
         yield chat, gr.update(), gr.update(), gr.update(), gr.update()
         return
     model = chat["model"]
+    scanning = scanning_model()
+    if scanning and _model_tag(model) != scanning:
+        # Only one model fits in memory at a time; loading this one would unload the scan's model mid-scan.
+        chat["messages"].append({"role": "assistant", "model": model, "stats": "Not sent", "content":
+                                 f"A scan is using {scanning}, so chatting with {model} now would unload it from "
+                                 f"memory and slow the scan down. Chat with {scanning}, or send this again once the "
+                                 "scan finishes."})
+        save_chat(chat)
+        yield chat, display_messages(chat), gr.update(visible=True), gr.update(visible=False), gr.update()
+        return
     has_images = any(a["kind"] == "image" for m in chat["messages"] for a in m.get("attachments", []))
     msgs, skipped_images = api_messages(chat, vision=has_images and "vision" in model_capabilities(model))
     reply = {"role": "assistant", "content": "", "stats": "", "model": model}
@@ -1077,8 +1108,9 @@ def chat_respond(chat):
     answer, last, last_save, final, first_token = "", 0.0, time.time(), {}, None
     t0 = time.time()
     try:
+        keep_alive = -1 if scanning else CHAT_KEEP_ALIVE  # (chatting with the scan's model must not shorten its stay)
         with requests.post(f"{OLLAMA}/api/chat", json={"model": model, "messages": msgs, "stream": True,
-                                                        "keep_alive": CHAT_KEEP_ALIVE},
+                                                        "keep_alive": keep_alive},
                            stream=True, timeout=(10, 1800)) as r:
             for line in r.iter_lines():
                 if not line:
@@ -3180,6 +3212,7 @@ SCAN_JOB = DATA_DIR / "scan_job.json"
 MAX_STALLED_RESUMES = 3  # give up on a scan that is interrupted this many times in a row without finishing a probe
 OLLAMA_WAIT_SECS = 600  # after a reboot, how long a resume waits for Ollama to come up
 WATCH_SECS = 10  # how often the watchdog checks a running scan
+MODEL_CHECK_SECS = 30  # how often it makes sure the scan's model is still loaded
 STALL_TIMEOUTS = 3  # requests in a row that time out before a probe counts as stuck
 STALL_ERRORS = 8  # requests in a row that Ollama fails before a probe counts as stuck
 STALL_IDLE_SECS = 600  # no progress and no CPU work by garak or the model for this long: stuck
@@ -3188,7 +3221,7 @@ QUIET_NOTE_SECS = 120  # no progress for this long is mentioned on the progress 
 AUTO_RESTARTS = 1  # automatic restarts of a stuck probe before the scan halts and waits for the user
 _scan = {"head": "", "buf": [], "cur": [""], "progress": ScanProgress(), "reader": None, "end": "", "ok": False,
          "user_stop": False, "paused": False, "job": None, "last_progress": 0.0, "timeouts": 0, "errors": 0,
-         "last_error": "", "action": None, "why": "", "manual": False}
+         "last_error": "", "action": None, "why": "", "manual": False, "model_seen": False}
 _scan_lock = threading.RLock()
 _resume = {"waiting": False}
 
@@ -3236,7 +3269,7 @@ def _launch_scan(job, note=""):
     buf, cur = [], [""]
     _scan.update(head=note + "garak " + " ".join(cmd[2:]) + "\n\n", buf=buf, cur=cur, progress=progress, end="",
                  ok=False, user_stop=False, paused=False, job=job, last_progress=time.time(), timeouts=0, errors=0,
-                 last_error="")
+                 last_error="", model_seen=False)
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, start_new_session=True)
     _proc["p"] = p
 
@@ -3350,11 +3383,33 @@ def _stall_reason(samples, now=None):
     return ""
 
 
+def _keep_scan_model_loaded(model):
+    """Load the scan's model again if something else unloaded it (another program using Ollama, for instance), so
+    the next prompt doesn't wait for a reload and time out. Only once garak has loaded it in the first place."""
+    try:
+        loaded = requests.get(f"{OLLAMA}/api/ps", timeout=10).json().get("models", [])
+    except Exception:
+        return  # Ollama busy or restarting: check again next time
+    if any(_model_tag(m["name"]) == _model_tag(model) for m in loaded):
+        _scan["model_seen"] = True
+        return
+    if not _scan["model_seen"]:  # garak hasn't loaded it yet
+        return
+    _scan["buf"].append(f"LLM Scanner: {model} was unloaded from memory; loading it again")
+    try:
+        requests.post(f"{OLLAMA}/api/generate", json={"model": model, "keep_alive": -1}, timeout=600)
+    except Exception:
+        pass
+
+
 def _watch_scan(p):
-    """Runs alongside each garak process and restarts or halts the scan if it gets stuck."""
-    samples = []
+    """Runs alongside each garak process: keeps its model loaded, and restarts or halts the scan if it gets stuck."""
+    samples, checked = [], time.time()
     while _proc.get("p") is p and p.poll() is None:
         time.sleep(WATCH_SECS)
+        if not _scan["action"] and _scan["job"] and time.time() - checked >= MODEL_CHECK_SECS:
+            checked = time.time()
+            _keep_scan_model_loaded(_scan["job"]["model"])
         if _scan["paused"] or _scan["action"]:
             samples.clear()  # time spent paused is not time stuck
             continue
@@ -4291,7 +4346,7 @@ with gr.Blocks(title="LLM Scanner") as ui:
     stop_ollama_btn.click(stop_ollama, outputs=status_outputs, show_progress="hidden")
     restart_ollama_btn.click(restart_ollama, outputs=status_outputs, show_progress="hidden")
     status_timer.tick(status_controls, outputs=status_outputs, show_progress="hidden")
-    unload_btn.click(unload_models, outputs=status_outputs, show_progress="hidden")
+    unload_btn.click(unload_button, outputs=status_outputs, show_progress="hidden")
     ui.load(status_controls, outputs=status_outputs, show_progress="hidden")
     update_outputs = [update_box, update_html, *update_rows, *update_labels, update_all_btn, update_dismiss]
     update_timer.tick(update_controls, outputs=update_outputs, show_progress="hidden")

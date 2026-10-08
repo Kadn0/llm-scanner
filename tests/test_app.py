@@ -19,6 +19,7 @@ real_sleep = time.sleep  # (some tests shorten app delays by patching time.sleep
 APP_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(APP_DIR))
 os.environ["LLM_SCANNER_CHECK"] = "1"
+os.environ["OLLAMA_URL"] = "http://127.0.0.1:9"  # never the real Ollama: a scan may be running on this machine
 
 import analyst_report  # noqa: E402
 import app  # noqa: E402
@@ -507,6 +508,22 @@ class ChatFiles(TempDataTest):
                 mock.patch.object(app.requests, "post", side_effect=app.requests.ConnectionError("refused")):
             final = list(app.chat_respond(chat))[-1][0]
         self.assertIn("Error: refused", final["messages"][-1]["content"])
+
+    def test_chat_during_a_scan_keeps_the_scan_model_loaded(self):
+        chat = {"id": "c5", "title": "t", "model": "other", "messages": [{"role": "user", "content": "hi"}],
+                "totals": app.new_totals()}
+        lines = [json.dumps({"message": {"content": "ok"}, "done": True}).encode()]
+        with mock.patch.object(app, "scanning_model", return_value="m:latest"), \
+                mock.patch.object(app, "model_capabilities", return_value=[]), \
+                mock.patch.object(app.requests, "post", return_value=FakeResponse(lines=lines)) as post:
+            final = list(app.chat_respond(chat))[-1][0]
+            post.assert_not_called()  # another model would push the scan's model out of memory
+            self.assertIn("A scan is using m:latest", final["messages"][-1]["content"])
+            chat["model"] = "m"
+            chat["messages"].append({"role": "user", "content": "hi again"})
+            final = list(app.chat_respond(chat))[-1][0]
+        self.assertEqual(final["messages"][-1]["content"], "ok", "the scan's own model can still be used")
+        self.assertEqual(post.call_args.kwargs["json"]["keep_alive"], -1, "chatting must not shorten its stay")
 
     def test_chat_stopped_replaces_typing_indicator(self):
         chat = {"id": "c4", "title": "t", "model": "m", "totals": app.new_totals(),
@@ -1243,6 +1260,22 @@ class ScanProgressTests(unittest.TestCase):
         self.assertIn("press Resume to continue", p.html("paused"))
         self.assertNotIn("left", p.html("paused"), "a paused scan has no meaningful estimate")
 
+    def test_scan_model_stays_loaded(self):
+        busy = mock.Mock()
+        busy.poll.return_value = None
+        loaded = [{"name": "m:latest"}, {"name": "chatty:7b"}]
+        with mock.patch.dict(app._proc, {"p": busy}), \
+                mock.patch.dict(app._scan, {"job": {"model": "m"}, "action": None}), \
+                mock.patch.object(app, "loaded_models", return_value=loaded), \
+                mock.patch.object(app.requests, "post") as post:
+            self.assertEqual(app.scanning_model(), "m:latest")
+            app.unload_models()
+            self.assertEqual([c.kwargs["json"]["model"] for c in post.call_args_list], ["chatty:7b"],
+                             "Unload must leave the scan's model alone")
+        with mock.patch.object(app.requests, "post") as post:
+            app.unload_models()  # no scan running: everything unloads
+        self.assertEqual(app.scanning_model(), None)
+
     def test_progress_from_garak_output(self):
         p = app.ScanProgress()
         p.feed("queue of probes: dan.DanInTheWild, goodside.WhoIsRiley")
@@ -1511,6 +1544,22 @@ class ScanResume(TempDataTest):
         self.assertTrue(any("restarting it" in s for s in states), "the page shows the restart")
         self.assertIn("Scan complete", states[-1])
         self.assertEqual(len(cmds), 2)
+
+    def test_scan_model_is_loaded_again_if_something_unloads_it(self):
+        ps = mock.Mock()
+        app._scan.update(model_seen=False, buf=[])
+        with mock.patch.object(app.requests, "get", return_value=ps), \
+                mock.patch.object(app.requests, "post") as post:
+            ps.json.return_value = {"models": []}
+            app._keep_scan_model_loaded("m")
+            post.assert_not_called()  # garak hasn't loaded it yet
+            ps.json.return_value = {"models": [{"name": "m:latest"}]}
+            app._keep_scan_model_loaded("m")
+            post.assert_not_called()
+            ps.json.return_value = {"models": [{"name": "other:latest"}]}
+            app._keep_scan_model_loaded("m")
+        self.assertEqual(post.call_args.kwargs["json"], {"model": "m", "keep_alive": -1})
+        self.assertIn("m was unloaded from memory", app._scan["buf"][-1])
 
     def test_pause_does_not_count_as_stuck(self):
         self.fake_garak("import time\nprint('queue of probes: a.A', flush=True)\ntime.sleep(60)\n")
