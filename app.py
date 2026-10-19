@@ -2801,11 +2801,12 @@ try:
 except importlib.metadata.PackageNotFoundError:
     GARAK_VERSION = "not installed"
 
-# How many prompts each probe sends, to tag it Low / Medium / High on the Probes tab. The repository ships counts for
+# How many prompts each probe sends, to tag it Low / Medium / High / Very high / Extreme on the Probes tab. The repository ships counts for
 # the garak version it was released with; after a garak update they are measured again once, in the background.
 PROBE_SIZES_FILE = DATA_DIR / "probe_sizes.json"
 BUNDLED_PROBE_SIZES = APP_DIR / "probe_sizes.json"
-LOW_PROMPTS, MEDIUM_PROMPTS = 30, 150  # up to 30 prompts is Low, up to 150 Medium, more is High
+LOW_PROMPTS, MEDIUM_PROMPTS = 30, 150  # up to 30 prompts' worth of work is Low, up to 150 Medium,
+HIGH_PROMPTS, VERY_HIGH_PROMPTS = 500, 2000  # up to 500 High, up to 2000 Very high, more is Extreme
 NORMAL_REPLY_TOKENS = 150  # garak's reply limit; a probe allowed longer replies costs that many times more per prompt
 NORMAL_PROMPT_CHARS = 200  # a typical prompt; reading one token costs about a tenth of writing one
 READ_COST = 0.1
@@ -2815,6 +2816,8 @@ PROBE_PROMPT_CHARS = {}  # probe -> average prompt length: long prompts take the
 PROBE_TURNS = {}  # probe -> average user turns per prompt
 PROBE_JUDGED = set()  # probes whose replies an AI model judges: one more model reply for every reply
 PROBE_SCORING_MODELS = set()  # probes scored by a Hugging Face model, downloaded the first time
+PROBE_UNCAPPED = {}  # probe -> prompts it has, for probes garak's prompt cap (256) cuts down in a scan
+PROMPT_CAP = [256]
 
 
 def _stored_probe_sizes():
@@ -2852,6 +2855,8 @@ def _use_probe_sizes(d):
         PROBE_TURNS.update(d.get("turns") or {})
         PROBE_JUDGED.update(d.get("judged") or [])
         PROBE_SCORING_MODELS.update(d.get("scoring_models") or [])
+        PROBE_UNCAPPED.update(d.get("uncapped") or {})
+        PROMPT_CAP[0] = d.get("prompt_cap") or PROMPT_CAP[0]
 
 
 def probe_work(name):
@@ -2869,18 +2874,20 @@ def probe_work(name):
 
 
 def probe_costs():
-    """{probe: {level, prompts, work, reply_tokens, prompt_chars, judged, downloads, generated, files}} for the probes
-    whose size is known, so the tag's hover can say what makes each probe slow."""
+    """{probe: {level, prompts, work, reply_tokens, prompt_chars, judged, downloads, generated, files, uncapped, cap}}
+    for the probes whose size is known, so the tag's hover can say what makes each probe slow."""
     out = {}
     for name, n in PROBE_SIZES.items():
         files_only = n == 0 and (CATALOG.get(name, {}).get("module") == "fileformats" or name.endswith("TokenizerHF"))
         generated = n == 0 and not files_only
         work = probe_work(name)
-        level = ("High" if generated else "Low" if files_only or work <= LOW_PROMPTS else
-                 "Medium" if work <= MEDIUM_PROMPTS else "High")
+        level = ("Very high" if generated else "Low" if files_only or work <= LOW_PROMPTS else
+                 "Medium" if work <= MEDIUM_PROMPTS else "High" if work <= HIGH_PROMPTS else
+                 "Very high" if work <= VERY_HIGH_PROMPTS else "Extreme")
         out[name] = {"level": level, "prompts": n, "work": round(work), "reply_tokens": PROBE_REPLY_TOKENS.get(name, 0),
                      "prompt_chars": PROBE_PROMPT_CHARS.get(name, 0), "judged": name in PROBE_JUDGED,
-                     "downloads": name in PROBE_SCORING_MODELS, "generated": generated, "files": files_only}
+                     "downloads": name in PROBE_SCORING_MODELS, "generated": generated, "files": files_only,
+                     "uncapped": PROBE_UNCAPPED.get(name, 0), "cap": PROMPT_CAP[0]}
     return out
 
 

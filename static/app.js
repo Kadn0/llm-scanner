@@ -107,6 +107,7 @@
       if (c.prompt_chars >= 1500) parts.push(`Its prompts are long (about ${Math.round(c.prompt_chars / 6)} words each), so the model takes longer to read them.`);
       else if (c.prompt_chars >= 500) parts.push(`Its prompts are longer than usual (about ${Math.round(c.prompt_chars / 6)} words each), which adds a little reading time.`);
     }
+    if (c.uncapped) parts.push(`It has ${c.uncapped} prompts, but garak sends at most ${c.cap} per probe, so a random ${c.cap} are used.`);
     if (c.judged) parts.push('An AI model judges every reply, which doubles the work.');
     if (c.downloads) parts.push('The first time it runs, it downloads a scoring model from Hugging Face.');
     if (!c.generated && c.work > c.prompts) parts.push(`Altogether about as much work as ${c.work} normal prompts.`);
@@ -127,7 +128,7 @@
       if (tag && tag.dataset.key === key) return;
       if (!tag) { tag = document.createElement('span'); label.appendChild(tag); }
       tag.dataset.key = key;
-      tag.className = `probe-cost ${cost.level.toLowerCase()}`;
+      tag.className = `probe-cost ${cost.level.toLowerCase().replace(' ', '-')}`;
       tag.textContent = `${cost.level} · ${cost.files ? 'none' : cost.generated ? 'generated' : cost.prompts}`;
       tag.dataset.tipTitle = `${cost.level} time: ${cost.files ? 'no prompts' : cost.generated ? 'prompts written during the scan' : `${cost.prompts} prompt${cost.prompts === 1 ? '' : 's'}`}`;
       tag.dataset.tip = costTip(cost);

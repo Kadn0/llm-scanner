@@ -639,6 +639,8 @@ a.mt-model-name:hover { color:#2997ff !important; text-decoration:underline !imp
 .probe-cost.low { background:rgba(48,209,88,.14); color:#30d158; }
 .probe-cost.medium { background:rgba(255,159,10,.15); color:#ff9f0a; }
 .probe-cost.high { background:rgba(255,69,58,.15); color:#ff6961; }
+.probe-cost.very-high { background:rgba(255,69,58,.32); color:#ff8a80; }
+.probe-cost.extreme { background:rgba(191,90,242,.25); color:#da8fff; }
 
 /* Red team tools: the link to promptfoo's own interface once it runs, and the model IDs to paste into it. */
 .pf-link { align-self:center; }

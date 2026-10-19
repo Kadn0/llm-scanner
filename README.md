@@ -190,6 +190,10 @@ It lists what will be deleted and asks before doing anything.
 
 ## Changelog
 
+- **1.1.9**: Probe time tags have five levels instead of three: Low, Medium, High, Very high and Extreme, so a probe
+  of 151 prompts is no longer tagged the same as one of 6463. Probes whose prompts an attacker model writes during the
+  scan are Very high. The hover now says when a probe has more prompts than garak sends (at most 256 per probe, picked
+  at random), for example badchars.BadCharacters has 36063.
 - **1.1.8**: A data export copied to another machine now sets it up without any options: the installer restores the
   newest `llm-scanner-data-*.tar.gz` in the home folder (or the folder it is run from) unless `--no-data` is given,
   and a copy that updates to this version restores PyRIT's settings from such an export if it has none yet. Exports

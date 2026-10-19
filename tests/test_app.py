@@ -1282,29 +1282,32 @@ class PyritLauncher(TempDataTest):
 
 
 class ProbeTimeTags(TempDataTest):
-    """Each probe is tagged Low / Medium / High by how much work it is: its prompts, how long its replies may run, how
-    long its prompts are to read, its turns, and whether an AI model judges every reply. Measured once per garak
-    version."""
+    """Each probe is tagged Low / Medium / High / Very high / Extreme by how much work it is: its prompts, how long its
+    replies may run, how long its prompts are to read, its turns, and whether an AI model judges every reply. Measured
+    once per garak version."""
 
     def setUp(self):
         super().setUp()
         self.enterContext(mock.patch.object(app, "PROBE_SIZES_FILE", self.tmp / "data" / "probe_sizes.json"))
         self.enterContext(mock.patch.object(app, "BUNDLED_PROBE_SIZES", self.tmp / "bundled.json"))
-        for name in ("PROBE_SIZES", "PROBE_REPLY_TOKENS", "PROBE_PROMPT_CHARS", "PROBE_TURNS"):
+        for name in ("PROBE_SIZES", "PROBE_REPLY_TOKENS", "PROBE_PROMPT_CHARS", "PROBE_TURNS", "PROBE_UNCAPPED"):
             self.enterContext(mock.patch.dict(getattr(app, name), clear=True))
         for name in ("PROBE_JUDGED", "PROBE_SCORING_MODELS"):
             self.enterContext(mock.patch.object(app, name, set()))
+        self.enterContext(mock.patch.object(app, "PROMPT_CAP", [256]))
 
     def level(self, name):
         return app.probe_costs()[name]["level"]
 
     def test_prompt_counts(self):
-        app.PROBE_SIZES.update({"a.Few": 30, "a.Some": 31, "a.Many": 151, "tap.TAP": 0, "fileformats.HF_Files": 0})
+        app.PROBE_SIZES.update({"a.Few": 30, "a.Some": 31, "a.Many": 151, "tap.TAP": 0, "fileformats.HF_Files": 0,
+                                "a.Huge": 501, "a.Giant": 2001})
         with mock.patch.dict(app.CATALOG, {"fileformats.HF_Files": {"module": "fileformats"}}):
             costs = app.probe_costs()
-        self.assertEqual([costs[n]["level"] for n in ("a.Few", "a.Some", "a.Many")], ["Low", "Medium", "High"])
+        self.assertEqual([costs[n]["level"] for n in ("a.Few", "a.Some", "a.Many", "a.Huge", "a.Giant")],
+                         ["Low", "Medium", "High", "Very high", "Extreme"], "High no longer lumps 151 with 6463")
         self.assertTrue(costs["tap.TAP"]["generated"])
-        self.assertEqual(costs["tap.TAP"]["level"], "High", "prompts written by an attacker model during the scan")
+        self.assertEqual(costs["tap.TAP"]["level"], "Very high", "prompts written by an attacker model during the scan")
         self.assertEqual(costs["fileformats.HF_Files"]["level"], "Low", "inspects files, sends nothing")
         self.assertIn('id="probe-costs"', app.probe_costs_html())
 
@@ -1323,6 +1326,16 @@ class ProbeTimeTags(TempDataTest):
         self.assertEqual(app.probe_work("x.Turns"), 40, "two turns per prompt, two replies")
         self.assertEqual(self.level("x.Scored"), "Low", "a first-run download is mentioned, not counted")
         self.assertTrue(app.probe_costs()["x.Scored"]["downloads"])
+
+    def test_prompt_cap_is_reported(self):
+        app._use_probe_sizes({"garak": app.GARAK_VERSION, "probes": {"a.Capped": 256, "a.Small": 10},
+                              "uncapped": {"a.Capped": 36063}, "prompt_cap": 256})
+        costs = app.probe_costs()
+        self.assertEqual((costs["a.Capped"]["prompts"], costs["a.Capped"]["uncapped"], costs["a.Capped"]["cap"]),
+                         (256, 36063, 256), "the tag counts what a scan sends; the hover says how many it has")
+        self.assertEqual(costs["a.Small"]["uncapped"], 0)
+        app._use_probe_sizes({"garak": app.GARAK_VERSION, "probes": {"a.Old": 5}})
+        self.assertEqual(app.probe_costs()["a.Old"]["cap"], 256, "counts measured before this release still load")
 
     def test_counts_again_only_after_a_garak_update(self):
         app.BUNDLED_PROBE_SIZES.write_text(json.dumps({"garak": app.GARAK_VERSION, "probes": {"a.B": 5},

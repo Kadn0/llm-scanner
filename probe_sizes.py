@@ -2,12 +2,13 @@
 
 Prints JSON: {"garak": version, "probes": {name: prompt count}, "reply_tokens": {name: tokens}, "prompt_chars":
 {name: average characters per prompt}, "turns": {name: average turns per prompt}, "judged": [names],
-"scoring_models": [names]}. A count of 0 means the probe writes its prompts during the scan (an attacker model or a
-search) or inspects files instead. reply_tokens lists probes that let each reply run longer than garak's usual limit
+"scoring_models": [names], "uncapped": {name: prompts it has}, "prompt_cap": n}. A count of 0 means the probe writes
+its prompts during the scan (an attacker model or a search) or inspects files instead. reply_tokens lists probes that let each reply run longer than garak's usual limit
 (divergence asks for a word repeated forever, so every reply runs to that limit). judged lists probes whose replies an
 AI model judges (one more model reply per reply); scoring_models lists probes scored by a Hugging Face model that is
 downloaded the first time. Probes that can't be loaded here (missing API keys or optional packages) are left out.
-garak's prompt cap is already applied to the counts.
+garak's prompt cap (soft_probe_prompt_cap, 256 by default) is applied to the counts, as in a scan; uncapped lists the
+probes the cap cuts down, with how many prompts they have.
 """
 
 import contextlib
@@ -60,6 +61,30 @@ def _detector_kinds():
     return judges, models
 
 
+def _uncapped_counts(names):
+    """How many prompts the capped probes have without garak's cap."""
+    cap = _config.run.soft_probe_prompt_cap
+    _config.run.soft_probe_prompt_cap = 10**9
+    out = {}
+    try:
+        for name in names:
+            signal.alarm(30)
+            try:
+                module, _, cls = name.rpartition(".")
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    probe = getattr(importlib.import_module(f"garak.probes.{module}"), cls)()  # load_plugin reuses
+                n = len(getattr(probe, "prompts", None) or [])
+                if n > cap:
+                    out[name] = n
+            except (_TooSlow, Exception):
+                pass
+            finally:
+                signal.alarm(0)
+    finally:
+        _config.run.soft_probe_prompt_cap = cap
+    return out
+
+
 def main():
     _config.load_base_config()
     signal.signal(signal.SIGALRM, _alarm)
@@ -91,9 +116,12 @@ def main():
             pass
         finally:
             signal.alarm(0)
+    cap = _config.run.soft_probe_prompt_cap
+    uncapped = _uncapped_counts([n for n, c in counts.items() if c == cap])
     print(json.dumps({"garak": importlib.metadata.version("garak"), "probes": counts, "reply_tokens": reply_tokens,
                       "prompt_chars": prompt_chars, "turns": turns, "judged": sorted(judged),
-                      "scoring_models": sorted(scoring_models)}, sort_keys=True))
+                      "scoring_models": sorted(scoring_models), "uncapped": uncapped, "prompt_cap": cap},
+                     sort_keys=True))
 
 
 if __name__ == "__main__":
