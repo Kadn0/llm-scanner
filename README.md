@@ -87,6 +87,7 @@ Installer options:
 |---|---|
 | `--data FILE` | Restore data exported from another machine (see below) |
 | `--pull-models` | With `--data`, also re-download that machine's Ollama chat models |
+| `--no-data` | Don't restore an export found in your home folder (or the folder you run the installer from) |
 | `--no-autostart` | Don't open the app in Firefox at login |
 | `--no-start` | Install, but don't start it yet |
 
@@ -102,7 +103,8 @@ probe groups, scan reports and the red team tools' setup (promptfoo's data, and 
 ~/llm-scanner/export-data.sh
 ```
 
-Copy the file it creates to the new machine and install with it:
+Copy the file it creates to the new machine's home folder and run the installer there; it finds the newest export in
+your home folder (or the folder you run it from) and restores it, or name one with `--data`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Kadn0/llm-scanner/main/install.sh -o install.sh
@@ -188,6 +190,10 @@ It lists what will be deleted and asks before doing anything.
 
 ## Changelog
 
+- **1.1.8**: A data export copied to another machine now sets it up without any options: the installer restores the
+  newest `llm-scanner-data-*.tar.gz` in the home folder (or the folder it is run from) unless `--no-data` is given,
+  and a copy that updates to this version restores PyRIT's settings from such an export if it has none yet. Exports
+  leave out Python environments, so they stay small.
 - **1.1.7**: New installs and updated copies end up with the same red team tools: PyRIT is now installed where it's
   missing, like promptfoo and Node.js (an Install button on the Red team tools page does it right away), and
   `uninstall.sh` removes all three. Moving to a new machine now carries the red team tools' setup too: `export-data.sh`

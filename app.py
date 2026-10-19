@@ -19,6 +19,7 @@ import signal
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -4435,6 +4436,40 @@ def install_red_team_tools(force=False):
         print(f"Could not install the red team tools: {e}", flush=True)
 
 
+def restore_pyrit_settings(home=None):
+    """On a machine with a data export (export-data.sh) in the home folder but no PyRIT settings yet, as after
+    updating a copy that was set up elsewhere, restore ~/.pyrit and ~/pyrit from the newest export, the same way
+    install.sh --data does: only missing files are added, and the old home folder in them becomes this one."""
+    home = Path(home or Path.home())
+    if (home / ".pyrit").exists():
+        return False
+    exports = sorted(home.glob("llm-scanner-data-*.tar.gz"), key=lambda p: p.stat().st_mtime, reverse=True)
+    prefix = "llm-scanner-data/pyrit-settings/"
+    for export in exports[:1]:
+        with tarfile.open(export) as tar, tempfile.TemporaryDirectory() as tmp:
+            members = [m for m in tar.getmembers() if m.name.startswith(prefix)]
+            if not members:
+                return False
+            tar.extractall(tmp, members=members, filter="data")
+            base = Path(tmp) / prefix
+            old_home = (base / "home.txt").read_text().strip() if (base / "home.txt").exists() else ""
+            for src_name, dest in (("dot-pyrit", home / ".pyrit"), ("pyrit", home / "pyrit")):
+                src = base / src_name
+                for f in sorted(src.rglob("*")) if src.is_dir() else []:
+                    target = dest / f.relative_to(src)
+                    if f.is_dir():
+                        target.mkdir(parents=True, exist_ok=True)
+                    elif not target.exists():
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        data = f.read_bytes()
+                        if old_home and old_home != str(home):
+                            data = data.replace(old_home.encode(), str(home).encode())
+                        target.write_bytes(data)
+        print(f"Restored PyRIT's settings from {export}", flush=True)
+        return True
+    return False
+
+
 def redteam_view():
     """(promptfoo status line, Start, Stop, Open link) for the current state."""
     if not promptfoo_installed():
@@ -5241,6 +5276,10 @@ if __name__ == "__main__":
             _resume["waiting"] = True  # set before the page can load, so it shows the pending resume
             threading.Thread(target=resume_interrupted_scan, daemon=True).start()
         threading.Thread(target=measure_probe_sizes, daemon=True).start()  # only does work after a garak update
+        try:
+            restore_pyrit_settings()  # from a data export in the home folder, if PyRIT has no settings yet
+        except Exception as e:
+            print(f"Could not restore PyRIT's settings: {e}", flush=True)
         threading.Thread(target=install_red_team_tools, daemon=True).start()  # only does work where it's missing
         threading.Thread(target=check_updates, daemon=True).start()  # once at startup; after that, on request
     ui.queue().launch(server_name="127.0.0.1", server_port=int(os.environ.get("LLM_SCANNER_PORT", 7861)),

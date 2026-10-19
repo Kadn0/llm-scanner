@@ -1211,6 +1211,39 @@ class RedTeamTools(TempDataTest):
         self.assertEqual(link, "")
 
 
+class PyritSettingsRestore(TempDataTest):
+    """An updated copy set up elsewhere gets its PyRIT settings back from a data export in the home folder."""
+
+    def make_export(self, home, old_home="/home/old"):
+        stage = self.tmp / "stage/llm-scanner-data/pyrit-settings"
+        (stage / "dot-pyrit").mkdir(parents=True)
+        (stage / "pyrit").mkdir()
+        (stage / "home.txt").write_text(old_home + "\n")
+        (stage / "dot-pyrit/.pyrit_conf").write_text(f"initialization_scripts:\n  - {old_home}/pyrit/setup.py\n")
+        (stage / "pyrit/setup.py").write_text("# setup\n")
+        import tarfile
+        with tarfile.open(home / "llm-scanner-data-20261019-0900.tar.gz", "w:gz") as tar:
+            tar.add(self.tmp / "stage/llm-scanner-data", arcname="llm-scanner-data")
+
+    def test_restores_missing_settings_with_this_home(self):
+        home = self.tmp / "home"
+        home.mkdir()
+        self.make_export(home)
+        self.assertTrue(app.restore_pyrit_settings(home))
+        conf = (home / ".pyrit/.pyrit_conf").read_text()
+        self.assertIn(f"{home}/pyrit/setup.py", conf, "the old home folder becomes this one")
+        self.assertTrue((home / "pyrit/setup.py").exists())
+        (home / ".pyrit/.pyrit_conf").write_text("mine")
+        self.assertFalse(app.restore_pyrit_settings(home), "settings already here are never replaced")
+        self.assertEqual((home / ".pyrit/.pyrit_conf").read_text(), "mine")
+
+    def test_nothing_to_restore(self):
+        home = self.tmp / "empty-home"
+        home.mkdir()
+        self.assertFalse(app.restore_pyrit_settings(home))
+        self.assertFalse((home / ".pyrit").exists())
+
+
 class PyritLauncher(TempDataTest):
     """The Red team tools page starts and stops PyRIT's own web interface, on this computer only."""
 

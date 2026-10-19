@@ -21,6 +21,8 @@ Usage: ./install.sh [options]
 
   --data FILE       restore chats, images, probe groups, reports and the red team tools' setup from an export-data.sh file
   --pull-models     with --data, also re-download the Ollama chat models listed in the export
+  --no-data         don't restore an export found automatically (without --data, the newest
+                    llm-scanner-data-*.tar.gz in this folder or your home folder is restored)
   --no-autostart    don't open the app automatically when you log in
   --no-start        install everything but don't start the services or open the browser
   -h, --help        show this help
@@ -32,9 +34,11 @@ PULL_MODELS=0
 AUTOSTART=1
 START=1
 DATA_FILE=""
+FIND_DATA=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --data) DATA_FILE="$(realpath "$2")"; shift ;;
+    --no-data) FIND_DATA=0 ;;
     --pull-models) PULL_MODELS=1 ;;
     --no-autostart) AUTOSTART=0 ;;
     --no-start) START=0 ;;
@@ -77,6 +81,18 @@ if [ ! -f "$SRC_DIR/app.py" ]; then
   [ -f "$SRC_DIR/app.py" ] || fail "The downloaded release doesn't contain app.py."
 fi
 info "Installing LLM Scanner $(cat "$SRC_DIR/VERSION" 2>/dev/null || echo "(unknown version)")"
+if [ -z "$DATA_FILE" ] && [ "$FIND_DATA" = "1" ]; then
+  # A data export copied over from another machine sets this one up the same way, red team tools' setup included,
+  # without having to remember --data. Only files that are missing here are added.
+  for dir in "$PWD" "$HOME"; do
+    found="$(ls -t "$dir"/llm-scanner-data-*.tar.gz 2>/dev/null | head -1 || true)"
+    if [ -n "$found" ]; then
+      DATA_FILE="$(realpath "$found")"
+      info "Found your data export $DATA_FILE; restoring it (run with --no-data to skip)."
+      break
+    fi
+  done
+fi
 if [ -n "$DATA_FILE" ]; then
   [ -f "$DATA_FILE" ] || fail "Data file not found: $DATA_FILE"
   DATA_DIR_SRC="$(mktemp -d)"

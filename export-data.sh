@@ -33,7 +33,12 @@ if [ -d "$HOME/.pyrit" ] || [ -d "$HOME/pyrit" ]; then
   mkdir -p "$D/pyrit-settings"
   echo "$HOME" > "$D/pyrit-settings/home.txt"  # paths inside are rewritten to the new home on restore
   if [ -d "$HOME/.pyrit" ]; then cp -r "$HOME/.pyrit" "$D/pyrit-settings/dot-pyrit"; fi
-  if [ -d "$HOME/pyrit" ]; then cp -r "$HOME/pyrit" "$D/pyrit-settings/pyrit"; fi
+  if [ -d "$HOME/pyrit" ]; then
+    # settings and scripts only: a Python environment (.venv) doesn't work on another machine, and PyRIT itself is
+    # installed there by LLM Scanner
+    tar -C "$HOME" --exclude='pyrit/.venv' --exclude='pyrit/venv' --exclude='__pycache__' -cf - pyrit \
+      | tar -C "$D/pyrit-settings" -xf -
+  fi
   find "$D/pyrit-settings" -name __pycache__ -type d -prune -exec rm -rf {} +
 fi
 if "$HOME/.local/bin/ollama" list >/dev/null 2>&1; then
