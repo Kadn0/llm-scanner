@@ -185,6 +185,14 @@ It lists what will be deleted and asks before doing anything.
 
 ## Changelog
 
+- **1.1.4**: Every probe on the Probes tab has a time tag (Low, Medium or High) with the number of prompts it sends;
+  hovering it estimates how many replies to wait for. Probes whose prompts an attacker model writes during the scan
+  are High, and so are probes that let each reply run far longer than usual: divergence.Repeat sends only 36 prompts,
+  but each asks for a word repeated forever, so every reply runs to 1024 tokens. Scans now send garak the Hugging Face
+  token saved in the app, since garak downloads detector models and datasets from Hugging Face partway through a scan.
+  If Hugging Face refuses one of those downloads (a rejected or old token, a gated repository, or too many requests),
+  the scan halts with an explanation of what to fix instead of retrying. Reports can be downloaded as a readable text
+  file of the raw report, and the scan's model stays loaded for the whole scan.
 - **1.1.3**: A scan that hangs is now caught instead of sitting frozen. garak retries a request that times out
   or fails without limit and without printing anything, so a model too slow for the response timeout used to stall
   a scan forever. The progress card now warns as soon as requests start timing out, and after 3 timeouts in a row,

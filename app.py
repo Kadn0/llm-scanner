@@ -2765,7 +2765,9 @@ except importlib.metadata.PackageNotFoundError:
 PROBE_SIZES_FILE = DATA_DIR / "probe_sizes.json"
 BUNDLED_PROBE_SIZES = APP_DIR / "probe_sizes.json"
 LOW_PROMPTS, MEDIUM_PROMPTS = 30, 150  # up to 30 prompts is Low, up to 150 Medium, more is High
-PROBE_SIZES = {}
+NORMAL_REPLY_TOKENS = 150  # garak's reply limit; a probe allowed longer replies costs that many times more per prompt
+PROBE_SIZES = {}  # probe -> prompts it sends
+PROBE_REPLY_TOKENS = {}  # probe -> reply limit, for probes that raise it (divergence: "repeat this word forever")
 
 
 def _stored_probe_sizes():
@@ -2775,7 +2777,7 @@ def _stored_probe_sizes():
         except (OSError, ValueError):
             continue
         if isinstance(d, dict) and d.get("garak") == GARAK_VERSION and isinstance(d.get("probes"), dict):
-            return d["probes"]
+            return d
     return None
 
 
@@ -2788,22 +2790,32 @@ def measure_probe_sizes():
                                  text=True, timeout=900)
             d = json.loads(out.stdout)
             PROBE_SIZES_FILE.write_text(json.dumps(d, sort_keys=True), encoding="utf-8")
-            sizes = d["probes"]
+            sizes = d
         except Exception as e:
             print(f"Could not count the prompts of garak's probes: {e}", flush=True)
             return
-    PROBE_SIZES.update(sizes or {})
+    _use_probe_sizes(sizes)
+
+
+def _use_probe_sizes(d):
+    if d:
+        PROBE_SIZES.update(d.get("probes") or {})
+        PROBE_REPLY_TOKENS.update(d.get("reply_tokens") or {})
 
 
 def probe_costs():
-    """{probe: [level, prompt count]} for the probes whose size is known; 0 prompts means generated or none sent."""
+    """{probe: [level, prompt count, reply limit or 0]} for the probes whose size is known. 0 prompts means they are
+    generated during the scan or none are sent. A probe that lets replies run longer counts each prompt as that many
+    normal ones, so divergence.Repeat (36 prompts, 1024-token replies) is as slow as about 245 normal prompts."""
     out = {}
     for name, n in PROBE_SIZES.items():
+        tokens = PROBE_REPLY_TOKENS.get(name, 0)
         if n == 0:
             files_only = CATALOG.get(name, {}).get("module") == "fileformats" or name.endswith("TokenizerHF")
-            out[name] = ["Low" if files_only else "High", 0]
-        else:
-            out[name] = ["Low" if n <= LOW_PROMPTS else "Medium" if n <= MEDIUM_PROMPTS else "High", n]
+            out[name] = ["Low" if files_only else "High", 0, tokens]
+            continue
+        work = n * max(1.0, tokens / NORMAL_REPLY_TOKENS)
+        out[name] = ["Low" if work <= LOW_PROMPTS else "Medium" if work <= MEDIUM_PROMPTS else "High", n, tokens]
     return out
 
 
@@ -2811,7 +2823,7 @@ def probe_costs_html():
     return f'<div id="probe-costs" hidden data-costs="{html.escape(json.dumps(probe_costs()))}"></div>'
 
 
-PROBE_SIZES.update(_stored_probe_sizes() or {})
+_use_probe_sizes(_stored_probe_sizes())
 MODULES = sorted({v["module"] for v in CATALOG.values()})
 
 
@@ -3304,6 +3316,47 @@ def _part_name(job, n):
     return job["prefix"] + (f"_part{n}" if n > 1 else "")
 
 
+# garak downloads detector models and datasets from Hugging Face the first time a probe needs them, which can be hours
+# into a scan. A refused download fails the same way on every retry, so the scan halts at once and says what to fix.
+HF_FAILURE = re.compile(r"(huggingface|hf\.co|HfHubHTTPError|GatedRepo|RepositoryNotFound|LocalTokenNotFound)", re.I)
+HF_STATUS = re.compile(r"\b(401|403|429)\b|Invalid credentials|Unauthorized|GatedRepo|gated|Too Many Requests", re.I)
+
+
+def hf_token_source():
+    """Where garak's Hugging Face downloads get their token: the app, the environment, or `huggingface-cli login`."""
+    if str(read_settings().get("hf_token") or "").strip():
+        return "the token saved in LLM Scanner"
+    env = next((n for n in HF_TOKEN_ENV if str(os.environ.get(n) or "").strip()), "")
+    if env:
+        return f"the {env} environment variable on this computer"
+    hf_home = Path(os.environ.get("HF_HOME") or Path.home() / ".cache/huggingface")
+    if (hf_home / "token").exists():
+        return f"the token `huggingface-cli login` saved in {hf_home / 'token'}"
+    return ""
+
+
+def explain_hf_failure(line):
+    """A plain explanation of a Hugging Face download garak was refused, or "" if the line isn't one."""
+    if not (HF_FAILURE.search(line) and HF_STATUS.search(line)):
+        return ""
+    source = hf_token_source()
+    if re.search(r"\b429\b|Too Many Requests", line, re.I):
+        return ("Hugging Face refused a download garak needs because this computer made too many requests. "
+                + ("Wait a while, then click Continue." if source else
+                   "Save a Hugging Face token with the gear on the Add a model card (downloads with a token have a "
+                   "much higher limit), then click Continue."))
+    if re.search(r"GatedRepo|gated|\b403\b", line, re.I):
+        return ("garak needs a file from a gated Hugging Face repository. Open that repository on Hugging Face, "
+                "accept its conditions with your account, make sure that account's token is saved with the gear on "
+                "the Add a model card, then click Continue.")
+    if source:
+        return (f"Hugging Face rejected the token sent with a download garak needs, so even public files fail. The "
+                f"token comes from {source}. Save a working token with the gear on the Add a model card (or remove "
+                "the old one), then click Continue.")
+    return ("Hugging Face refused a download garak needs. Save a Hugging Face token with the gear on the Add a model "
+            "card, then click Continue.")
+
+
 def _launch_scan(job, note=""):
     """Start garak for the job's unfinished probes. Output goes to _scan so any open page can show it."""
     prefix = _part_name(job, job["parts"])
@@ -3318,11 +3371,14 @@ def _launch_scan(job, note=""):
         cmd += ["--probes", ",".join(remaining)]
     env = os.environ | {"PYTHONUNBUFFERED": "1", "TERM": "dumb", "PYTHONIOENCODING": "utf-8",
                         "LLM_SCANNER_THINK": "1" if job["thinking"] else "0", "LLM_SCANNER_MODEL": job["model"]}
+    saved_token = str(read_settings().get("hf_token") or "").strip()
+    if saved_token:  # checked with Hugging Face when it was saved; takes precedence over an old login on this machine
+        env["HF_TOKEN"] = saved_token
     progress = ScanProgress(job["queue"], job["done"], job["failed"], job.get("skipped", []))
     buf, cur = [], [""]
     _scan.update(head=note + "garak " + " ".join(cmd[2:]) + "\n\n", buf=buf, cur=cur, progress=progress, end="",
                  ok=False, user_stop=False, paused=False, job=job, last_progress=time.time(), timeouts=0, errors=0,
-                 last_error="", model_seen=False)
+                 last_error="", model_seen=False, hf_problem="")
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, start_new_session=True)
     _proc["p"] = p
 
@@ -3338,6 +3394,9 @@ def _launch_scan(job, note=""):
                 _scan["errors"] += 1
                 _scan["last_error"] = line.split(": ", 2)[-1].split("; garak will retry")[0]
             return
+        if not _scan.get("hf_problem") and (why := explain_hf_failure(line)):
+            _scan["hf_problem"] = why
+            _scan_stuck(why, halt_now=True)  # before garak exits, so its exit isn't taken for a crash to retry
         if progress.feed(line):
             _scan.update(last_progress=time.time(), timeouts=0, errors=0)
         changed = False
@@ -3484,7 +3543,7 @@ def _stuck_probe(job):
     return next(iter(_remaining_probes(job)), None)
 
 
-def _scan_stuck(reason, manual=False):
+def _scan_stuck(reason, manual=False, halt_now=False):
     """The scan is stuck or garak died mid-scan. Restart garak from the probe it was on, keeping finished probes; if
     that probe was already restarted, halt instead and let the user decide. manual: the Restart probe button."""
     with _scan_lock:
@@ -3494,7 +3553,7 @@ def _scan_stuck(reason, manual=False):
         probe = _stuck_probe(job)
         count = job.get("stuck_count", 0) + 1 if job.get("stuck_on") == probe else 1
         job.update(stuck_on=probe, stuck_count=count)
-        halt = not manual and count > AUTO_RESTARTS
+        halt = halt_now or (not manual and count > AUTO_RESTARTS)
         _scan.update(action="halt" if halt else "restart", why=reason, manual=manual)
         if SCAN_JOB.exists():
             _save_scan_job(job)
@@ -3550,8 +3609,8 @@ def _recover_scan(job, halt):
         if halt or not ollama_up():
             job["halted"] = why if halt else f"{why}; Ollama could not be restarted"
             _save_scan_job(job)
-            _scan.update(action=None, ok=False, end=f"Scan halted on {probe or 'startup'}: {job['halted']}. "
-                                                     "Finished probes are kept.")
+            _scan.update(action=None, ok=False, end=f"Scan halted on {probe or 'startup'}: "
+                                                     f"{job['halted'].rstrip('.')}. Finished probes are kept.")
             return
         job["parts"] += 1
         job["done_at_resume"] = len(job["done"])
@@ -3871,7 +3930,28 @@ def report_paths(name):
     f = GARAK_RUNS / name
     prefix = name[:-len(".report.html")]
     return {"garak": f, "jsonl": f.with_name(prefix + ".report.jsonl"), "hitlog": f.with_name(prefix + ".hitlog.jsonl"),
-            "analyst": f.with_name(prefix + ".analyst.html"), "csv": f.with_name(prefix + ".findings.csv")}
+            "analyst": f.with_name(prefix + ".analyst.html"), "csv": f.with_name(prefix + ".findings.csv"),
+            "txt": f.with_name(prefix + ".report.txt")}
+
+
+def write_report_text(jsonl, txt):
+    """The raw report as a text file any editor opens: every record of report.jsonl, laid out over indented lines
+    and numbered, nothing left out. Rewritten only when the report has changed."""
+    if not jsonl.exists() or (txt.exists() and txt.stat().st_mtime >= jsonl.stat().st_mtime):
+        return
+    tmp = txt.with_name(txt.name + ".tmp")
+    with jsonl.open(encoding="utf-8", errors="replace") as src, tmp.open("w", encoding="utf-8") as out:
+        out.write(f"garak report: {jsonl.name}\n")
+        for i, line in enumerate(src, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                body = json.dumps(json.loads(line), indent=2, ensure_ascii=False)
+            except ValueError:
+                body = line  # an unfinished last line (scan stopped mid-write) is kept as it is
+            out.write(f"\n--- record {i} ---\n{body}\n")
+    tmp.replace(txt)
 
 
 def read_raw(name, which):
@@ -3901,12 +3981,17 @@ def show_report(name, which="Full report (report.jsonl)"):
     else:
         garak_view = ('<div class="empty">This scan was stopped before garak wrote its report. The security summary '
                       'and raw data show the results collected before it stopped.</div>')
-    files = [str(paths[k]) for k in ("analyst", "csv", "garak", "jsonl", "hitlog") if paths[k].exists()]
+    try:
+        write_report_text(paths["jsonl"], paths["txt"])
+    except OSError:
+        pass
+    files = [str(paths[k]) for k in ("analyst", "csv", "garak", "jsonl", "txt", "hitlog") if paths[k].exists()]
     return summary, garak_view, read_raw(name, which), files
 
 
 def _delete_run(name):
-    """Every file of one scan run: garak report, raw JSONL, hitlog, summary, CSV. Returns how many were deleted."""
+    """Every file of one scan run: garak report, raw JSONL and its text copy, hitlog, summary, CSV. Returns how many
+    were deleted."""
     prefix = name[:-len(".report.html")]
     removed = 0
     for f in list(GARAK_RUNS.iterdir()):
@@ -4381,7 +4466,8 @@ with gr.Blocks(title="LLM Scanner") as ui:
                 rep_confirm = gr.Checkbox(value=False, visible=False)
                 rep_picked = gr.State([])                                   # what is ticked, to spot new ticks
                 rep_shown = gr.State(_reports[0][1] if _reports else None)  # the report the tabs below display
-                with gr.Accordion("Download files (summary HTML, findings CSV, garak HTML, raw JSONL)", open=False):
+                with gr.Accordion("Download files (summary HTML, findings CSV, garak HTML, raw JSONL, raw report as text)",
+                                  open=False):
                     rep_files = gr.File(show_label=False, file_count="multiple")
             with gr.Tabs(elem_classes="subtabs"):
                 with gr.Tab("Security summary"):

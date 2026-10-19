@@ -1150,24 +1150,33 @@ class ProbeTimeTags(TempDataTest):
         self.enterContext(mock.patch.object(app, "PROBE_SIZES_FILE", self.tmp / "data" / "probe_sizes.json"))
         self.enterContext(mock.patch.object(app, "BUNDLED_PROBE_SIZES", self.tmp / "bundled.json"))
         self.enterContext(mock.patch.dict(app.PROBE_SIZES, clear=True))
+        self.enterContext(mock.patch.dict(app.PROBE_REPLY_TOKENS, clear=True))
 
     def test_levels(self):
         app.PROBE_SIZES.update({"a.Few": 30, "a.Some": 31, "a.Many": 151, "tap.TAP": 0, "fileformats.HF_Files": 0})
         with mock.patch.dict(app.CATALOG, {"fileformats.HF_Files": {"module": "fileformats"}}):
             costs = app.probe_costs()
-        self.assertEqual(costs["a.Few"], ["Low", 30])
-        self.assertEqual(costs["a.Some"], ["Medium", 31])
-        self.assertEqual(costs["a.Many"], ["High", 151])
-        self.assertEqual(costs["tap.TAP"], ["High", 0], "prompts written by an attacker model during the scan")
-        self.assertEqual(costs["fileformats.HF_Files"], ["Low", 0], "inspects files, sends nothing")
+        self.assertEqual(costs["a.Few"], ["Low", 30, 0])
+        self.assertEqual(costs["a.Some"], ["Medium", 31, 0])
+        self.assertEqual(costs["a.Many"], ["High", 151, 0])
+        self.assertEqual(costs["tap.TAP"], ["High", 0, 0], "prompts written by an attacker model during the scan")
+        self.assertEqual(costs["fileformats.HF_Files"], ["Low", 0, 0], "inspects files, sends nothing")
+
+    def test_long_replies_count_as_more_work(self):
+        app.PROBE_SIZES.update({"divergence.Repeat": 36})
+        self.enterContext(mock.patch.dict(app.PROBE_REPLY_TOKENS, {"divergence.Repeat": 1024}, clear=True))
+        self.assertEqual(app.probe_costs()["divergence.Repeat"], ["High", 36, 1024],
+                         "36 prompts whose replies run 7x longer took days, not minutes")
         self.assertIn('id="probe-costs"', app.probe_costs_html())
 
     def test_counts_again_only_after_a_garak_update(self):
-        app.BUNDLED_PROBE_SIZES.write_text(json.dumps({"garak": app.GARAK_VERSION, "probes": {"a.B": 5}}))
+        app.BUNDLED_PROBE_SIZES.write_text(json.dumps({"garak": app.GARAK_VERSION, "probes": {"a.B": 5},
+                                                       "reply_tokens": {"a.B": 1024}}))
         with mock.patch.object(app.subprocess, "run") as run:
             app.measure_probe_sizes()
         run.assert_not_called()
         self.assertEqual(app.PROBE_SIZES, {"a.B": 5})
+        self.assertEqual(app.PROBE_REPLY_TOKENS["a.B"], 1024)
         app.BUNDLED_PROBE_SIZES.write_text(json.dumps({"garak": "0.0.1", "probes": {"a.B": 5}}))
         fresh = json.dumps({"garak": app.GARAK_VERSION, "probes": {"a.B": 7}})
         with mock.patch.object(app.subprocess, "run", return_value=mock.Mock(stdout=fresh)) as run:
@@ -1381,6 +1390,33 @@ class ScanSurvivesPageClose(TempDataTest):
             self.assertEqual(proc.poll(), 0, "the scan process blocked after the page was closed")
             self.assertIsNone(app._proc["p"], "the app still thinks a scan is running")
             unload.assert_called()
+
+
+class ScanHuggingFaceDownloads(TempDataTest):
+    """garak downloads detector models and datasets from Hugging Face mid-scan; a refusal is explained, not retried."""
+
+    def test_explains_refusals(self):
+        with mock.patch.object(app, "read_settings", return_value={"hf_token": "hf_saved"}):
+            why = app.explain_hf_failure("requests.exceptions.HTTPError: 401 Client Error: Unauthorized for url: "
+                                         "https://huggingface.co/garak-llm/toxic-comment-model/resolve/main/config.json")
+        self.assertIn("rejected the token", why)
+        self.assertIn("saved in LLM Scanner", why)
+        self.assertIn("gated", app.explain_hf_failure("huggingface_hub.errors.GatedRepoError: 403 Client Error."))
+        self.assertIn("too many requests", app.explain_hf_failure("429 Client Error: Too Many Requests for url: https://huggingface.co/x"))
+        self.assertEqual(app.explain_hf_failure("probes.dan.DanInTheWild:  40%|####  | 103/256"), "")
+        self.assertEqual(app.explain_hf_failure("dan.DanInTheWild   mitigation.MitigationBypass: PASS ok on 401/401"), "",
+                         "a result line that happens to contain 401 is not a download failure")
+
+    def test_scan_uses_the_saved_token(self):
+        job = {"model": "m", "scan_type": "x", "requested": [], "queue": [], "done": [], "failed": [],
+               "generations": 1, "timeout": 60, "thinking": False, "prefix": "m_1", "parts": 1, "stalls": 0}
+        with mock.patch.object(app, "read_settings", return_value={"hf_token": "hf_saved"}), \
+                mock.patch.object(app.subprocess, "Popen") as popen, mock.patch.object(app, "pump_output"), \
+                mock.patch.object(app.threading, "Thread"):
+            popen.return_value.pid = 1
+            app._launch_scan(job)
+        self.assertEqual(popen.call_args.kwargs["env"]["HF_TOKEN"], "hf_saved")
+        app._proc["p"] = None
 
 
 class ScanResume(TempDataTest):
@@ -1641,6 +1677,20 @@ def write_run(folder, prefix, *, complete=True, evals=True, hits=True):
 
 
 class Reports(TempDataTest):
+    def test_raw_report_as_text(self):
+        write_run(app.GARAK_RUNS, "m_20260917-100000")
+        name = "m_20260917-100000.report.html"
+        *_, files = app.show_report(name)
+        txt = app.GARAK_RUNS / "m_20260917-100000.report.txt"
+        self.assertIn(str(txt), files, "offered for download next to the JSONL")
+        text = txt.read_text(encoding="utf-8")
+        self.assertIn("--- record 1 ---", text)
+        self.assertIn('"probe": "dan.DanInTheWild"', text, "records are laid out readably, nothing dropped")
+        self.assertIn("{garbled", text, "an unfinished last line is kept as it is")
+        before = txt.stat().st_mtime_ns
+        app.show_report(name)
+        self.assertEqual(txt.stat().st_mtime_ns, before, "not rewritten while the report is unchanged")
+
     def test_complete_run_summary(self):
         write_run(app.GARAK_RUNS, "m_20260917-100000")
         data = analyst_report.parse(app.GARAK_RUNS / "m_20260917-100000.report.jsonl")
@@ -1681,7 +1731,7 @@ class Reports(TempDataTest):
         self.assertTrue(choices[0][0].startswith("x_m "))
         summary, garak_view, raw, files = app.show_report(choices[0][1])
         self.assertIn("iframe", summary)
-        self.assertEqual(len(files), 5)
+        self.assertEqual(len(files), 6)  # summary, CSV, garak HTML, JSONL, its text copy, hitlog
         self.assertIn("evil", app.read_raw(choices[0][1], "Hitlog (failing responses)"))
 
     def test_stopped_scan_with_results_is_listed(self):

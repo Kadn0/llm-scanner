@@ -96,8 +96,9 @@
   // and the hover explanation are unchanged; Gradio reuses rows when the list is filtered, so each tag follows its
   // row's checkbox.
   let probeCosts = {}, probeCostsRaw = null, tagTimer = 0;
-  const costTip = (level, n) => (n
+  const costTip = (level, n, tokens) => (n
     ? `Sends ${n} prompt${n === 1 ? '' : 's'}, each once per attempt (Attempts per prompt on the Scan tab, 3 by default), so about ${n * 3} replies to wait for.`
+      + (tokens ? ` Each reply may run to ${tokens} tokens, about ${Math.round(tokens / 150)} times a normal reply, and this probe asks for text that never ends, so every reply runs that long.` : '')
     : level === 'Low' ? "Sends no prompts; it inspects the model's files instead."
       : 'An attacker model or a search writes the prompts during the scan, often over many turns, so it is among the slowest probes.');
   const tagProbes = () => {
@@ -111,15 +112,15 @@
       const cost = name && probeCosts[name];
       let tag = label.querySelector(':scope > .probe-cost');
       if (!cost) { tag?.remove(); return; }
-      const [level, n] = cost;
-      const key = `${name}|${level}|${n}`;
+      const [level, n, tokens] = cost;
+      const key = `${name}|${level}|${n}|${tokens}`;
       if (tag && tag.dataset.key === key) return;
       if (!tag) { tag = document.createElement('span'); label.appendChild(tag); }
       tag.dataset.key = key;
       tag.className = `probe-cost ${level.toLowerCase()}`;
       tag.textContent = `${level} · ${n || (level === 'Low' ? 'none' : 'generated')}`;
       tag.dataset.tipTitle = `${level} time: ${n ? `${n} prompt${n === 1 ? '' : 's'}` : level === 'Low' ? 'no prompts' : 'prompts written during the scan'}`;
-      tag.dataset.tip = costTip(level, n);
+      tag.dataset.tip = costTip(level, n, tokens);
     });
   };
   new MutationObserver(() => { clearTimeout(tagTimer); tagTimer = setTimeout(tagProbes, 30); })
