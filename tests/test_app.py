@@ -1142,6 +1142,41 @@ class ImageModels(TempDataTest):
 
 
 # ---------------------------------------------------------------- probes, groups, scans
+class ProbeTimeTags(TempDataTest):
+    """Each probe is tagged Low / Medium / High by how many prompts it sends, counted once per garak version."""
+
+    def setUp(self):
+        super().setUp()
+        self.enterContext(mock.patch.object(app, "PROBE_SIZES_FILE", self.tmp / "data" / "probe_sizes.json"))
+        self.enterContext(mock.patch.object(app, "BUNDLED_PROBE_SIZES", self.tmp / "bundled.json"))
+        self.enterContext(mock.patch.dict(app.PROBE_SIZES, clear=True))
+
+    def test_levels(self):
+        app.PROBE_SIZES.update({"a.Few": 30, "a.Some": 31, "a.Many": 151, "tap.TAP": 0, "fileformats.HF_Files": 0})
+        with mock.patch.dict(app.CATALOG, {"fileformats.HF_Files": {"module": "fileformats"}}):
+            costs = app.probe_costs()
+        self.assertEqual(costs["a.Few"], ["Low", 30])
+        self.assertEqual(costs["a.Some"], ["Medium", 31])
+        self.assertEqual(costs["a.Many"], ["High", 151])
+        self.assertEqual(costs["tap.TAP"], ["High", 0], "prompts written by an attacker model during the scan")
+        self.assertEqual(costs["fileformats.HF_Files"], ["Low", 0], "inspects files, sends nothing")
+        self.assertIn('id="probe-costs"', app.probe_costs_html())
+
+    def test_counts_again_only_after_a_garak_update(self):
+        app.BUNDLED_PROBE_SIZES.write_text(json.dumps({"garak": app.GARAK_VERSION, "probes": {"a.B": 5}}))
+        with mock.patch.object(app.subprocess, "run") as run:
+            app.measure_probe_sizes()
+        run.assert_not_called()
+        self.assertEqual(app.PROBE_SIZES, {"a.B": 5})
+        app.BUNDLED_PROBE_SIZES.write_text(json.dumps({"garak": "0.0.1", "probes": {"a.B": 5}}))
+        fresh = json.dumps({"garak": app.GARAK_VERSION, "probes": {"a.B": 7}})
+        with mock.patch.object(app.subprocess, "run", return_value=mock.Mock(stdout=fresh)) as run:
+            app.measure_probe_sizes()
+        self.assertIn("probe_sizes.py", run.call_args[0][0][-1])
+        self.assertEqual(app.PROBE_SIZES["a.B"], 7)
+        self.assertEqual(json.loads(app.PROBE_SIZES_FILE.read_text())["probes"], {"a.B": 7}, "saved for next time")
+
+
 class ProbesAndGroups(TempDataTest):
     def test_catalog_loaded(self):
         self.assertGreater(len(app.CATALOG), 20)

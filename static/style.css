@@ -630,3 +630,12 @@ a.mt-model-name:hover { color:#2997ff !important; text-decoration:underline !imp
 .report-list label { cursor:pointer; }
 .report-list label.viewing { box-shadow:inset 3px 0 0 #2997ff; }
 .report-list label.viewing:not(:has(input:checked)) { background:#1d1d1f !important; }
+
+/* Probes tab: Low / Medium / High time tag at the end of each probe's row (added by app.js). */
+.probe-list label { display:flex !important; align-items:center; gap:10px; }
+.probe-list label > span:not(.probe-cost) { flex:1 1 auto; min-width:0; }
+.probe-cost { flex:0 0 auto; margin-left:auto; padding:2px 9px; border-radius:980px; font-size:11.5px; font-weight:600;
+       letter-spacing:.01em; white-space:nowrap; font-variant-numeric:tabular-nums; cursor:help; }
+.probe-cost.low { background:rgba(48,209,88,.14); color:#30d158; }
+.probe-cost.medium { background:rgba(255,159,10,.15); color:#ff9f0a; }
+.probe-cost.high { background:rgba(255,69,58,.15); color:#ff6961; }

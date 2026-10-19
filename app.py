@@ -2759,6 +2759,59 @@ try:
     GARAK_VERSION = importlib.metadata.version("garak")  # (a garak update restarts the app, so this stays current)
 except importlib.metadata.PackageNotFoundError:
     GARAK_VERSION = "not installed"
+
+# How many prompts each probe sends, to tag it Low / Medium / High on the Probes tab. The repository ships counts for
+# the garak version it was released with; after a garak update they are measured again once, in the background.
+PROBE_SIZES_FILE = DATA_DIR / "probe_sizes.json"
+BUNDLED_PROBE_SIZES = APP_DIR / "probe_sizes.json"
+LOW_PROMPTS, MEDIUM_PROMPTS = 30, 150  # up to 30 prompts is Low, up to 150 Medium, more is High
+PROBE_SIZES = {}
+
+
+def _stored_probe_sizes():
+    for f in (PROBE_SIZES_FILE, BUNDLED_PROBE_SIZES):
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(d, dict) and d.get("garak") == GARAK_VERSION and isinstance(d.get("probes"), dict):
+            return d["probes"]
+    return None
+
+
+def measure_probe_sizes():
+    """Load the prompt counts for this garak version, counting them (about a minute, at low priority) if needed."""
+    sizes = _stored_probe_sizes()
+    if sizes is None and GARAK_VERSION != "not installed":
+        try:
+            out = subprocess.run(["nice", "-n", "10", PY, str(APP_DIR / "probe_sizes.py")], capture_output=True,
+                                 text=True, timeout=900)
+            d = json.loads(out.stdout)
+            PROBE_SIZES_FILE.write_text(json.dumps(d, sort_keys=True), encoding="utf-8")
+            sizes = d["probes"]
+        except Exception as e:
+            print(f"Could not count the prompts of garak's probes: {e}", flush=True)
+            return
+    PROBE_SIZES.update(sizes or {})
+
+
+def probe_costs():
+    """{probe: [level, prompt count]} for the probes whose size is known; 0 prompts means generated or none sent."""
+    out = {}
+    for name, n in PROBE_SIZES.items():
+        if n == 0:
+            files_only = CATALOG.get(name, {}).get("module") == "fileformats" or name.endswith("TokenizerHF")
+            out[name] = ["Low" if files_only else "High", 0]
+        else:
+            out[name] = ["Low" if n <= LOW_PROMPTS else "Medium" if n <= MEDIUM_PROMPTS else "High", n]
+    return out
+
+
+def probe_costs_html():
+    return f'<div id="probe-costs" hidden data-costs="{html.escape(json.dumps(probe_costs()))}"></div>'
+
+
+PROBE_SIZES.update(_stored_probe_sizes() or {})
 MODULES = sorted({v["module"] for v in CATALOG.values()})
 
 
@@ -4256,6 +4309,7 @@ with gr.Blocks(title="LLM Scanner") as ui:
                     _init = filtered_probes("", "All categories", False)
                     gr.HTML('<div id="probe-tips" hidden data-tips="' + html.escape(json.dumps(
                         {n: probe_tip(n) for n in CATALOG})) + '"></div>', elem_classes="hidden-control")
+                    probe_costs_view = gr.HTML(probe_costs_html(), elem_classes="hidden-control")
                     probe_list = gr.CheckboxGroup(choices=[(probe_label(n), n) for n in _init], show_label=False,
                                                   elem_classes="probe-list")
                     probe_count.value = f"Showing {len(_init)} of {len(CATALOG)} probes."
@@ -4466,6 +4520,7 @@ with gr.Blocks(title="LLM Scanner") as ui:
                      js="(names, c, shown, which) => [names, !!(names && names.length), shown, which]",
                      show_progress="hidden")
 
+    ui.load(probe_costs_html, outputs=probe_costs_view, show_progress="hidden")
     ui.load(refresh_all, chat_state, [models_version, scan_model, status, scan_type, group_pick, chat_model],
             show_progress="hidden").then(
         model_hint, scan_model, [model_note, tmo], show_progress="hidden").then(
@@ -4551,6 +4606,7 @@ if __name__ == "__main__":
         if (job := _load_scan_job()) and not job.get("halted"):  # a halted scan waits for Continue
             _resume["waiting"] = True  # set before the page can load, so it shows the pending resume
             threading.Thread(target=resume_interrupted_scan, daemon=True).start()
+        threading.Thread(target=measure_probe_sizes, daemon=True).start()  # only does work after a garak update
         threading.Thread(target=check_updates, daemon=True).start()  # once at startup; after that, on request
     ui.queue().launch(server_name="127.0.0.1", server_port=int(os.environ.get("LLM_SCANNER_PORT", 7861)),
                       inbrowser="--no-browser" not in sys.argv, allowed_paths=[str(GARAK_RUNS), str(ATTACH_DIR), str(IMAGES_DIR)],

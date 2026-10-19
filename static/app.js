@@ -91,6 +91,40 @@
   });
   document.addEventListener('scroll', hideTip, true);
 
+  // Probes tab: a Low / Medium / High tag on every probe, from how many prompts it sends (the hidden #probe-costs
+  // table), so the long ones stand out before a scan. Added beside the label text, never into it, so search, ticking
+  // and the hover explanation are unchanged; Gradio reuses rows when the list is filtered, so each tag follows its
+  // row's checkbox.
+  let probeCosts = {}, probeCostsRaw = null, tagTimer = 0;
+  const costTip = (level, n) => (n
+    ? `Sends ${n} prompt${n === 1 ? '' : 's'}, each once per attempt (Attempts per prompt on the Scan tab, 3 by default), so about ${n * 3} replies to wait for.`
+    : level === 'Low' ? "Sends no prompts; it inspects the model's files instead."
+      : 'An attacker model or a search writes the prompts during the scan, often over many turns, so it is among the slowest probes.');
+  const tagProbes = () => {
+    const raw = document.querySelector('#probe-costs')?.dataset.costs;
+    if (raw && raw !== probeCostsRaw) {
+      try { probeCosts = JSON.parse(raw); } catch (err) { probeCosts = {}; }
+      probeCostsRaw = raw;
+    }
+    document.querySelectorAll('.probe-list label').forEach((label) => {
+      const name = label.querySelector('input')?.name;
+      const cost = name && probeCosts[name];
+      let tag = label.querySelector(':scope > .probe-cost');
+      if (!cost) { tag?.remove(); return; }
+      const [level, n] = cost;
+      const key = `${name}|${level}|${n}`;
+      if (tag && tag.dataset.key === key) return;
+      if (!tag) { tag = document.createElement('span'); label.appendChild(tag); }
+      tag.dataset.key = key;
+      tag.className = `probe-cost ${level.toLowerCase()}`;
+      tag.textContent = `${level} · ${n || (level === 'Low' ? 'none' : 'generated')}`;
+      tag.dataset.tipTitle = `${level} time: ${n ? `${n} prompt${n === 1 ? '' : 's'}` : level === 'Low' ? 'no prompts' : 'prompts written during the scan'}`;
+      tag.dataset.tip = costTip(level, n);
+    });
+  };
+  new MutationObserver(() => { clearTimeout(tagTimer); tagTimer = setTimeout(tagProbes, 30); })
+    .observe(document.body, {subtree: true, childList: true, attributes: true, attributeFilter: ['name', 'data-costs']});
+
   // Repository/Version options only reach the page as plain text ("PQ2_0   7.5 GB VRAM + 2.3 GB RAM",
   // "llama3.2   1.2M pulls   tools, vision"), so lay each one out instead of one run-on line: repository results
   // get a name plus muted meta on the right; version rows get the name left-aligned (with a red no-entry icon
