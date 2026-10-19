@@ -1194,6 +1194,40 @@ class RedTeamTools(TempDataTest):
         self.assertEqual(link, "")
 
 
+class PyritLauncher(TempDataTest):
+    """The Red team tools page starts and stops PyRIT's own web interface, on this computer only."""
+
+    def setUp(self):
+        super().setUp()
+        self.backend = self.tmp / "pyrit/bin/pyrit_backend"
+        self.enterContext(mock.patch.object(app, "PYRIT_BACKEND", self.backend))
+        self.enterContext(mock.patch.object(app, "PYRIT_DATA", self.tmp / "data/pyrit"))
+        self.enterContext(mock.patch.dict(app._pyrit, {"p": None}))
+
+    def test_hidden_when_not_installed(self):
+        status, start, stop, link = app.pyrit_view()
+        self.assertFalse(start["visible"], "no Start button without PyRIT installed")
+
+    def test_start_and_stop(self):
+        self.backend.parent.mkdir(parents=True)
+        self.backend.write_text("")
+        answers = iter([False, False, False, True])  # not yet, not yet (twice per loop), then answering
+        with mock.patch.object(app, "_pyrit_answers", side_effect=lambda: next(answers, True)), \
+                mock.patch.object(app.subprocess, "Popen") as popen, mock.patch.object(app.time, "sleep"):
+            popen.return_value.poll.return_value = None
+            views = list(app.start_pyrit())
+        cmd = popen.call_args[0][0]
+        self.assertEqual(cmd[cmd.index("--host") + 1], "127.0.0.1", "never reachable from other computers")
+        self.assertIn("starting", views[0][0])
+        self.assertIn("running on this computer only", views[-1][0])
+        self.assertIn("Open PyRIT", views[-1][3])
+        with mock.patch.object(app.os, "killpg") as kill, mock.patch.object(app, "_pyrit_answers", return_value=False):
+            status, start, stop, link = app.stop_pyrit()
+        kill.assert_called()
+        self.assertIn("stopped", status)
+        self.assertEqual(link, "")
+
+
 class ProbeTimeTags(TempDataTest):
     """Each probe is tagged Low / Medium / High by how much work it is: its prompts, how long its replies may run, how
     long its prompts are to read, its turns, and whether an AI model judges every reply. Measured once per garak

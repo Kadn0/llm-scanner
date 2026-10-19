@@ -4295,6 +4295,11 @@ PROMPTFOO_PORT = int(os.environ.get("LLM_SCANNER_PROMPTFOO_PORT", 15500))
 PROMPTFOO_URL = f"http://127.0.0.1:{PROMPTFOO_PORT}"
 PROMPTFOO_DATA = DATA_DIR / "promptfoo"
 PYRIT_PY = Path.home() / ".local/pyrit/bin/python"
+PYRIT_BACKEND = Path.home() / ".local/pyrit/bin/pyrit_backend"  # serves PyRIT's own web interface
+PYRIT_PORT = int(os.environ.get("LLM_SCANNER_PYRIT_PORT", 15600))
+PYRIT_URL = f"http://127.0.0.1:{PYRIT_PORT}"
+PYRIT_DATA = DATA_DIR / "pyrit"
+_pyrit = {"p": None}
 PYRIT_DOCS = "https://azure.github.io/PyRIT/"
 PROMPTFOO_DOCS = "https://www.promptfoo.dev/docs/red-team/quickstart/"
 _promptfoo = {"p": None}
@@ -4490,16 +4495,16 @@ def stop_promptfoo():
     return redteam_view()
 
 
-def _stop_promptfoo_at_exit():
-    p = _promptfoo["p"]
-    if p and p.poll() is None:
-        try:
-            os.killpg(p.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+def _stop_tools_at_exit():
+    for p in (_promptfoo["p"], _pyrit["p"]):
+        if p and p.poll() is None:
+            try:
+                os.killpg(p.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
 
 
-atexit.register(_stop_promptfoo_at_exit)  # started from this app, so it ends with it
+atexit.register(_stop_tools_at_exit)  # promptfoo and PyRIT were started from this app, so end with it
 
 
 def promptfoo_targets_html():
@@ -4514,15 +4519,81 @@ def promptfoo_targets_html():
 
 def pyrit_html():
     v = pyrit_version()
+    docs = f'<a href="{PYRIT_DOCS}" target="_blank" rel="noopener">PyRIT documentation</a>'
     if not v:
-        return ('<p class="sub">PyRIT is not installed on this computer. It is a Python library for scripted red-team '
-                f'attacks, without an interface of its own. <a href="{PYRIT_DOCS}" target="_blank" rel="noopener">'
-                'PyRIT documentation</a></p>')
-    return (f'<p class="sub">PyRIT {html.escape(v)} is installed in <code>~/.local/pyrit</code>. It is a Python library '
-            'with no interface of its own, so it is used from scripts or notebooks with its own Python: '
-            f'<code>{html.escape(str(PYRIT_PY))}</code>. Point its OpenAI-compatible target at Ollama '
-            f'(<code>{html.escape(OLLAMA)}/v1</code>) to test your local models. '
-            f'<a href="{PYRIT_DOCS}" target="_blank" rel="noopener">PyRIT documentation</a></p>')
+        return f'<p class="sub">PyRIT is not installed on this computer (it goes in ~/.local/pyrit). {docs}</p>'
+    return (f'<p class="sub">PyRIT {html.escape(v)}\'s own web interface. It runs on this computer only, uses PyRIT\'s '
+            'settings in <code>~/.pyrit</code>, and only runs while started here. It takes about half a minute to '
+            f'start. {docs}</p>')
+
+
+def _pyrit_ours():
+    p = _pyrit["p"]
+    return bool(p and p.poll() is None)
+
+
+def _pyrit_answers():
+    try:
+        return requests.get(f"{PYRIT_URL}/api/health", timeout=2).ok
+    except requests.RequestException:
+        return False
+
+
+def pyrit_view():
+    """(PyRIT status line, Start, Stop, Open link) for the current state."""
+    if not PYRIT_BACKEND.exists():
+        return "", gr.update(visible=False), gr.update(visible=False), ""
+    link = (f'<a class="pf-open" href="{PYRIT_URL}" target="_blank" rel="noopener">Open PyRIT</a>'
+            f'<span class="pf-url">{PYRIT_URL}</span>')
+    if _pyrit_ours():
+        if _pyrit_answers():
+            return (note_html(f"PyRIT is running on this computer only, at {PYRIT_URL}."), gr.update(visible=False),
+                    gr.update(visible=True, interactive=True), link)
+        return (note_html("PyRIT is starting...", "loading"), gr.update(visible=False),
+                gr.update(visible=True, interactive=True), "")
+    if _pyrit_answers():
+        return (note_html(f"Something else is already serving {PYRIT_URL}, probably PyRIT started from a terminal. "
+                          "Open it, or stop it there to start it from here."),
+                gr.update(visible=True, interactive=False), gr.update(visible=False), link)
+    return (note_html("PyRIT is stopped. Nothing runs until you start it."), gr.update(visible=True, interactive=True),
+            gr.update(visible=False), "")
+
+
+def start_pyrit():
+    """Start PyRIT's web interface and show it starting until it answers (it loads for about half a minute)."""
+    if not PYRIT_BACKEND.exists() or _pyrit_ours() or _pyrit_answers():
+        yield pyrit_view()
+        return
+    PYRIT_DATA.mkdir(parents=True, exist_ok=True)
+    log = (PYRIT_DATA / "server.log").open("w")
+    _pyrit["p"] = subprocess.Popen([str(PYRIT_BACKEND), "--host", "127.0.0.1", "--port", str(PYRIT_PORT)],
+                                   cwd=PYRIT_DATA, env=os.environ | {"OLLAMA_URL": OLLAMA}, stdout=log,
+                                   stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+    log.close()
+    deadline = time.time() + 180
+    while _pyrit_ours() and not _pyrit_answers() and time.time() < deadline:
+        yield pyrit_view()
+        time.sleep(2)
+    if not _pyrit_ours():
+        tail = (PYRIT_DATA / "server.log").read_text(errors="replace").strip().splitlines()[-3:]
+        yield (note_html("PyRIT stopped right after starting: " + " ".join(tail)[-300:], "error"),
+               gr.update(visible=True, interactive=True), gr.update(visible=False), "")
+        return
+    yield pyrit_view()
+
+
+def stop_pyrit():
+    p = _pyrit["p"]
+    if p and p.poll() is None:
+        try:
+            os.killpg(p.pid, signal.SIGTERM)
+            p.wait(15)
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    _pyrit["p"] = None
+    return pyrit_view()
 
 
 CSS = (APP_DIR / "static" / "style.css").read_text(encoding="utf-8")
@@ -4904,6 +4975,11 @@ with gr.Blocks(title="LLM Scanner") as ui:
             with gr.Column(elem_classes="card"):
                 gr.HTML('<h2>PyRIT</h2>')
                 pyrit_info = gr.HTML()
+                py_status = gr.HTML(elem_classes="note")
+                with gr.Row():
+                    py_start = gr.Button("Start PyRIT", variant="primary", scale=0, min_width=180)
+                    py_stop = gr.Button("Stop PyRIT", variant="stop", scale=0, min_width=180, visible=False)
+                    py_link = gr.HTML(elem_classes="pf-link")
 
     # status
     status_outputs = [status, unload_btn, start_btn, stop_ollama_btn, restart_ollama_btn, ollama_status, activity]
@@ -5038,6 +5114,10 @@ with gr.Blocks(title="LLM Scanner") as ui:
     ui.load(redteam_view, outputs=pf_outputs, show_progress="hidden")
     ui.load(promptfoo_targets_html, outputs=pf_targets, show_progress="hidden")
     ui.load(pyrit_html, outputs=pyrit_info, show_progress="hidden")
+    py_outputs = [py_status, py_start, py_stop, py_link]
+    py_start.click(start_pyrit, outputs=py_outputs, show_progress="hidden")
+    py_stop.click(stop_pyrit, outputs=py_outputs, show_progress="hidden")
+    ui.load(pyrit_view, outputs=py_outputs, show_progress="hidden")
     ui.load(refresh_all, chat_state, [models_version, scan_model, status, scan_type, group_pick, chat_model],
             show_progress="hidden").then(
         model_hint, scan_model, [model_note, tmo], show_progress="hidden").then(

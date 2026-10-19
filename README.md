@@ -16,8 +16,8 @@ security weaknesses with [garak](https://github.com/NVIDIA/garak). It runs entir
 - **Scanning**: garak probes, saved probe groups, a live progress bar, and a security-analyst report with OWASP
   LLM Top 10 mapping, evidence, remediation, and the raw garak data. Scans can be paused, a stuck probe is
   detected and restarted, and finished probes are never lost.
-- **Red team tools**: start and stop promptfoo's own web interface (evals and red-team runs) from the app, on this
-  computer only, with your installed models listed as promptfoo targets.
+- **Red team tools**: start and stop the own web interfaces of promptfoo (evals and red-team runs) and PyRIT from
+  the app, on this computer only, with your installed models listed as promptfoo targets.
 - **Housekeeping**: models load only while in use, a live GPU/RAM status bar, start at boot, and one-click
   verified updates for LLM Scanner, Ollama, and garak.
 
@@ -188,6 +188,9 @@ It lists what will be deleted and asks before doing anything.
 
 ## Changelog
 
+- **1.1.6**: The Red team tools page can start and stop PyRIT's own web interface (when PyRIT is installed in
+  `~/.local/pyrit`), on this computer only and with PyRIT's settings in `~/.pyrit`, so it is used without the command
+  line. It shows PyRIT starting, links to it once it runs, and stops with LLM Scanner.
 - **1.1.5**: Hugging Face no longer holds up a scan. Scans run offline from Hugging Face first, using the files earlier
   scans downloaded, and only a probe that needs a file not downloaded yet goes online for it, so most scans make no
   Hugging Face requests at all. A token Hugging Face rejects is found before going online and simply not sent; "too
