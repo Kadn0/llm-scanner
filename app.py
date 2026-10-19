@@ -1,20 +1,24 @@
 """LLM Scanner - a local GUI for pulling models into Ollama and scanning them with garak."""
 
+import atexit
 import base64
 import bisect
 import codecs
 import concurrent.futures
 import functools
+import hashlib
 import html
 import importlib.metadata
 import importlib.util
 import json
 import os
+import platform
 import re
 import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import urllib.parse
@@ -113,10 +117,45 @@ def mask_token(token):
     return f"{token[:3]}\u2026{token[-4:]}" if len(token) > 12 else "\u2026" if token else ""
 
 
+# Hugging Face limits how often one computer may call it. Every call to its API goes through hf_api_get: answers are
+# reused for a few minutes (a search, then picking a repository, asks for the same lists), no more than 4 requests run
+# at once, and "too many requests" is waited out (as long as Hugging Face asks, up to 30 s) and retried.
+HF_API_CACHE_SECS = 0 if os.environ.get("LLM_SCANNER_CHECK") == "1" else 300  # (tests fake the answers)
+HF_API_TRIES = 4
+_hf_api_cache = {}  # (url, params, headers) -> (time, response)
+_hf_api_lock = threading.Lock()
+_hf_api_slots = threading.BoundedSemaphore(4)
+
+
+def hf_api_get(url, params=None, headers=None, timeout=15):
+    key = (url, json.dumps(params or {}, sort_keys=True), json.dumps(headers or {}, sort_keys=True))
+    with _hf_api_lock:
+        hit = _hf_api_cache.get(key)
+        if hit and time.time() - hit[0] < HF_API_CACHE_SECS:
+            return hit[1]
+    for attempt in range(HF_API_TRIES):
+        with _hf_api_slots:
+            res = requests.get(url, params=params, headers=headers, timeout=timeout)
+        if res.status_code != 429 or attempt == HF_API_TRIES - 1:
+            break
+        try:
+            wait = float(res.headers.get("Retry-After") or 0)
+        except ValueError:
+            wait = 0
+        time.sleep(min(30.0, wait or 2 * 3 ** attempt))  # 2, 6, 18 s unless Hugging Face says otherwise
+    if res.ok and HF_API_CACHE_SECS:
+        with _hf_api_lock:
+            _hf_api_cache[key] = (time.time(), res)
+            if len(_hf_api_cache) > 500:
+                for old in sorted(_hf_api_cache, key=lambda k: _hf_api_cache[k][0])[:100]:
+                    del _hf_api_cache[old]
+    return res
+
+
 def hf_whoami(token):
     """(account name, error) for a token. Both empty means Hugging Face couldn't be reached to check it."""
     try:
-        res = requests.get(f"{HF_API}/whoami-v2", headers={"Authorization": f"Bearer {token}"}, timeout=15)
+        res = hf_api_get(f"{HF_API}/whoami-v2", headers={"Authorization": f"Bearer {token}"}, timeout=15)
     except Exception:
         return "", ""
     if res.status_code in (401, 403):
@@ -1379,7 +1418,7 @@ def hf_download_size(repo):
             best = best_version(usable)
             _hf_size_cache[repo] = next((size for size, tag in usable if tag == best), 0.0)
         except Exception:
-            _hf_size_cache[repo] = 0.0
+            return 0.0  # not remembered: a refused or failed lookup is tried again next time
     return _hf_size_cache[repo]
 
 
@@ -1391,7 +1430,7 @@ def hf_find_repos(query):
     q = repo_from_text(query)
     if "/" in q and q.lower().endswith("gguf"):
         return [{"id": q, "size": hf_download_size(q), "gated": False, "private": False}], q
-    res = requests.get(f"{HF_API}/models", timeout=15, headers=hf_headers(), params={
+    res = hf_api_get(f"{HF_API}/models", timeout=15, headers=hf_headers(), params={
         "search": q.split("/")[-1], "filter": "gguf", "sort": "downloads", "limit": 25,
         "expand[]": ["gated", "private"]})
     res.raise_for_status()
@@ -1440,8 +1479,8 @@ def hf_gguf_catalog(repo):
     A file's tag is what tells it apart from the others in the repo, so it matches what the repository shows:
     Q4_K_M, UD-Q5_K_XL, PQ2_0, dspark-bf16. Repositories name their files differently, so the shared part of the
     names is dropped rather than guessing which part is the quantization."""
-    res = requests.get(f"{HF_API}/models/{repo_from_text(repo)}/tree/main", params={"recursive": "true"},
-                       headers=hf_headers(), timeout=30)
+    res = hf_api_get(f"{HF_API}/models/{repo_from_text(repo)}/tree/main", params={"recursive": "true"},
+                     headers=hf_headers(), timeout=30)
     _check_response(res, f"Listing files of {repo}")
     ggufs = [(e["path"], int(e.get("size") or 0)) for e in res.json()
              if e.get("path", "").lower().endswith(".gguf") and not SHARD_IN_NAME.search(e["path"].lower())]
@@ -1473,7 +1512,7 @@ def hf_repo_info(repo):
     repo = repo_from_text(repo)
     if repo not in _hf_meta:
         try:
-            d = requests.get(f"{HF_API}/models/{repo}", headers=hf_headers(), timeout=15).json()
+            d = hf_api_get(f"{HF_API}/models/{repo}", headers=hf_headers(), timeout=15).json()
             card = d.get("cardData") or {}
             base = card.get("base_model")
             _hf_meta[repo] = {"base": (base[0] if isinstance(base, list) else base) or "",
@@ -1701,8 +1740,9 @@ def response_error(response, operation):
 
 
 def _check_response(response, operation):
-    """4xx means the request itself is wrong and fails for good; 5xx and network errors are retried."""
-    if 400 <= response.status_code < 500:
+    """4xx means the request itself is wrong and fails for good; 5xx, network errors and 429 (Hugging Face asking us to
+    slow down) are retried."""
+    if 400 <= response.status_code < 500 and response.status_code != 429:
         raise PermanentDownloadError(response_error(response, operation))
     response.raise_for_status()
 
@@ -2281,8 +2321,8 @@ def detect_family(repo):
 
 def image_repo_files(repo, family):
     """[(size_gb, path)] of files usable as the main model for this family."""
-    res = requests.get(f"{HF_API}/models/{repo}/tree/main", params={"recursive": "true"}, headers=hf_headers(),
-                       timeout=15)
+    res = hf_api_get(f"{HF_API}/models/{repo}/tree/main", params={"recursive": "true"}, headers=hf_headers(),
+                     timeout=15)
     res.raise_for_status()
     opts = []
     for f in res.json():
@@ -2325,7 +2365,7 @@ def image_search(query):
         else:
             seen, repos = set(), []
             for extra in ({"filter": "gguf"}, {}):
-                res = requests.get(f"{HF_API}/models", timeout=15, headers=hf_headers(), params={
+                res = hf_api_get(f"{HF_API}/models", timeout=15, headers=hf_headers(), params={
                     "search": q, "pipeline_tag": "text-to-image", "sort": "downloads", "limit": 20, **extra})
                 res.raise_for_status()
                 for m in res.json():
@@ -2766,8 +2806,14 @@ PROBE_SIZES_FILE = DATA_DIR / "probe_sizes.json"
 BUNDLED_PROBE_SIZES = APP_DIR / "probe_sizes.json"
 LOW_PROMPTS, MEDIUM_PROMPTS = 30, 150  # up to 30 prompts is Low, up to 150 Medium, more is High
 NORMAL_REPLY_TOKENS = 150  # garak's reply limit; a probe allowed longer replies costs that many times more per prompt
+NORMAL_PROMPT_CHARS = 200  # a typical prompt; reading one token costs about a tenth of writing one
+READ_COST = 0.1
 PROBE_SIZES = {}  # probe -> prompts it sends
 PROBE_REPLY_TOKENS = {}  # probe -> reply limit, for probes that raise it (divergence: "repeat this word forever")
+PROBE_PROMPT_CHARS = {}  # probe -> average prompt length: long prompts take the model longer to read
+PROBE_TURNS = {}  # probe -> average user turns per prompt
+PROBE_JUDGED = set()  # probes whose replies an AI model judges: one more model reply for every reply
+PROBE_SCORING_MODELS = set()  # probes scored by a Hugging Face model, downloaded the first time
 
 
 def _stored_probe_sizes():
@@ -2801,21 +2847,39 @@ def _use_probe_sizes(d):
     if d:
         PROBE_SIZES.update(d.get("probes") or {})
         PROBE_REPLY_TOKENS.update(d.get("reply_tokens") or {})
+        PROBE_PROMPT_CHARS.update(d.get("prompt_chars") or {})
+        PROBE_TURNS.update(d.get("turns") or {})
+        PROBE_JUDGED.update(d.get("judged") or [])
+        PROBE_SCORING_MODELS.update(d.get("scoring_models") or [])
+
+
+def probe_work(name):
+    """How many normal prompts' worth of work one pass of a probe is (attempts multiply every probe alike).
+    Each prompt counts as its reply (garak's limit, or the longer one the probe allows) plus reading the prompt, times
+    its turns, doubled when an AI model judges every reply. So divergence.Repeat, 36 prompts whose replies run to
+    1024 tokens, is about 240 normal prompts, and a long DAN prompt counts as nearly two."""
+    n = PROBE_SIZES.get(name, 0)
+    reply = PROBE_REPLY_TOKENS.get(name) or NORMAL_REPLY_TOKENS
+    read = PROBE_PROMPT_CHARS.get(name, NORMAL_PROMPT_CHARS) / 4 * READ_COST
+    normal = NORMAL_REPLY_TOKENS + NORMAL_PROMPT_CHARS / 4 * READ_COST
+    per_prompt = max(1.0, (reply + read) / normal) * max(1.0, PROBE_TURNS.get(name, 1)) * (
+        2 if name in PROBE_JUDGED else 1)
+    return n * per_prompt
 
 
 def probe_costs():
-    """{probe: [level, prompt count, reply limit or 0]} for the probes whose size is known. 0 prompts means they are
-    generated during the scan or none are sent. A probe that lets replies run longer counts each prompt as that many
-    normal ones, so divergence.Repeat (36 prompts, 1024-token replies) is as slow as about 245 normal prompts."""
+    """{probe: {level, prompts, work, reply_tokens, prompt_chars, judged, downloads, generated, files}} for the probes
+    whose size is known, so the tag's hover can say what makes each probe slow."""
     out = {}
     for name, n in PROBE_SIZES.items():
-        tokens = PROBE_REPLY_TOKENS.get(name, 0)
-        if n == 0:
-            files_only = CATALOG.get(name, {}).get("module") == "fileformats" or name.endswith("TokenizerHF")
-            out[name] = ["Low" if files_only else "High", 0, tokens]
-            continue
-        work = n * max(1.0, tokens / NORMAL_REPLY_TOKENS)
-        out[name] = ["Low" if work <= LOW_PROMPTS else "Medium" if work <= MEDIUM_PROMPTS else "High", n, tokens]
+        files_only = n == 0 and (CATALOG.get(name, {}).get("module") == "fileformats" or name.endswith("TokenizerHF"))
+        generated = n == 0 and not files_only
+        work = probe_work(name)
+        level = ("High" if generated else "Low" if files_only or work <= LOW_PROMPTS else
+                 "Medium" if work <= MEDIUM_PROMPTS else "High")
+        out[name] = {"level": level, "prompts": n, "work": round(work), "reply_tokens": PROBE_REPLY_TOKENS.get(name, 0),
+                     "prompt_chars": PROBE_PROMPT_CHARS.get(name, 0), "judged": name in PROBE_JUDGED,
+                     "downloads": name in PROBE_SCORING_MODELS, "generated": generated, "files": files_only}
     return out
 
 
@@ -3317,9 +3381,39 @@ def _part_name(job, n):
 
 
 # garak downloads detector models and datasets from Hugging Face the first time a probe needs them, which can be hours
-# into a scan. A refused download fails the same way on every retry, so the scan halts at once and says what to fix.
+# into a scan. None of that may hold a scan up: a token Hugging Face rejects is found before the scan and simply not
+# sent (garak's files are public), and a refusal mid-scan is handled on its own: retried without the token, retried
+# after a pause, or that one probe is skipped with the reason, while the rest of the scan carries on.
 HF_FAILURE = re.compile(r"(huggingface|hf\.co|HfHubHTTPError|GatedRepo|RepositoryNotFound|LocalTokenNotFound)", re.I)
 HF_STATUS = re.compile(r"\b(401|403|429)\b|Invalid credentials|Unauthorized|GatedRepo|gated|Too Many Requests", re.I)
+HF_RATE_WAITS = (60, 180, 600)  # pauses (seconds) before retrying after "too many requests"; then the probe is skipped
+# Scans start offline from Hugging Face, using the files earlier scans downloaded: no requests at all, so no rate limit.
+# garak reports a file it doesn't have yet as a detector or probe that failed to load (and would quietly carry on
+# without it), so that restarts the probe online to fetch it; the next scan finds it on disk.
+HF_OFFLINE_MISS = re.compile(r"detector load failed|failed to load probe|outgoing traffic has been disabled|"
+                             r"offline mode|HF_HUB_OFFLINE|LocalEntryNotFound|couldn't find them in the cached files", re.I)
+LOAD_FAILED = re.compile(r"detector load failed: ([\w.]+)|failed to load probe (?:probes\.)?([\w.]+)")
+# Detectors and probes that fail to load even online (perspective.Toxicity needs a Google API key, audio probes need
+# extra packages) aren't missing files, so they must not send a scan online. Learned per garak version, for 30 days.
+UNLOADABLE_FILE = DATA_DIR / "garak_unloadable.json"
+UNLOADABLE_DAYS = 30
+
+
+def _unloadable():
+    try:
+        d = json.loads(UNLOADABLE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(d, dict) or d.get("garak") != GARAK_VERSION:
+        return {}
+    cutoff = time.time() - UNLOADABLE_DAYS * 86400
+    return {n: t for n, t in (d.get("plugins") or {}).items() if isinstance(t, (int, float)) and t > cutoff}
+
+
+def _remember_unloadable(name):
+    known = _unloadable()
+    known[name] = time.time()
+    UNLOADABLE_FILE.write_text(json.dumps({"garak": GARAK_VERSION, "plugins": known}, indent=2), encoding="utf-8")
 
 
 def hf_token_source():
@@ -3329,32 +3423,47 @@ def hf_token_source():
     env = next((n for n in HF_TOKEN_ENV if str(os.environ.get(n) or "").strip()), "")
     if env:
         return f"the {env} environment variable on this computer"
-    hf_home = Path(os.environ.get("HF_HOME") or Path.home() / ".cache/huggingface")
-    if (hf_home / "token").exists():
-        return f"the token `huggingface-cli login` saved in {hf_home / 'token'}"
+    if _hf_login_file().exists():
+        return f"the token `huggingface-cli login` saved in {_hf_login_file()}"
     return ""
 
 
-def explain_hf_failure(line):
-    """A plain explanation of a Hugging Face download garak was refused, or "" if the line isn't one."""
+def _hf_login_file():
+    return Path(os.environ.get("HF_HOME") or Path.home() / ".cache/huggingface") / "token"
+
+
+def _machine_hf_token():
+    """The token garak's downloads would send: the app's, else the environment's, else the login file's."""
+    token = hf_token()
+    if token:
+        return token
+    try:
+        return _hf_login_file().read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def hf_failure_kind(line, without_token=False):
+    """What a line of garak output says about a refused Hugging Face download: "rate" (too many requests),
+    "access" (a gated or private repository), "token" (the token was rejected), or "" if it isn't one."""
     if not (HF_FAILURE.search(line) and HF_STATUS.search(line)):
         return ""
-    source = hf_token_source()
     if re.search(r"\b429\b|Too Many Requests", line, re.I):
-        return ("Hugging Face refused a download garak needs because this computer made too many requests. "
-                + ("Wait a while, then click Continue." if source else
-                   "Save a Hugging Face token with the gear on the Add a model card (downloads with a token have a "
-                   "much higher limit), then click Continue."))
-    if re.search(r"GatedRepo|gated|\b403\b", line, re.I):
-        return ("garak needs a file from a gated Hugging Face repository. Open that repository on Hugging Face, "
-                "accept its conditions with your account, make sure that account's token is saved with the gear on "
-                "the Add a model card, then click Continue.")
-    if source:
-        return (f"Hugging Face rejected the token sent with a download garak needs, so even public files fail. The "
-                f"token comes from {source}. Save a working token with the gear on the Add a model card (or remove "
-                "the old one), then click Continue.")
-    return ("Hugging Face refused a download garak needs. Save a Hugging Face token with the gear on the Add a model "
-            "card, then click Continue.")
+        return "rate"
+    if re.search(r"GatedRepo|gated|\b403\b", line, re.I) or without_token or not hf_token_source():
+        return "access"  # refused even without a token: the file isn't public
+    return "token"
+
+
+def hf_reason(kind):
+    if kind == "token":
+        return (f"Hugging Face rejected the token from {hf_token_source() or 'this computer'} for a download garak "
+                "needs; garak's files are public, so the probe was restarted without a token")
+    if kind == "rate":
+        return "Hugging Face limited downloads from this computer (too many requests), so the probe is retried after a pause"
+    return ("a file this probe needs is in a gated or private Hugging Face repository that can't be opened, so the "
+            "probe was skipped (to include it, accept the repository's conditions on Hugging Face and save that "
+            "account's token with the gear on the Add a model card)")
 
 
 def _launch_scan(job, note=""):
@@ -3371,14 +3480,26 @@ def _launch_scan(job, note=""):
         cmd += ["--probes", ",".join(remaining)]
     env = os.environ | {"PYTHONUNBUFFERED": "1", "TERM": "dumb", "PYTHONIOENCODING": "utf-8",
                         "LLM_SCANNER_THINK": "1" if job["thinking"] else "0", "LLM_SCANNER_MODEL": job["model"]}
-    saved_token = str(read_settings().get("hf_token") or "").strip()
-    if saved_token:  # checked with Hugging Face when it was saved; takes precedence over an old login on this machine
-        env["HF_TOKEN"] = saved_token
+    if not job.get("hf_online"):
+        env.update(HF_HUB_OFFLINE="1", HF_DATASETS_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
+    elif not job.get("hf_checked"):  # once per scan: a token Hugging Face rejects would break even public downloads
+        job["hf_checked"] = True
+        token = _machine_hf_token()
+        if token and hf_whoami(token)[1]:  # (if Hugging Face can't be reached, nothing is decided)
+            job["hf_no_token"] = True
+            note += (f"The Hugging Face token from {hf_token_source()} was rejected, so garak downloads its files "
+                     "without one.\n")
+    if job.get("hf_no_token"):
+        for name in HF_TOKEN_ENV:
+            env.pop(name, None)
+        env["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"  # nor the token `huggingface-cli login` saved
+    elif saved_token := str(read_settings().get("hf_token") or "").strip():
+        env["HF_TOKEN"] = saved_token  # checked when it was saved; preferred over an old login on this machine
     progress = ScanProgress(job["queue"], job["done"], job["failed"], job.get("skipped", []))
     buf, cur = [], [""]
     _scan.update(head=note + "garak " + " ".join(cmd[2:]) + "\n\n", buf=buf, cur=cur, progress=progress, end="",
                  ok=False, user_stop=False, paused=False, job=job, last_progress=time.time(), timeouts=0, errors=0,
-                 last_error="", model_seen=False, hf_problem="")
+                 last_error="", model_seen=False, hf_problem="", hf=None)
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, start_new_session=True)
     _proc["p"] = p
 
@@ -3394,9 +3515,18 @@ def _launch_scan(job, note=""):
                 _scan["errors"] += 1
                 _scan["last_error"] = line.split(": ", 2)[-1].split("; garak will retry")[0]
             return
-        if not _scan.get("hf_problem") and (why := explain_hf_failure(line)):
-            _scan["hf_problem"] = why
-            _scan_stuck(why, halt_now=True)  # before garak exits, so its exit isn't taken for a crash to retry
+        failed = LOAD_FAILED.search(line)
+        failed = failed and (failed.group(1) or failed.group(2))
+        if failed and job.get("hf_online"):
+            _remember_unloadable(failed)  # fails with network access too: not a missing download
+        if (not job.get("hf_online") and not _scan.get("hf_problem") and HF_OFFLINE_MISS.search(line)
+                and not (failed and failed in _unloadable())):
+            _scan["hf_problem"] = "offline"
+            _scan_stuck("a file it needs from Hugging Face isn't downloaded yet, so it was restarted to download it",
+                        hf="offline")
+        if not _scan.get("hf_problem") and (kind := hf_failure_kind(line, job.get("hf_no_token", False))):
+            _scan["hf_problem"] = kind
+            _scan_stuck(hf_reason(kind), hf=kind)  # before garak exits, so its exit isn't taken for a crash
         if progress.feed(line):
             _scan.update(last_progress=time.time(), timeouts=0, errors=0)
         changed = False
@@ -3434,9 +3564,11 @@ def _launch_scan(job, note=""):
             _scan["ok"] = rc == 0
             failed = rc != 0 and not _scan["user_stop"]
             if rc == 0:
-                skipped = job.get("skipped", [])
+                skipped, reasons = job.get("skipped", []), job.get("skip_reasons", {})
+                stuck = [p for p in skipped if p not in reasons]
                 _scan["end"] = "Scan complete. Open Reports to view the results." + (
-                    f" Skipped because they got stuck: {', '.join(skipped)}." if skipped else "")
+                    f" Skipped because they got stuck: {', '.join(stuck)}." if stuck else "") + "".join(
+                    f" Skipped {p}: {reasons[p]}." for p in skipped if p in reasons)
             elif _scan["user_stop"]:
                 _scan["end"] = "Scan stopped."
             if not failed:
@@ -3543,22 +3675,29 @@ def _stuck_probe(job):
     return next(iter(_remaining_probes(job)), None)
 
 
-def _scan_stuck(reason, manual=False, halt_now=False):
+def _scan_stuck(reason, manual=False, hf=None):
     """The scan is stuck or garak died mid-scan. Restart garak from the probe it was on, keeping finished probes; if
-    that probe was already restarted, halt instead and let the user decide. manual: the Restart probe button."""
+    that probe was already restarted, halt instead and let the user decide. manual: the Restart probe button.
+    hf: a Hugging Face file that isn't downloaded yet ("offline") or a refused download ("token", "rate", "access"),
+    handled without ever halting."""
     with _scan_lock:
         job = _scan["job"]
         if not job or _scan["action"] or _scan["user_stop"]:
             return
         probe = _stuck_probe(job)
-        count = job.get("stuck_count", 0) + 1 if job.get("stuck_on") == probe else 1
-        job.update(stuck_on=probe, stuck_count=count)
-        halt = halt_now or (not manual and count > AUTO_RESTARTS)
-        _scan.update(action="halt" if halt else "restart", why=reason, manual=manual)
+        if hf:
+            job["stuck_on"] = probe
+            halt = False
+        else:
+            count = job.get("stuck_count", 0) + 1 if job.get("stuck_on") == probe else 1
+            job.update(stuck_on=probe, stuck_count=count)
+            halt = not manual and count > AUTO_RESTARTS
+        _scan.update(action="halt" if halt else "restart", why=reason, manual=manual, hf=hf)
         if SCAN_JOB.exists():
             _save_scan_job(job)
         if not manual:
-            print(f"Scan stuck on {probe or 'startup'}: {reason}. {'Halting' if halt else 'Restarting it'}.", flush=True)
+            print(f"Scan {'download refused' if hf else 'stuck'} on {probe or 'startup'}: {reason}. "
+                  f"{'Halting' if halt else 'Handling it'}.", flush=True)
     threading.Thread(target=_recover_scan, args=(job, halt), daemon=True).start()
 
 
@@ -3600,9 +3739,25 @@ def _recover_scan(job, halt):
     _end_process(p)
     if reader and reader is not threading.current_thread():
         reader.join(30)
-    _revive_ollama()
+    hf = _scan.get("hf")
+    if not hf:
+        _revive_ollama()
+    elif hf == "rate":  # wait before downloading again; after the last pause, give up on this probe
+        waits = job.get("hf_waits", 0)
+        job["hf_waits"] = waits + 1
+        if waits < len(HF_RATE_WAITS):
+            until = time.time() + HF_RATE_WAITS[waits]
+            while time.time() < until and not _scan["user_stop"] and SCAN_JOB.exists():
+                time.sleep(1)
+        else:
+            hf = "access"
+            _scan["why"] = ("Hugging Face kept refusing downloads from this computer (too many requests), so the "
+                            "probe was skipped")
     with _scan_lock:
         probe, why = job.get("stuck_on"), _scan["why"]
+        if hf and not probe:  # refused before garak got to a probe: try twice more, then wait for the user
+            job["hf_startup"] = job.get("hf_startup", 0) + 1
+            halt = halt or job["hf_startup"] > 2
         if _scan["user_stop"] or not SCAN_JOB.exists():  # Stop was pressed meanwhile
             _scan.update(action=None, end="Scan stopped.", ok=False)
             return
@@ -3612,10 +3767,19 @@ def _recover_scan(job, halt):
             _scan.update(action=None, ok=False, end=f"Scan halted on {probe or 'startup'}: "
                                                      f"{job['halted'].rstrip('.')}. Finished probes are kept.")
             return
+        if hf == "offline":
+            job["hf_online"] = True
+        if hf == "token":
+            job["hf_no_token"] = True
+        if hf == "access" and probe:
+            job.setdefault("skipped", []).append(probe)
+            job.setdefault("skip_reasons", {})[probe] = why
+            job.update(stuck_on=None, stuck_count=0)
         job["parts"] += 1
         job["done_at_resume"] = len(job["done"])
         _save_scan_job(job)
         note = ((f"Restarted {probe or 'the scan'} with the Restart probe button." if _scan["manual"] else
+                 f"{probe or 'Startup'}: {why}." if hf else
                  f"The scan got stuck on {probe or 'startup'} ({why}) and was restarted from that probe.") +
                 f" Finished probes are kept in report {_part_name(job, job['parts'] - 1)}; this part is saved as "
                 f"{_part_name(job, job['parts'])}.\n")
@@ -4119,6 +4283,248 @@ _base = gr.themes.Base(primary_hue="blue", neutral_hue="zinc", radius_size="lg",
 THEME = _base.set(**{k: v for k, v in _vars.items() if hasattr(_base, k)},
                   **{k + "_dark": v for k, v in _vars.items() if hasattr(_base, k + "_dark")})
 
+# ---------------------------------------------------------------- red team tools
+# promptfoo has its own web interface for evals and red-team runs; this page starts and stops it. It is kept on this
+# computer (promptfoo_localhost.cjs binds its servers to 127.0.0.1), with its data in LLM Scanner's data folder and
+# telemetry, update checks and result sharing off. PyRIT is a Python library without an interface, so it only gets
+# an install status.
+NODE_BIN = Path.home() / ".local/node/bin"
+PROMPTFOO_DIR = Path.home() / ".local/promptfoo"
+PROMPTFOO_BIN = PROMPTFOO_DIR / "node_modules/.bin/promptfoo"
+PROMPTFOO_PORT = int(os.environ.get("LLM_SCANNER_PROMPTFOO_PORT", 15500))
+PROMPTFOO_URL = f"http://127.0.0.1:{PROMPTFOO_PORT}"
+PROMPTFOO_DATA = DATA_DIR / "promptfoo"
+PYRIT_PY = Path.home() / ".local/pyrit/bin/python"
+PYRIT_DOCS = "https://azure.github.io/PyRIT/"
+PROMPTFOO_DOCS = "https://www.promptfoo.dev/docs/red-team/quickstart/"
+_promptfoo = {"p": None}
+
+
+def promptfoo_version():
+    try:
+        return json.loads((PROMPTFOO_DIR / "node_modules/promptfoo/package.json").read_text())["version"]
+    except (OSError, ValueError, KeyError):
+        return ""
+
+
+def pyrit_version():
+    """PyRIT's version from its own install (~/.local/pyrit), read without starting its Python."""
+    for meta in (Path.home() / ".local/pyrit/lib").glob("python3*/site-packages/pyrit-*.dist-info/METADATA"):
+        for line in meta.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("Version:"):
+                return line.split(":", 1)[1].strip()
+    return ""
+
+
+def _promptfoo_answers():
+    try:
+        return requests.get(PROMPTFOO_URL, timeout=2).ok
+    except requests.RequestException:
+        return False
+
+
+def _promptfoo_ours():
+    p = _promptfoo["p"]
+    return bool(p and p.poll() is None)
+
+
+# Installed by LLM Scanner when missing (at startup, so also right after an update), into ~/.local like Ollama.
+NODE_VERSION = "24.21.0"
+PROMPTFOO_VERSION = "0.124.1"
+TOOLS_STATE_FILE = DATA_DIR / "tools_install.json"  # when an automatic install last failed, so it waits a day
+TOOLS_RETRY_SECS = 86400
+_tools = {"state": "", "msg": ""}  # state: "installing", "failed" or ""
+
+
+def promptfoo_installed():
+    return PROMPTFOO_BIN.exists() and (NODE_BIN / "node").exists()
+
+
+def _install_node():
+    """Node.js's official build into ~/.local/node, checked against its published SHA-256."""
+    arch = {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64", "arm64": "arm64"}.get(platform.machine().lower())
+    if not arch:
+        raise RuntimeError(f"Node.js has no build for this processor ({platform.machine()})")
+    base, name = f"https://nodejs.org/dist/v{NODE_VERSION}", f"node-v{NODE_VERSION}-linux-{arch}.tar.xz"
+    sums = requests.get(f"{base}/SHASUMS256.txt", timeout=30)
+    sums.raise_for_status()
+    want = next((line.split()[0] for line in sums.text.splitlines() if line.endswith("  " + name)), None)
+    if not want:
+        raise RuntimeError(f"Node.js {NODE_VERSION} publishes no checksum for {name}")
+    work = NODE_BIN.parent.with_name(".node-install")
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    try:
+        archive, digest = work / name, hashlib.sha256()
+        with requests.get(f"{base}/{name}", stream=True, timeout=(15, 120)) as r:
+            r.raise_for_status()
+            with archive.open("wb") as f:
+                for chunk in r.iter_content(1 << 20):
+                    f.write(chunk)
+                    digest.update(chunk)
+        if digest.hexdigest() != want:
+            raise RuntimeError("the Node.js download didn't match its published checksum")
+        with tarfile.open(archive) as tar:
+            tar.extractall(work / "unpacked", filter="data")
+        unpacked = next((work / "unpacked").iterdir())
+        shutil.rmtree(NODE_BIN.parent, ignore_errors=True)
+        unpacked.rename(NODE_BIN.parent)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _install_promptfoo_package():
+    env = os.environ | {"PATH": f"{NODE_BIN}:{os.environ.get('PATH', '')}", "npm_config_update_notifier": "false",
+                        "npm_config_fund": "false", "npm_config_audit": "false"}
+    PROMPTFOO_DIR.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run(["nice", "-n", "10", str(NODE_BIN / "npm"), "install", "--prefix", str(PROMPTFOO_DIR),
+                        f"promptfoo@{PROMPTFOO_VERSION}"], env=env, capture_output=True, text=True, timeout=3600)
+    if r.returncode or not PROMPTFOO_BIN.exists():
+        raise RuntimeError("npm couldn't install promptfoo: " + (r.stderr or r.stdout or "").strip()[-300:])
+
+
+def install_promptfoo(force=False):
+    """Install Node.js and promptfoo into ~/.local if they're missing (about 1.6 GB). Runs at startup, which includes
+    the restart after an update; an automatic attempt that failed waits a day, the Install button doesn't."""
+    if _tools["state"] == "installing" or promptfoo_installed():
+        return
+    if not force:
+        try:
+            if time.time() - json.loads(TOOLS_STATE_FILE.read_text()).get("failed", 0) < TOOLS_RETRY_SECS:
+                return
+        except (OSError, ValueError):
+            pass
+    _tools.update(state="installing", msg="")
+    try:
+        if not (NODE_BIN / "node").exists():
+            _tools["msg"] = f"Downloading Node.js {NODE_VERSION}..."
+            _install_node()
+        _tools["msg"] = f"Installing promptfoo {PROMPTFOO_VERSION}..."
+        _install_promptfoo_package()
+        _tools.update(state="", msg="")
+        TOOLS_STATE_FILE.unlink(missing_ok=True)
+        print(f"Installed promptfoo {PROMPTFOO_VERSION} with Node.js {NODE_VERSION}", flush=True)
+    except Exception as e:
+        _tools.update(state="failed", msg=str(e)[-300:])
+        TOOLS_STATE_FILE.write_text(json.dumps({"failed": time.time(), "error": str(e)[-300:]}), encoding="utf-8")
+        print(f"Could not install promptfoo: {e}", flush=True)
+
+
+def redteam_view():
+    """(promptfoo status line, Start, Stop, Open link) for the current state."""
+    if not promptfoo_installed():
+        if _tools["state"] == "installing":
+            return (note_html(f"Installing promptfoo and Node.js (about 1.6 GB, once). {_tools['msg']}", "loading"),
+                    gr.update(visible=False), gr.update(visible=False), "")
+        why = (f"The last attempt failed: {_tools['msg']} " if _tools["state"] == "failed" else
+               "It installs on its own when LLM Scanner starts, or now with the button. ")
+        return (note_html(f"promptfoo isn't installed yet. {why}It goes into ~/.local/node and ~/.local/promptfoo "
+                          "(about 1.6 GB).", "error" if _tools["state"] == "failed" else ""),
+                gr.update(value="Install promptfoo", visible=True, interactive=True), gr.update(visible=False), "")
+    link = (f'<a class="pf-open" href="{PROMPTFOO_URL}" target="_blank" rel="noopener">Open promptfoo</a>'
+            f'<span class="pf-url">{PROMPTFOO_URL}</span>')
+    if _promptfoo_ours():
+        if _promptfoo_answers():
+            return (note_html(f"promptfoo is running on this computer only, at {PROMPTFOO_URL}."),
+                    gr.update(visible=False), gr.update(visible=True, interactive=True), link)
+        return (note_html("promptfoo is starting...", "loading"), gr.update(visible=False),
+                gr.update(visible=True, interactive=True), "")
+    if _promptfoo_answers():
+        return (note_html(f"Something else is already serving {PROMPTFOO_URL}, probably promptfoo started from a "
+                          "terminal. Open it, or stop it there to start it from here."),
+                gr.update(visible=True, interactive=False), gr.update(visible=False), link)
+    return (note_html("promptfoo is stopped. Nothing runs until you start it."),
+            gr.update(value="Start promptfoo", visible=True, interactive=True), gr.update(visible=False), "")
+
+
+def start_promptfoo():
+    """Start promptfoo's web interface and wait until it answers, or install it first if it's missing."""
+    if not promptfoo_installed():
+        if _tools["state"] != "installing":
+            threading.Thread(target=install_promptfoo, kwargs={"force": True}, daemon=True).start()
+            time.sleep(0.5)
+        while _tools["state"] == "installing":
+            yield redteam_view()
+            time.sleep(2)
+        yield redteam_view()
+        return
+    if _promptfoo_ours() or _promptfoo_answers():
+        yield redteam_view()
+        return
+    PROMPTFOO_DATA.mkdir(parents=True, exist_ok=True)
+    env = os.environ | {
+        "PATH": f"{NODE_BIN}:{os.environ.get('PATH', '')}",
+        "NODE_OPTIONS": f'--require "{APP_DIR / "promptfoo_localhost.cjs"}"',
+        "PROMPTFOO_CONFIG_DIR": str(PROMPTFOO_DATA),
+        "PROMPTFOO_DISABLE_TELEMETRY": "1", "PROMPTFOO_DISABLE_UPDATE": "1", "PROMPTFOO_DISABLE_SHARING": "1",
+        "OLLAMA_BASE_URL": OLLAMA,
+    }
+    log = (PROMPTFOO_DATA / "server.log").open("w")
+    _promptfoo["p"] = subprocess.Popen([str(PROMPTFOO_BIN), "view", "--port", str(PROMPTFOO_PORT), "--no"],
+                                       cwd=PROMPTFOO_DATA, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                       stdin=subprocess.DEVNULL, start_new_session=True)
+    log.close()
+    for _ in range(60):
+        if _promptfoo_answers() or not _promptfoo_ours():
+            break
+        time.sleep(0.5)
+    if not _promptfoo_ours():
+        tail = (PROMPTFOO_DATA / "server.log").read_text(errors="replace").strip().splitlines()[-3:]
+        yield (note_html("promptfoo stopped right after starting: " + " ".join(tail)[-300:], "error"),
+               gr.update(visible=True, interactive=True), gr.update(visible=False), "")
+        return
+    yield redteam_view()
+
+
+def stop_promptfoo():
+    p = _promptfoo["p"]
+    if p and p.poll() is None:
+        try:
+            os.killpg(p.pid, signal.SIGTERM)
+            p.wait(10)
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    _promptfoo["p"] = None
+    return redteam_view()
+
+
+def _stop_promptfoo_at_exit():
+    p = _promptfoo["p"]
+    if p and p.poll() is None:
+        try:
+            os.killpg(p.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+
+atexit.register(_stop_promptfoo_at_exit)  # started from this app, so it ends with it
+
+
+def promptfoo_targets_html():
+    """The installed chat models, written the way promptfoo names them, to paste into its target settings."""
+    names = [n for n in model_names()]
+    if not names:
+        return '<p class="sub">No chat models are installed yet. Download one on the Models tab.</p>'
+    rows = "".join(f"<li><code>ollama:chat:{html.escape(n)}</code></li>" for n in names)
+    return ('<p class="sub">To test one of your models, add a target in promptfoo with one of these provider IDs '
+            f'(Ollama at <code>{html.escape(OLLAMA)}</code>):</p><ul class="pf-targets">{rows}</ul>')
+
+
+def pyrit_html():
+    v = pyrit_version()
+    if not v:
+        return ('<p class="sub">PyRIT is not installed on this computer. It is a Python library for scripted red-team '
+                f'attacks, without an interface of its own. <a href="{PYRIT_DOCS}" target="_blank" rel="noopener">'
+                'PyRIT documentation</a></p>')
+    return (f'<p class="sub">PyRIT {html.escape(v)} is installed in <code>~/.local/pyrit</code>. It is a Python library '
+            'with no interface of its own, so it is used from scripts or notebooks with its own Python: '
+            f'<code>{html.escape(str(PYRIT_PY))}</code>. Point its OpenAI-compatible target at Ollama '
+            f'(<code>{html.escape(OLLAMA)}/v1</code>) to test your local models. '
+            f'<a href="{PYRIT_DOCS}" target="_blank" rel="noopener">PyRIT documentation</a></p>')
+
+
 CSS = (APP_DIR / "static" / "style.css").read_text(encoding="utf-8")
 
 
@@ -4480,6 +4886,25 @@ with gr.Blocks(title="LLM Scanner") as ui:
                                             value="Full report (report.jsonl)", show_label=False, elem_classes="segmented")
                         raw_view = gr.Code(show_label=False, language=None, lines=30, max_lines=30, elem_classes="log")
 
+        # ---------------- Red team tools
+        with gr.Tab("Red team tools"):
+            with gr.Column(elem_classes="card"):
+                _pf = promptfoo_version()
+                gr.HTML('<h2>promptfoo' + (f' <span class="ver-badge">{html.escape(_pf)}</span>' if _pf else '')
+                        + '</h2><p class="sub">promptfoo\'s own web interface, with all of its features: evals, red-team '
+                        'setup and runs, and its reports. It runs on this computer only, keeps its data in LLM '
+                        'Scanner\'s data folder, and sends no telemetry. It only runs while started here. '
+                        f'<a href="{PROMPTFOO_DOCS}" target="_blank" rel="noopener">promptfoo red-team guide</a></p>')
+                pf_status = gr.HTML(elem_classes="note")
+                with gr.Row():
+                    pf_start = gr.Button("Start promptfoo", variant="primary", scale=0, min_width=180)
+                    pf_stop = gr.Button("Stop promptfoo", variant="stop", scale=0, min_width=180, visible=False)
+                    pf_link = gr.HTML(elem_classes="pf-link")
+                pf_targets = gr.HTML()
+            with gr.Column(elem_classes="card"):
+                gr.HTML('<h2>PyRIT</h2>')
+                pyrit_info = gr.HTML()
+
     # status
     status_outputs = [status, unload_btn, start_btn, stop_ollama_btn, restart_ollama_btn, ollama_status, activity]
     start_btn.click(start_ollama, outputs=status_outputs, show_progress="hidden")
@@ -4607,6 +5032,12 @@ with gr.Blocks(title="LLM Scanner") as ui:
                      show_progress="hidden")
 
     ui.load(probe_costs_html, outputs=probe_costs_view, show_progress="hidden")
+    pf_outputs = [pf_status, pf_start, pf_stop, pf_link]
+    pf_start.click(start_promptfoo, outputs=pf_outputs, show_progress="hidden")
+    pf_stop.click(stop_promptfoo, outputs=pf_outputs, show_progress="hidden")
+    ui.load(redteam_view, outputs=pf_outputs, show_progress="hidden")
+    ui.load(promptfoo_targets_html, outputs=pf_targets, show_progress="hidden")
+    ui.load(pyrit_html, outputs=pyrit_info, show_progress="hidden")
     ui.load(refresh_all, chat_state, [models_version, scan_model, status, scan_type, group_pick, chat_model],
             show_progress="hidden").then(
         model_hint, scan_model, [model_note, tmo], show_progress="hidden").then(
@@ -4693,6 +5124,7 @@ if __name__ == "__main__":
             _resume["waiting"] = True  # set before the page can load, so it shows the pending resume
             threading.Thread(target=resume_interrupted_scan, daemon=True).start()
         threading.Thread(target=measure_probe_sizes, daemon=True).start()  # only does work after a garak update
+        threading.Thread(target=install_promptfoo, daemon=True).start()  # only does work where it's missing
         threading.Thread(target=check_updates, daemon=True).start()  # once at startup; after that, on request
     ui.queue().launch(server_name="127.0.0.1", server_port=int(os.environ.get("LLM_SCANNER_PORT", 7861)),
                       inbrowser="--no-browser" not in sys.argv, allowed_paths=[str(GARAK_RUNS), str(ATTACH_DIR), str(IMAGES_DIR)],

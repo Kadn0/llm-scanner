@@ -639,3 +639,13 @@ a.mt-model-name:hover { color:#2997ff !important; text-decoration:underline !imp
 .probe-cost.low { background:rgba(48,209,88,.14); color:#30d158; }
 .probe-cost.medium { background:rgba(255,159,10,.15); color:#ff9f0a; }
 .probe-cost.high { background:rgba(255,69,58,.15); color:#ff6961; }
+
+/* Red team tools: the link to promptfoo's own interface once it runs, and the model IDs to paste into it. */
+.pf-link { align-self:center; }
+.pf-link .html-container { display:flex; align-items:center; gap:14px; padding:0 !important; }
+.pf-open { display:inline-flex; align-items:center; height:44px; padding:0 22px; border-radius:980px; background:#2997ff;
+       color:#fff !important; font-size:15px; font-weight:500; text-decoration:none !important; }
+.pf-open:hover { background:#0a84ff; }
+.pf-url { color:#86868b; font-size:13px; font-family:"JetBrains Mono","SF Mono",ui-monospace,monospace; }
+.pf-targets { margin:6px 0 0; padding-left:18px; color:#d1d1d6; font-size:13.5px; }
+.pf-targets li { margin:3px 0; }

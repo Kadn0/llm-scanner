@@ -1142,41 +1142,110 @@ class ImageModels(TempDataTest):
 
 
 # ---------------------------------------------------------------- probes, groups, scans
+class RedTeamTools(TempDataTest):
+    """promptfoo is installed where it's missing (at startup, so also after an update) and started from the page."""
+
+    def setUp(self):
+        super().setUp()
+        for name, value in {"NODE_BIN": self.tmp / "node/bin", "PROMPTFOO_DIR": self.tmp / "promptfoo",
+                            "PROMPTFOO_BIN": self.tmp / "promptfoo/node_modules/.bin/promptfoo",
+                            "TOOLS_STATE_FILE": self.tmp / "data/tools.json"}.items():
+            self.enterContext(mock.patch.object(app, name, value))
+        self.enterContext(mock.patch.dict(app._tools, {"state": "", "msg": ""}))
+
+    def fake_install(self, *_):
+        for f in (app.NODE_BIN / "node", app.PROMPTFOO_BIN):
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("")
+
+    def test_installs_what_is_missing(self):
+        with mock.patch.object(app, "_install_node", side_effect=self.fake_install) as node, \
+                mock.patch.object(app, "_install_promptfoo_package") as pkg:
+            app.install_promptfoo()
+            node.assert_called_once()
+            pkg.assert_called_once()
+            app.install_promptfoo()
+        self.assertEqual(node.call_count, 1, "nothing to do once it's there")
+        self.assertTrue(app.promptfoo_installed())
+
+    def test_a_failed_install_waits_a_day_unless_asked(self):
+        with mock.patch.object(app, "_install_node", side_effect=RuntimeError("no network")) as node:
+            app.install_promptfoo()
+            self.assertEqual(app._tools["state"], "failed")
+            status, start, *_ = app.redteam_view()
+            self.assertIn("no network", status)
+            self.assertEqual(start["value"], "Install promptfoo")
+            app.install_promptfoo()
+            self.assertEqual(node.call_count, 1, "not retried on every start")
+            app.install_promptfoo(force=True)
+            self.assertEqual(node.call_count, 2, "the Install button retries at once")
+
+    def test_view_while_installing_and_when_stopped(self):
+        app._tools.update(state="installing", msg="Downloading Node.js")
+        status, start, stop, link = app.redteam_view()
+        self.assertIn("Installing promptfoo", status)
+        self.assertFalse(start["visible"])
+        app._tools.update(state="", msg="")
+        self.fake_install()
+        with mock.patch.object(app, "_promptfoo_answers", return_value=False):
+            status, start, stop, link = app.redteam_view()
+        self.assertIn("stopped", status)
+        self.assertEqual(start["value"], "Start promptfoo")
+        self.assertEqual(link, "")
+
+
 class ProbeTimeTags(TempDataTest):
-    """Each probe is tagged Low / Medium / High by how many prompts it sends, counted once per garak version."""
+    """Each probe is tagged Low / Medium / High by how much work it is: its prompts, how long its replies may run, how
+    long its prompts are to read, its turns, and whether an AI model judges every reply. Measured once per garak
+    version."""
 
     def setUp(self):
         super().setUp()
         self.enterContext(mock.patch.object(app, "PROBE_SIZES_FILE", self.tmp / "data" / "probe_sizes.json"))
         self.enterContext(mock.patch.object(app, "BUNDLED_PROBE_SIZES", self.tmp / "bundled.json"))
-        self.enterContext(mock.patch.dict(app.PROBE_SIZES, clear=True))
-        self.enterContext(mock.patch.dict(app.PROBE_REPLY_TOKENS, clear=True))
+        for name in ("PROBE_SIZES", "PROBE_REPLY_TOKENS", "PROBE_PROMPT_CHARS", "PROBE_TURNS"):
+            self.enterContext(mock.patch.dict(getattr(app, name), clear=True))
+        for name in ("PROBE_JUDGED", "PROBE_SCORING_MODELS"):
+            self.enterContext(mock.patch.object(app, name, set()))
 
-    def test_levels(self):
+    def level(self, name):
+        return app.probe_costs()[name]["level"]
+
+    def test_prompt_counts(self):
         app.PROBE_SIZES.update({"a.Few": 30, "a.Some": 31, "a.Many": 151, "tap.TAP": 0, "fileformats.HF_Files": 0})
         with mock.patch.dict(app.CATALOG, {"fileformats.HF_Files": {"module": "fileformats"}}):
             costs = app.probe_costs()
-        self.assertEqual(costs["a.Few"], ["Low", 30, 0])
-        self.assertEqual(costs["a.Some"], ["Medium", 31, 0])
-        self.assertEqual(costs["a.Many"], ["High", 151, 0])
-        self.assertEqual(costs["tap.TAP"], ["High", 0, 0], "prompts written by an attacker model during the scan")
-        self.assertEqual(costs["fileformats.HF_Files"], ["Low", 0, 0], "inspects files, sends nothing")
-
-    def test_long_replies_count_as_more_work(self):
-        app.PROBE_SIZES.update({"divergence.Repeat": 36})
-        self.enterContext(mock.patch.dict(app.PROBE_REPLY_TOKENS, {"divergence.Repeat": 1024}, clear=True))
-        self.assertEqual(app.probe_costs()["divergence.Repeat"], ["High", 36, 1024],
-                         "36 prompts whose replies run 7x longer took days, not minutes")
+        self.assertEqual([costs[n]["level"] for n in ("a.Few", "a.Some", "a.Many")], ["Low", "Medium", "High"])
+        self.assertTrue(costs["tap.TAP"]["generated"])
+        self.assertEqual(costs["tap.TAP"]["level"], "High", "prompts written by an attacker model during the scan")
+        self.assertEqual(costs["fileformats.HF_Files"]["level"], "Low", "inspects files, sends nothing")
         self.assertIn('id="probe-costs"', app.probe_costs_html())
+
+    def test_everything_that_makes_a_probe_slow_counts(self):
+        app.PROBE_SIZES.update({"divergence.Repeat": 36, "dan.Long": 127, "dan.Short": 127, "x.Judged": 20,
+                                "x.Turns": 20, "x.Scored": 20})
+        app.PROBE_REPLY_TOKENS["divergence.Repeat"] = 1024
+        app.PROBE_PROMPT_CHARS.update({"dan.Long": 3538, "dan.Short": 200})
+        app.PROBE_JUDGED.add("x.Judged")
+        app.PROBE_TURNS["x.Turns"] = 2
+        app.PROBE_SCORING_MODELS.add("x.Scored")
+        self.assertEqual(self.level("divergence.Repeat"), "High", "36 prompts whose replies run 7x longer took days")
+        self.assertEqual(self.level("dan.Short"), "Medium")
+        self.assertEqual(self.level("dan.Long"), "High", "long prompts take the model longer to read")
+        self.assertEqual(app.probe_work("x.Judged"), 40, "an AI model judging every reply doubles the work")
+        self.assertEqual(app.probe_work("x.Turns"), 40, "two turns per prompt, two replies")
+        self.assertEqual(self.level("x.Scored"), "Low", "a first-run download is mentioned, not counted")
+        self.assertTrue(app.probe_costs()["x.Scored"]["downloads"])
 
     def test_counts_again_only_after_a_garak_update(self):
         app.BUNDLED_PROBE_SIZES.write_text(json.dumps({"garak": app.GARAK_VERSION, "probes": {"a.B": 5},
-                                                       "reply_tokens": {"a.B": 1024}}))
+                                                       "reply_tokens": {"a.B": 1024}, "judged": ["a.B"]}))
         with mock.patch.object(app.subprocess, "run") as run:
             app.measure_probe_sizes()
         run.assert_not_called()
         self.assertEqual(app.PROBE_SIZES, {"a.B": 5})
         self.assertEqual(app.PROBE_REPLY_TOKENS["a.B"], 1024)
+        self.assertIn("a.B", app.PROBE_JUDGED)
         app.BUNDLED_PROBE_SIZES.write_text(json.dumps({"garak": "0.0.1", "probes": {"a.B": 5}}))
         fresh = json.dumps({"garak": app.GARAK_VERSION, "probes": {"a.B": 7}})
         with mock.patch.object(app.subprocess, "run", return_value=mock.Mock(stdout=fresh)) as run:
@@ -1392,31 +1461,160 @@ class ScanSurvivesPageClose(TempDataTest):
             unload.assert_called()
 
 
+class HuggingFaceRateLimit(unittest.TestCase):
+    """Hugging Face limits how often a computer may call it: answers are reused, and 'too many requests' is waited
+    out and retried instead of showing an error."""
+
+    def setUp(self):
+        self.enterContext(mock.patch.object(app, "HF_API_CACHE_SECS", 300))
+        self.enterContext(mock.patch.dict(app._hf_api_cache, clear=True))
+        self.sleep = self.enterContext(mock.patch.object(app.time, "sleep"))
+
+    def test_answers_are_reused(self):
+        with mock.patch.object(app.requests, "get", return_value=FakeResponse([1])) as get:
+            app.hf_api_get("https://hf/api/models", params={"search": "x"})
+            app.hf_api_get("https://hf/api/models", params={"search": "x"})
+            app.hf_api_get("https://hf/api/models", params={"search": "y"})
+        self.assertEqual(get.call_count, 2, "the same question within a few minutes isn't asked again")
+
+    def test_too_many_requests_is_waited_out(self):
+        answers = [FakeResponse(status=429, headers={"Retry-After": "5"}), FakeResponse(status=429), FakeResponse([1])]
+        with mock.patch.object(app.requests, "get", side_effect=answers):
+            res = app.hf_api_get("https://hf/api/models")
+        self.assertEqual(res.json(), [1])
+        self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [5.0, 6], "Retry-After, then backing off")
+        self.assertIsNone(app._check_response(FakeResponse(status=200), "x"))
+        with self.assertRaises(app.requests.HTTPError, msg="a 429 during a download is retried, not given up on"):
+            app._check_response(FakeResponse(status=429), "x")
+        with self.assertRaises(app.PermanentDownloadError):
+            app._check_response(FakeResponse(status=404), "x")
+
+
 class ScanHuggingFaceDownloads(TempDataTest):
-    """garak downloads detector models and datasets from Hugging Face mid-scan; a refusal is explained, not retried."""
+    """garak downloads detector models and datasets from Hugging Face mid-scan. None of it may hold a scan up: a
+    rejected token isn't sent, and a refused download is retried without the token, retried after a pause, or that
+    probe alone is skipped, while the scan carries on."""
+    JOB = {"model": "m", "scan_type": "x", "requested": [], "queue": ["a.A", "b.B"], "done": [], "failed": [],
+           "generations": 1, "timeout": 60, "thinking": False, "prefix": "m_1", "parts": 1, "stalls": 0}
 
-    def test_explains_refusals(self):
+    def setUp(self):
+        super().setUp()
+        self.enterContext(mock.patch.object(app, "HF_RATE_WAITS", (0, 0, 0)))
+        self.enterContext(mock.patch.object(app, "_hf_login_file", return_value=self.tmp / "no-token"))
+
+    def test_kinds(self):
+        line401 = ("requests.exceptions.HTTPError: 401 Client Error: Unauthorized for url: "
+                   "https://huggingface.co/garak-llm/toxic-comment-model/resolve/main/config.json")
         with mock.patch.object(app, "read_settings", return_value={"hf_token": "hf_saved"}):
-            why = app.explain_hf_failure("requests.exceptions.HTTPError: 401 Client Error: Unauthorized for url: "
-                                         "https://huggingface.co/garak-llm/toxic-comment-model/resolve/main/config.json")
-        self.assertIn("rejected the token", why)
-        self.assertIn("saved in LLM Scanner", why)
-        self.assertIn("gated", app.explain_hf_failure("huggingface_hub.errors.GatedRepoError: 403 Client Error."))
-        self.assertIn("too many requests", app.explain_hf_failure("429 Client Error: Too Many Requests for url: https://huggingface.co/x"))
-        self.assertEqual(app.explain_hf_failure("probes.dan.DanInTheWild:  40%|####  | 103/256"), "")
-        self.assertEqual(app.explain_hf_failure("dan.DanInTheWild   mitigation.MitigationBypass: PASS ok on 401/401"), "",
-                         "a result line that happens to contain 401 is not a download failure")
+            self.assertEqual(app.hf_failure_kind(line401), "token")
+            self.assertEqual(app.hf_failure_kind(line401, without_token=True), "access",
+                             "refused again without a token: the file isn't public, so retrying can't help")
+            self.assertIn("saved in LLM Scanner", app.hf_reason("token"))
+        with mock.patch.object(app, "read_settings", return_value={}), mock.patch.dict(os.environ, clear=True):
+            self.assertEqual(app.hf_failure_kind(line401), "access", "no token was sent, so it isn't public")
+        self.assertEqual(app.hf_failure_kind("huggingface_hub.errors.GatedRepoError: 403 Client Error."), "access")
+        self.assertEqual(app.hf_failure_kind("429 Client Error: Too Many Requests for url: https://huggingface.co/x"),
+                         "rate")
+        self.assertEqual(app.hf_failure_kind("probes.dan.DanInTheWild:  40%|####  | 103/256"), "")
+        self.assertEqual(app.hf_failure_kind("dan.DanInTheWild   mitigation.MitigationBypass: PASS ok on 401/401"),
+                         "", "a result line that happens to contain 401 is not a download failure")
 
-    def test_scan_uses_the_saved_token(self):
-        job = {"model": "m", "scan_type": "x", "requested": [], "queue": [], "done": [], "failed": [],
-               "generations": 1, "timeout": 60, "thinking": False, "prefix": "m_1", "parts": 1, "stalls": 0}
-        with mock.patch.object(app, "read_settings", return_value={"hf_token": "hf_saved"}), \
+    def launch(self, job, settings, whoami=("me", "")):
+        with mock.patch.object(app, "read_settings", return_value=settings), \
+                mock.patch.object(app, "hf_whoami", return_value=whoami) as check, \
                 mock.patch.object(app.subprocess, "Popen") as popen, mock.patch.object(app, "pump_output"), \
                 mock.patch.object(app.threading, "Thread"):
             popen.return_value.pid = 1
             app._launch_scan(job)
-        self.assertEqual(popen.call_args.kwargs["env"]["HF_TOKEN"], "hf_saved")
         app._proc["p"] = None
+        return popen.call_args.kwargs["env"], check
+
+    def test_scans_start_offline_and_use_the_saved_token(self):
+        env, check = self.launch(dict(self.JOB), {"hf_token": "hf_saved"})
+        self.assertEqual(env["HF_HUB_OFFLINE"], "1", "files earlier scans downloaded are used without asking again")
+        self.assertEqual(env["HF_DATASETS_OFFLINE"], "1")
+        check.assert_not_called()  # offline: nothing to check the token for
+        env, check = self.launch(dict(self.JOB, hf_online=True), {"hf_token": "hf_saved"})
+        self.assertNotIn("HF_HUB_OFFLINE", env)
+        self.assertEqual(env["HF_TOKEN"], "hf_saved")
+        self.assertNotIn("HF_HUB_DISABLE_IMPLICIT_TOKEN", env)
+
+    def test_a_missing_file_restarts_the_probe_online(self):
+        self.assertTrue(app.HF_OFFLINE_MISS.search(" detector load failed: unsafe_content.ToxicCommentModel, skipping >>"))
+        self.assertTrue(app.HF_OFFLINE_MISS.search("failed to load probe probes.sysprompt_extraction.SystemPromptExtraction"))
+        self.assertFalse(app.HF_OFFLINE_MISS.search("probes.dan.DanInTheWild:  40%|####  | 103/256"))
+        job, launch = self.recover("offline")
+        self.assertTrue(job["hf_online"])
+        self.assertEqual(job["skipped"], [], "the probe runs again, online, not skipped")
+        launch.assert_called_once()
+
+    def run_garak_printing(self, line, job):
+        script = self.tmp / "fake_garak.py"
+        script.write_text(f"print({line!r}, flush=True)\n")
+        real_popen = app.subprocess.Popen
+        with mock.patch.object(app, "read_settings", return_value={}), \
+                mock.patch.object(app.subprocess, "Popen", side_effect=lambda cmd, **kw: real_popen(
+                    [sys.executable, str(script)], **kw)), \
+                mock.patch.object(app, "_scan_stuck") as stuck, mock.patch.object(app, "unload_models"), \
+                mock.patch.object(app, "_watch_scan"), mock.patch.object(app, "SCAN_JOB", self.tmp / "job.json"):
+            app._launch_scan(job)
+            app._scan["reader"].join(10)
+        app._proc["p"] = None
+        return stuck
+
+    def test_a_detector_that_never_loads_does_not_send_the_scan_online(self):
+        self.enterContext(mock.patch.object(app, "UNLOADABLE_FILE", self.tmp / "data" / "unloadable.json"))
+        line = " detector load failed: perspective.Toxicity, skipping >>"
+        stuck = self.run_garak_printing(line, dict(self.JOB))
+        self.assertEqual(stuck.call_args.kwargs["hf"], "offline", "unknown yet: maybe a file not downloaded")
+        self.run_garak_printing(line, dict(self.JOB, hf_online=True))
+        self.assertIn("perspective.Toxicity", app._unloadable(), "failed online too, so it isn't a missing download")
+        stuck = self.run_garak_printing(line, dict(self.JOB))
+        stuck.assert_not_called()
+
+    def test_a_rejected_token_is_not_sent(self):
+        job = dict(self.JOB, hf_online=True)
+        env, check = self.launch(job, {"hf_token": "hf_old"}, whoami=("", "Hugging Face rejected this token."))
+        self.assertTrue(job["hf_no_token"])
+        self.assertNotIn("HF_TOKEN", env)
+        self.assertEqual(env["HF_HUB_DISABLE_IMPLICIT_TOKEN"], "1", "nor the token `huggingface-cli login` saved")
+        self.assertIn("was rejected", app._scan["head"])
+        env, check = self.launch(job, {"hf_token": "hf_old"})
+        check.assert_not_called()  # checked once per scan, not again for each part
+
+    def recover(self, kind, probe="a.A"):
+        job = dict(self.JOB, skipped=[], stuck_on=probe)
+        app._save_scan_job(job)
+        app._scan.update(job=job, why=app.hf_reason(kind), hf=kind, manual=False, user_stop=False, action="restart",
+                         reader=None)
+        with mock.patch.object(app, "_end_process"), mock.patch.object(app, "_revive_ollama") as revive, \
+                mock.patch.object(app, "ollama_up", return_value="1"), \
+                mock.patch.object(app, "_launch_scan") as launch, mock.patch.object(app, "read_settings", return_value={}):
+            app._recover_scan(job, False)
+        revive.assert_not_called()  # a download problem doesn't need the model unloaded
+        return job, launch
+
+    def test_refusals_never_halt_the_scan(self):
+        job, launch = self.recover("token")
+        self.assertTrue(job["hf_no_token"])
+        self.assertNotIn("halted", job)
+        launch.assert_called_once()
+        job, launch = self.recover("access")
+        self.assertEqual(job["skipped"], ["a.A"], "only the probe that needs the file is left out")
+        self.assertIn("gated or private", job["skip_reasons"]["a.A"])
+        launch.assert_called_once()
+        for attempt in range(len(app.HF_RATE_WAITS)):
+            job, launch = self.recover("rate")
+            app._save_scan_job(job)
+        self.assertEqual(job["skipped"], [], "retried after each pause")
+        job = dict(job, hf_waits=len(app.HF_RATE_WAITS))
+        app._save_scan_job(job)
+        app._scan.update(job=job, hf="rate", why="x", user_stop=False, action="restart", reader=None)
+        with mock.patch.object(app, "_end_process"), mock.patch.object(app, "ollama_up", return_value="1"), \
+                mock.patch.object(app, "_launch_scan") as launch:
+            app._recover_scan(job, False)
+        self.assertEqual(job["skipped"], ["a.A"], "after the last pause the probe is skipped, not the scan halted")
+        launch.assert_called_once()
 
 
 class ScanResume(TempDataTest):

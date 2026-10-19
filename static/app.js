@@ -91,16 +91,27 @@
   });
   document.addEventListener('scroll', hideTip, true);
 
-  // Probes tab: a Low / Medium / High tag on every probe, from how many prompts it sends (the hidden #probe-costs
+  // Probes tab: a Low / Medium / High tag on every probe, from how much work it is (the hidden #probe-costs
   // table), so the long ones stand out before a scan. Added beside the label text, never into it, so search, ticking
   // and the hover explanation are unchanged; Gradio reuses rows when the list is filtered, so each tag follows its
   // row's checkbox.
   let probeCosts = {}, probeCostsRaw = null, tagTimer = 0;
-  const costTip = (level, n, tokens) => (n
-    ? `Sends ${n} prompt${n === 1 ? '' : 's'}, each once per attempt (Attempts per prompt on the Scan tab, 3 by default), so about ${n * 3} replies to wait for.`
-      + (tokens ? ` Each reply may run to ${tokens} tokens, about ${Math.round(tokens / 150)} times a normal reply, and this probe asks for text that never ends, so every reply runs that long.` : '')
-    : level === 'Low' ? "Sends no prompts; it inspects the model's files instead."
-      : 'An attacker model or a search writes the prompts during the scan, often over many turns, so it is among the slowest probes.');
+  const costTip = (c) => {
+    if (c.files) return "Sends no prompts; it inspects the model's files instead.";
+    const parts = [];
+    if (c.generated) {
+      parts.push('An attacker model or a search writes the prompts during the scan, often over many turns, so it is among the slowest probes.');
+    } else {
+      parts.push(`Sends ${c.prompts} prompt${c.prompts === 1 ? '' : 's'}, each once per attempt (Attempts per prompt on the Scan tab, 3 by default).`);
+      if (c.reply_tokens) parts.push(`Each reply may run to ${c.reply_tokens} tokens, about ${Math.round(c.reply_tokens / 150)} times a normal reply, and this probe asks for text that never ends, so every reply runs that long.`);
+      if (c.prompt_chars >= 1500) parts.push(`Its prompts are long (about ${Math.round(c.prompt_chars / 6)} words each), so the model takes longer to read them.`);
+      else if (c.prompt_chars >= 500) parts.push(`Its prompts are longer than usual (about ${Math.round(c.prompt_chars / 6)} words each), which adds a little reading time.`);
+    }
+    if (c.judged) parts.push('An AI model judges every reply, which doubles the work.');
+    if (c.downloads) parts.push('The first time it runs, it downloads a scoring model from Hugging Face.');
+    if (!c.generated && c.work > c.prompts) parts.push(`Altogether about as much work as ${c.work} normal prompts.`);
+    return parts.join(' ');
+  };
   const tagProbes = () => {
     const raw = document.querySelector('#probe-costs')?.dataset.costs;
     if (raw && raw !== probeCostsRaw) {
@@ -112,15 +123,14 @@
       const cost = name && probeCosts[name];
       let tag = label.querySelector(':scope > .probe-cost');
       if (!cost) { tag?.remove(); return; }
-      const [level, n, tokens] = cost;
-      const key = `${name}|${level}|${n}|${tokens}`;
+      const key = `${name}|${JSON.stringify(cost)}`;
       if (tag && tag.dataset.key === key) return;
       if (!tag) { tag = document.createElement('span'); label.appendChild(tag); }
       tag.dataset.key = key;
-      tag.className = `probe-cost ${level.toLowerCase()}`;
-      tag.textContent = `${level} · ${n || (level === 'Low' ? 'none' : 'generated')}`;
-      tag.dataset.tipTitle = `${level} time: ${n ? `${n} prompt${n === 1 ? '' : 's'}` : level === 'Low' ? 'no prompts' : 'prompts written during the scan'}`;
-      tag.dataset.tip = costTip(level, n, tokens);
+      tag.className = `probe-cost ${cost.level.toLowerCase()}`;
+      tag.textContent = `${cost.level} · ${cost.files ? 'none' : cost.generated ? 'generated' : cost.prompts}`;
+      tag.dataset.tipTitle = `${cost.level} time: ${cost.files ? 'no prompts' : cost.generated ? 'prompts written during the scan' : `${cost.prompts} prompt${cost.prompts === 1 ? '' : 's'}`}`;
+      tag.dataset.tip = costTip(cost);
     });
   };
   new MutationObserver(() => { clearTimeout(tagTimer); tagTimer = setTimeout(tagProbes, 30); })

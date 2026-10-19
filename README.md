@@ -16,6 +16,8 @@ security weaknesses with [garak](https://github.com/NVIDIA/garak). It runs entir
 - **Scanning**: garak probes, saved probe groups, a live progress bar, and a security-analyst report with OWASP
   LLM Top 10 mapping, evidence, remediation, and the raw garak data. Scans can be paused, a stuck probe is
   detected and restarted, and finished probes are never lost.
+- **Red team tools**: start and stop promptfoo's own web interface (evals and red-team runs) from the app, on this
+  computer only, with your installed models listed as promptfoo targets.
 - **Housekeeping**: models load only while in use, a live GPU/RAM status bar, start at boot, and one-click
   verified updates for LLM Scanner, Ollama, and garak.
 
@@ -77,6 +79,7 @@ needs, plus Ollama), so expect 10 to 20 minutes. When it finishes, LLM Scanner o
 | stable-diffusion.cpp | Runs image models | `~/.local/sd-cpp` |
 | garak, Gradio, PyTorch | Scanner and app packages (exact pinned versions) | `~/llm-scanner/.venv` |
 | uv | Python and package installer | `~/.local/bin/uv` |
+| Node.js, promptfoo | Red team tools (installed by the app the first time it starts, about 1.6 GB) | `~/.local/node`, `~/.local/promptfoo` |
 
 Installer options:
 
@@ -185,6 +188,16 @@ It lists what will be deleted and asks before doing anything.
 
 ## Changelog
 
+- **1.1.5**: Hugging Face no longer holds up a scan. Scans run offline from Hugging Face first, using the files earlier
+  scans downloaded, and only a probe that needs a file not downloaded yet goes online for it, so most scans make no
+  Hugging Face requests at all. A token Hugging Face rejects is found before going online and simply not sent; "too
+  many requests" pauses and retries; and a file in a gated or private repository skips just that probe, with the reason
+  in the summary, instead of halting. The app's own Hugging Face requests (search, versions, repository details) reuse
+  answers for a few minutes, run at most four at once and wait out "too many requests", and downloads retry it instead
+  of failing. Probe time tags now count everything that makes a probe slow: prompts, how long replies may run, how
+  long prompts are to read, turns, and AI judging of replies, and the hover says which apply and when a scoring
+  model is downloaded the first time. A new Red team tools page starts promptfoo's own web interface on this computer
+  only, and promptfoo with Node.js is installed where it's missing, including on copies that update.
 - **1.1.4**: Every probe on the Probes tab has a time tag (Low, Medium or High) with the number of prompts it sends;
   hovering it estimates how many replies to wait for. Probes whose prompts an attacker model writes during the scan
   are High, and so are probes that let each reply run far longer than usual: divergence.Repeat sends only 36 prompts,
