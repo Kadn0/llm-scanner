@@ -5,6 +5,7 @@ import base64
 import bisect
 import codecs
 import concurrent.futures
+import csv
 import functools
 import hashlib
 import html
@@ -422,7 +423,9 @@ def check_updates():
     _updates["checked"] = time.time()
     failed = []
     try:
-        latest = requests.get("https://api.github.com/repos/ollama/ollama/releases/latest", timeout=10).json()
+        r = requests.get("https://api.github.com/repos/ollama/ollama/releases/latest", timeout=10)
+        r.raise_for_status()  # a 403 rate limit has no tag_name and would otherwise read as "up to date"
+        latest = r.json()
         installed = ollama_up()
         tag = (latest.get("tag_name") or "").lstrip("v")
         _updates["ollama"] = (installed, tag) if installed and tag and \
@@ -436,7 +439,9 @@ def check_updates():
     except Exception:
         failed.append("garak")
     try:
-        rel = requests.get(f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest", timeout=10).json()
+        r = requests.get(f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest", timeout=10)
+        r.raise_for_status()
+        rel = r.json()
         tag = (rel.get("tag_name") or "").lstrip("v")
         if tag and _version_tuple(tag) > _version_tuple(APP_VERSION) and not rel.get("prerelease"):
             _updates["app"] = {"version": tag, "tag": rel["tag_name"], "notes": (rel.get("body") or "").strip()}
@@ -951,7 +956,7 @@ class ChatIndex:
 
     Words map to the chats that contain them; a sorted word list lets each search term match by prefix with a
     binary search, so typing in the search box never re-reads chat files. Updated on save and delete."""
-    WORD = re.compile(r"[a-z0-9]+")
+    WORD = re.compile(r"[^\W_]+")  # letters and digits in any script
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -1152,7 +1157,15 @@ def chat_respond(chat):
         with requests.post(f"{OLLAMA}/api/chat", json={"model": model, "messages": msgs, "stream": True,
                                                         "keep_alive": keep_alive},
                            stream=True, timeout=(10, 1800)) as r:
-            for line in r.iter_lines():
+            if not r.ok:
+                body = " ".join(ln.decode("utf-8", "replace") if isinstance(ln, bytes) else ln
+                                for ln in r.iter_lines() if ln).strip()
+                try:
+                    detail = json.loads(body)["error"]
+                except Exception:
+                    detail = f"Ollama answered with HTTP {r.status_code}" + (f": {body[:500]}" if body else "")
+                answer += f"\n\nError: {readable_ollama_error(detail)}"
+            for line in r.iter_lines() if r.ok else ():
                 if not line:
                     continue
                 ev = json.loads(line)
@@ -1721,6 +1734,8 @@ def _pending():
         entries = json.loads(DOWNLOADS_FILE.read_text())
     except Exception:
         return []
+    if not isinstance(entries, list):
+        return []
     return [(e, False) if isinstance(e, str) else (e["ref"], bool(e.get("paused"))) for e in entries]
 
 
@@ -2238,7 +2253,7 @@ UNSUPPORTED = [
     (r"chroma|hidream|sd3|stable-diffusion-3|cogview|sana|pixart|kolors|lumina|omnigen|ideogram",
      "This model family isn't supported yet."),
     (r"inpaint|instruct[-_]?pix|edit\b", "This model edits existing images (inpainting), it doesn't create new ones."),
-    (r"text[._-]?encoder|t5|clip|vae|lora|controlnet|ip[._-]?adapter|upscal",
+    (r"text[._-]?encoder|t5|clip|(?<!no)(?<!no[._-])vae|lora|controlnet|ip[._-]?adapter|upscal",
      "This is an add-on or component file, not a complete image model."),
 ]
 
@@ -2255,9 +2270,10 @@ BUILTIN_IMAGE_MODELS = {
 
 def _custom_image_models():
     try:
-        return json.loads(CUSTOM_IMAGE_FILE.read_text(encoding="utf-8"))
+        models = json.loads(CUSTOM_IMAGE_FILE.read_text(encoding="utf-8"))
     except Exception:
         return {}
+    return models if isinstance(models, dict) else {}
 
 
 def image_models():
@@ -2992,9 +3008,10 @@ def expand(specs):
 
 def load_groups():
     try:
-        return json.loads(GROUPS_FILE.read_text())
+        groups = json.loads(GROUPS_FILE.read_text())
     except Exception:
         return {}
+    return groups if isinstance(groups, dict) else {}
 
 
 def save_groups(groups):
@@ -3099,7 +3116,11 @@ def resolve_scan(scan_type, selected):
         g = load_groups().get(scan_type.removeprefix(GROUP_PREFIX))
         if not g:
             return None, "That group no longer exists."
-        return expand(g), None
+        probes = expand(g)
+        if not probes:
+            return None, ("None of this group's probes exist in the installed garak version any more. Edit the "
+                          "group on the Probes tab.")
+        return probes, None
     return None, "Choose a scan type."
 
 
@@ -4103,7 +4124,70 @@ def report_paths(name):
     prefix = name[:-len(".report.html")]
     return {"garak": f, "jsonl": f.with_name(prefix + ".report.jsonl"), "hitlog": f.with_name(prefix + ".hitlog.jsonl"),
             "analyst": f.with_name(prefix + ".analyst.html"), "csv": f.with_name(prefix + ".findings.csv"),
-            "txt": f.with_name(prefix + ".report.txt")}
+            "txt": f.with_name(prefix + ".report.txt"), "table": f.with_name(prefix + ".report.csv")}
+
+
+CSV_LIST_LIMIT = 50  # a list longer than this (rare: long config lists) stays together in one cell, as JSON
+CSV_FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_cell(value):
+    """A scalar as a spreadsheet cell. Text that a spreadsheet would run as a formula (attack prompts and model
+    replies can start with "=") gets a leading apostrophe, which spreadsheets show as plain text."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str) and value.startswith(CSV_FORMULA_START):
+        return "'" + value
+    return value
+
+
+def _flatten_record(value, key, out):
+    """Every value of a record in its own column, named by its path: {"prompt": {"turns": [{"role": "user"}]}} gives
+    the column prompt.turns.0.role."""
+    if isinstance(value, dict) and value:
+        for k, v in value.items():
+            _flatten_record(v, f"{key}.{k}" if key else str(k), out)
+    elif isinstance(value, list) and value and len(value) <= CSV_LIST_LIMIT:
+        for i, v in enumerate(value):
+            _flatten_record(v, f"{key}.{i}" if key else str(i), out)
+    elif isinstance(value, (dict, list)):
+        out[key or "value"] = json.dumps(value, ensure_ascii=False) if value else ""
+    else:
+        out[key or "value"] = _csv_cell(value)
+
+
+def write_report_csv(jsonl, csv_path):
+    """The raw report as a spreadsheet: one row per record of report.jsonl, one column per value, nothing left out.
+    The first columns are the record's line number and its entry_type; the rest follow in the order they first
+    appear. A line that isn't JSON (a scan stopped mid-write) is kept whole in the column "unparsed". Rewritten only
+    when the report has changed."""
+    if not jsonl.exists() or (csv_path.exists() and csv_path.stat().st_mtime >= jsonl.stat().st_mtime):
+        return
+    columns = {"record": None, "entry_type": None}
+
+    def rows():
+        with jsonl.open(encoding="utf-8", errors="replace") as src:
+            for i, line in enumerate(src, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                row = {"record": i}
+                try:
+                    _flatten_record(json.loads(line), "", row)
+                except ValueError:
+                    row["unparsed"] = _csv_cell(line)
+                yield row
+
+    for row in rows():  # first pass: every column any record has, so each value lands under its own heading
+        columns.update(dict.fromkeys(row))
+    tmp = csv_path.with_name(csv_path.name + ".tmp")
+    with tmp.open("w", newline="", encoding="utf-8") as out:
+        w = csv.DictWriter(out, fieldnames=list(columns), restval="")
+        w.writeheader()
+        w.writerows(rows())
+    tmp.replace(csv_path)
 
 
 def write_report_text(jsonl, txt):
@@ -4126,19 +4210,28 @@ def write_report_text(jsonl, txt):
     tmp.replace(txt)
 
 
+RAW_FULL, RAW_HITLOG, RAW_TABLE = "Full report (report.jsonl)", "Hitlog (failing responses)", "Full report as CSV (columns)"
+
+
 def read_raw(name, which):
     if not _known_report(name):
         return ""
-    p = report_paths(name)["hitlog" if which == "Hitlog (failing responses)" else "jsonl"]
+    kind = {RAW_HITLOG: "hitlog", RAW_TABLE: "table"}.get(which, "jsonl")
+    p = report_paths(name)[kind]
+    if kind == "table":
+        try:
+            write_report_csv(report_paths(name)["jsonl"], p)
+        except OSError:
+            pass
     if not p.exists():
-        return "No failing responses were recorded for this run." if "hitlog" in p.name else "File not found."
+        return "No failing responses were recorded for this run." if kind == "hitlog" else "File not found."
     text = p.read_text(encoding="utf-8", errors="replace")
     if len(text) > RAW_LIMIT:
         text = text[:RAW_LIMIT] + f"\n\n[Truncated: showing {RAW_LIMIT:,} of {len(text):,} characters. Download the file for the rest.]"
     return text
 
 
-def show_report(name, which="Full report (report.jsonl)"):
+def show_report(name, which=RAW_FULL):
     empty = '<div class="empty">No reports yet. Run a scan to create one.</div>'
     if not _known_report(name):
         return empty, empty, "", None
@@ -4155,14 +4248,15 @@ def show_report(name, which="Full report (report.jsonl)"):
                       'and raw data show the results collected before it stopped.</div>')
     try:
         write_report_text(paths["jsonl"], paths["txt"])
+        write_report_csv(paths["jsonl"], paths["table"])
     except OSError:
         pass
-    files = [str(paths[k]) for k in ("analyst", "csv", "garak", "jsonl", "txt", "hitlog") if paths[k].exists()]
+    files = [str(paths[k]) for k in ("analyst", "csv", "garak", "jsonl", "table", "txt", "hitlog") if paths[k].exists()]
     return summary, garak_view, read_raw(name, which), files
 
 
 def _delete_run(name):
-    """Every file of one scan run: garak report, raw JSONL and its text copy, hitlog, summary, CSV. Returns how many
+    """Every file of one scan run: garak report, raw JSONL and its text and CSV copies, hitlog, summary, CSV. Returns how many
     were deleted."""
     prefix = name[:-len(".report.html")]
     removed = 0
@@ -4267,17 +4361,17 @@ _vars = dict(
     body_background_fill="#000000", body_text_color="#f5f5f7", body_text_color_subdued="#86868b",
     background_fill_primary="#161617", background_fill_secondary="#1d1d1f",
     block_background_fill="transparent", block_border_width="0px", block_shadow="none",
-    block_label_background_fill="transparent", block_label_text_color="#86868b", block_label_border_width="0px",
-    block_title_text_color="#86868b", block_title_text_weight="500", block_label_text_weight="500",
+    block_label_background_fill="transparent", block_label_text_color="#a1a1a6", block_label_border_width="0px",
+    block_title_text_color="#a1a1a6", block_title_text_weight="500", block_label_text_weight="500",
     border_color_primary="#2d2d2f", border_color_accent="#2997ff",
     input_background_fill="#1d1d1f", input_border_color="#2d2d2f", input_border_color_focus="#2997ff",
     input_shadow="none", input_shadow_focus="0 0 0 3px rgba(41,151,255,.25)", input_radius="12px",
-    button_primary_background_fill="#0071e3", button_primary_background_fill_hover="#0077ed",
+    button_primary_background_fill="#0071e3", button_primary_background_fill_hover="#0068d1",
     button_primary_text_color="#ffffff", button_primary_border_color="transparent",
     button_secondary_background_fill="#2a2a2c", button_secondary_background_fill_hover="#3a3a3c",
     button_secondary_text_color="#f5f5f7", button_secondary_border_color="transparent",
     button_cancel_background_fill="#2a2a2c", button_cancel_background_fill_hover="#3a1d1d",
-    button_cancel_text_color="#ff453a", button_cancel_border_color="transparent",
+    button_cancel_text_color="#ff6961", button_cancel_border_color="transparent",
     button_large_radius="980px", button_small_radius="980px", button_medium_radius="980px",
     color_accent="#2997ff", color_accent_soft="#0a2540", link_text_color="#2997ff",
     table_even_background_fill="#161617", table_odd_background_fill="#1a1a1c", table_border_color="#2d2d2f",
@@ -5022,8 +5116,8 @@ with gr.Blocks(title="LLM Scanner") as ui:
                 rep_confirm = gr.Checkbox(value=False, visible=False)
                 rep_picked = gr.State([])                                   # what is ticked, to spot new ticks
                 rep_shown = gr.State(_reports[0][1] if _reports else None)  # the report the tabs below display
-                with gr.Accordion("Download files (summary HTML, findings CSV, garak HTML, raw JSONL, raw report as text)",
-                                  open=False):
+                with gr.Accordion("Download files (summary HTML, findings CSV, garak HTML, raw JSONL, raw report as "
+                                  "CSV and as text)", open=False):
                     rep_files = gr.File(show_label=False, file_count="multiple")
             with gr.Tabs(elem_classes="subtabs"):
                 with gr.Tab("Security summary"):
@@ -5032,8 +5126,8 @@ with gr.Blocks(title="LLM Scanner") as ui:
                     rep_view = gr.HTML()
                 with gr.Tab("Raw data"):
                     with gr.Column(elem_classes="card"):
-                        raw_pick = gr.Radio(["Full report (report.jsonl)", "Hitlog (failing responses)"],
-                                            value="Full report (report.jsonl)", show_label=False, elem_classes="segmented")
+                        raw_pick = gr.Radio([RAW_FULL, RAW_TABLE, RAW_HITLOG],
+                                            value=RAW_FULL, show_label=False, elem_classes="segmented")
                         raw_view = gr.Code(show_label=False, language=None, lines=30, max_lines=30, elem_classes="log")
 
         # ---------------- Red team tools

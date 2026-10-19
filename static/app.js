@@ -500,6 +500,13 @@
     if (b) b.title = b.classList.contains('docs-only')
       ? "Attach documents and text files (this model can't view images)" : 'Attach images, documents, or text files';
   }, 1500);
+  // Saved chat names are cut with an ellipsis in the sidebar: hovering one shows the whole name.
+  const titleChats = () => document.querySelectorAll('.chat-item-row button.chat-item').forEach((b) => {
+    const t = b.innerText.trim();
+    if (b.title !== t) b.title = t;
+  });
+  new MutationObserver(titleChats).observe(document.body, {subtree: true, childList: true, characterData: true});
+  titleChats();
   // A running scan's progress card carries a heartbeat that changes every second. If it stops changing, the page
   // lost its connection to LLM Scanner (sleep, network, server restart) and only looks like the scan is stuck.
   let beat = null, beatSince = Date.now();

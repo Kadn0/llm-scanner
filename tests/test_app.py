@@ -1975,6 +1975,67 @@ def write_run(folder, prefix, *, complete=True, evals=True, hits=True):
 
 
 class Reports(TempDataTest):
+    def read_csv(self, path):
+        import csv
+        with open(path, newline="", encoding="utf-8") as fh:
+            return list(csv.DictReader(fh))
+
+    def test_raw_report_as_csv_with_a_column_per_value(self):
+        write_run(app.GARAK_RUNS, "m_20260917-100000")
+        name = "m_20260917-100000.report.html"
+        *_, files = app.show_report(name)
+        table = app.GARAK_RUNS / "m_20260917-100000.report.csv"
+        self.assertIn(str(table), files, "offered for download next to the JSONL")
+        rows = self.read_csv(table)
+        self.assertEqual(list(rows[0])[:2], ["record", "entry_type"])
+        self.assertEqual([r["entry_type"] for r in rows[:5]], ["start_run setup", "init", "eval", "completion", "digest"])
+        evals = rows[2]
+        self.assertEqual((evals["probe"], evals["detector"], evals["total_evaluated"], evals["passed"]),
+                         ("dan.DanInTheWild", "mitigation.MitigationBypass", "10", "4"))
+        self.assertEqual(rows[4]["eval.dan.dan.DanInTheWild.mitigation.MitigationBypass.absolute_defcon"], "2",
+                         "nested values get their own column, named by their path")
+        self.assertEqual(rows[4]["eval.dan.dan.DanInTheWild._summary.probe_tags.0"], "owasp:llm01", "lists by index")
+        self.assertEqual(rows[0]["start_time"], "", "a record leaves the other records' columns empty")
+        self.assertEqual(rows[1]["start_time"], "2026-09-17T10:00:00")
+        self.assertEqual((rows[5]["record"], rows[5]["unparsed"]), ("6", "{garbled"), "an unfinished line is kept")
+        before = table.stat().st_mtime_ns
+        app.show_report(name)
+        self.assertEqual(table.stat().st_mtime_ns, before, "not rewritten while the report is unchanged")
+
+    def test_raw_report_csv_keeps_attack_text_from_running_as_a_formula(self):
+        jsonl = app.GARAK_RUNS / "m_1.report.jsonl"
+        jsonl.write_text("\n".join(json.dumps(r) for r in [
+            {"entry_type": "attempt", "prompt": {"turns": [{"role": "user", "content": {"text": "=HYPERLINK(\"x\")"}}]},
+             "outputs": [{"text": "@SUM(1)"}, {"text": "fine, \"quoted\", and\nmulti-line"}], "score": -0.5,
+             "detector_results": {"d.X": [0.0, 1.0]}, "notes": None, "done": True, "empty": [], "meta": {}},
+            "just a string", None]) + "\n")
+        table = app.GARAK_RUNS / "m_1.report.csv"
+        app.write_report_csv(jsonl, table)
+        rows = self.read_csv(table)
+        a = rows[0]
+        self.assertEqual(a["prompt.turns.0.content.text"], "'=HYPERLINK(\"x\")")
+        self.assertEqual(a["outputs.0.text"], "'@SUM(1)")
+        self.assertEqual(a["outputs.1.text"], "fine, \"quoted\", and\nmulti-line", "commas, quotes and newlines survive")
+        self.assertEqual((a["score"], a["detector_results.d.X.0"], a["detector_results.d.X.1"]), ("-0.5", "0.0", "1.0"),
+                         "numbers are not treated as formulas")
+        self.assertEqual((a["notes"], a["done"], a["empty"], a["meta"]), ("", "true", "", ""))
+        self.assertEqual((rows[1]["value"], rows[2]["value"]), ("just a string", ""), "records that aren't objects")
+
+    def test_raw_report_csv_view_in_raw_data(self):
+        write_run(app.GARAK_RUNS, "m_20260917-100000")
+        raw = app.read_raw("m_20260917-100000.report.html", app.RAW_TABLE)
+        self.assertTrue(raw.startswith("record,entry_type,"), raw[:60])
+        self.assertIn("dan.DanInTheWild", raw)
+        self.assertEqual(app.read_raw("../x.report.html", app.RAW_TABLE), "")
+
+    def test_raw_report_csv_puts_a_long_list_in_one_cell(self):
+        jsonl = app.GARAK_RUNS / "m_1.report.jsonl"
+        jsonl.write_text(json.dumps({"entry_type": "config", "probes": [f"p{i}" for i in range(60)]}) + "\n")
+        app.write_report_csv(jsonl, app.GARAK_RUNS / "m_1.report.csv")
+        row = self.read_csv(app.GARAK_RUNS / "m_1.report.csv")[0]
+        self.assertEqual(json.loads(row["probes"])[59], "p59")
+        self.assertNotIn("probes.0", row)
+
     def test_raw_report_as_text(self):
         write_run(app.GARAK_RUNS, "m_20260917-100000")
         name = "m_20260917-100000.report.html"
@@ -2029,7 +2090,7 @@ class Reports(TempDataTest):
         self.assertTrue(choices[0][0].startswith("x_m "))
         summary, garak_view, raw, files = app.show_report(choices[0][1])
         self.assertIn("iframe", summary)
-        self.assertEqual(len(files), 6)  # summary, CSV, garak HTML, JSONL, its text copy, hitlog
+        self.assertEqual(len(files), 7)  # summary, findings CSV, garak HTML, JSONL, its CSV and text copies, hitlog
         self.assertIn("evil", app.read_raw(choices[0][1], "Hitlog (failing responses)"))
 
     def test_stopped_scan_with_results_is_listed(self):

@@ -14,7 +14,8 @@ security weaknesses with [garak](https://github.com/NVIDIA/garak). It runs entir
 - **Images**: text-to-image with Z-Image, FLUX.1, and Stable Diffusion 1.5 / XL through stable-diffusion.cpp,
   with a gallery. Image models can be found through Hugging Face search too.
 - **Scanning**: garak probes, saved probe groups, a live progress bar, and a security-analyst report with OWASP
-  LLM Top 10 mapping, evidence, remediation, and the raw garak data. Scans can be paused, a stuck probe is
+  LLM Top 10 mapping, evidence, remediation, and the raw garak data, also as a spreadsheet (CSV) with every value
+  of every record in its own column. Scans can be paused, a stuck probe is
   detected and restarted, and finished probes are never lost.
 - **Red team tools**: start and stop the own web interfaces of promptfoo (evals and red-team runs) and PyRIT from
   the app, on this computer only, with your installed models listed as promptfoo targets.
@@ -190,6 +191,14 @@ It lists what will be deleted and asks before doing anything.
 
 ## Changelog
 
+- **1.1.10**: The raw garak report is also saved as a spreadsheet (CSV): one row per record, every value in its own
+  column named by its path, offered in Download files and as a view under Raw data. Text that a spreadsheet would
+  run as a formula is kept as plain text. Clearer setting explanations, primary button hover and Extreme tags, a
+  hover title showing a saved chat's full name, and a collapsed chat sidebar no longer takes keyboard focus.
+  Fixes: chat search finds words in any script; an Ollama server error shows in the chat instead of a JSON
+  error or an empty reply; a GitHub rate limit no longer reads as "up to date"; a saved group whose probes are
+  all gone no longer starts garak's full scan; settings files holding the wrong kind of JSON no longer crash
+  saving a group or hide the built-in image models; Realistic Vision "no VAE" files are recognised as SD 1.5.
 - **1.1.9**: Probe time tags have five levels instead of three: Low, Medium, High, Very high and Extreme, so a probe
   of 151 prompts is no longer tagged the same as one of 6463. Probes whose prompts an attacker model writes during the
   scan are Very high. The hover now says when a probe has more prompts than garak sends (at most 256 per probe, picked
