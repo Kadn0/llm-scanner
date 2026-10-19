@@ -19,7 +19,7 @@ usage() {
   cat <<'EOF'
 Usage: ./install.sh [options]
 
-  --data FILE       restore chats, images, probe groups and reports from an export-data.sh file
+  --data FILE       restore chats, images, probe groups, reports and the red team tools' setup from an export-data.sh file
   --pull-models     with --data, also re-download the Ollama chat models listed in the export
   --no-autostart    don't open the app automatically when you log in
   --no-start        install everything but don't start the services or open the browser
@@ -201,7 +201,7 @@ fi
 
 # ---------------------------------------------------------------- your data
 if [ -n "$DATA_FILE" ]; then
-  step "Restoring your data (chats, images, probe groups, reports)"
+  step "Restoring your data (chats, images, probe groups, reports, red team tools' setup)"
   for item in chats attachments images probe_groups.json image_models.json; do
     if [ -e "$DATA_DIR_SRC/$item" ]; then
       cp -rn "$DATA_DIR_SRC/$item" "$APP_DIR/data/" 2>/dev/null || true
@@ -210,6 +210,27 @@ if [ -n "$DATA_FILE" ]; then
   if [ -d "$DATA_DIR_SRC/garak_runs" ]; then
     mkdir -p "$HOME/.local/share/garak/garak_runs"
     cp -rn "$DATA_DIR_SRC/garak_runs/." "$HOME/.local/share/garak/garak_runs/" 2>/dev/null || true
+  fi
+  if [ -d "$DATA_DIR_SRC/promptfoo" ]; then
+    mkdir -p "$APP_DIR/data/promptfoo"
+    cp -rn "$DATA_DIR_SRC/promptfoo/." "$APP_DIR/data/promptfoo/" 2>/dev/null || true
+  fi
+  if [ -d "$DATA_DIR_SRC/pyrit-settings" ]; then
+    # PyRIT's settings exactly as they were, with the old home folder in them changed to this machine's.
+    old_home="$(cat "$DATA_DIR_SRC/pyrit-settings/home.txt" 2>/dev/null || true)"
+    for pair in "dot-pyrit:.pyrit" "pyrit:pyrit"; do
+      src="$DATA_DIR_SRC/pyrit-settings/${pair%%:*}"
+      dest="$HOME/${pair#*:}"
+      [ -d "$src" ] || continue
+      if [ -n "$old_home" ] && [ "$old_home" != "$HOME" ]; then
+        grep -rlF "$old_home" "$src" 2>/dev/null | while IFS= read -r f; do
+          sed -i "s|$old_home|$HOME|g" "$f"
+        done
+      fi
+      mkdir -p "$dest"
+      cp -rn "$src/." "$dest/" 2>/dev/null || true
+    done
+    info "PyRIT's settings were restored to ~/.pyrit and ~/pyrit."
   fi
   info "Existing files on this machine were kept; only missing ones were added."
 fi

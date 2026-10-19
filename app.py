@@ -4336,6 +4336,8 @@ def _promptfoo_ours():
 # Installed by LLM Scanner when missing (at startup, so also right after an update), into ~/.local like Ollama.
 NODE_VERSION = "24.21.0"
 PROMPTFOO_VERSION = "0.124.1"
+PYRIT_VERSION = "1.1.0"
+PYRIT_PYTHON = "3.12"
 TOOLS_STATE_FILE = DATA_DIR / "tools_install.json"  # when an automatic install last failed, so it waits a day
 TOOLS_RETRY_SECS = 86400
 _tools = {"state": "", "msg": ""}  # state: "installing", "failed" or ""
@@ -4388,10 +4390,23 @@ def _install_promptfoo_package():
         raise RuntimeError("npm couldn't install promptfoo: " + (r.stderr or r.stdout or "").strip()[-300:])
 
 
-def install_promptfoo(force=False):
-    """Install Node.js and promptfoo into ~/.local if they're missing (about 1.6 GB). Runs at startup, which includes
-    the restart after an update; an automatic attempt that failed waits a day, the Install button doesn't."""
-    if _tools["state"] == "installing" or promptfoo_installed():
+def _install_pyrit_package():
+    """PyRIT in its own environment in ~/.local/pyrit (its packages don't mix with garak's), made with uv."""
+    venv = PYRIT_PY.parent.parent
+    for cmd in ([UV, "venv", str(venv), "--python", PYRIT_PYTHON, "--allow-existing"],
+                ["nice", "-n", "10", UV, "pip", "install", "--python", str(PYRIT_PY), f"pyrit=={PYRIT_VERSION}"]):
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        if r.returncode:
+            raise RuntimeError("couldn't install PyRIT: " + (r.stderr or r.stdout or "").strip()[-300:])
+    if not PYRIT_BACKEND.exists():
+        raise RuntimeError("PyRIT installed without its web interface (pyrit_backend)")
+
+
+def install_red_team_tools(force=False):
+    """Install what the Red team tools page runs, where it's missing: Node.js and promptfoo (about 1.6 GB) and PyRIT
+    (about 0.8 GB), into ~/.local. Runs at startup, which includes the restart after an update, so new installs and
+    updated copies end up with the same tools; an automatic attempt that failed waits a day, Install buttons don't."""
+    if _tools["state"] == "installing" or (promptfoo_installed() and PYRIT_BACKEND.exists()):
         return
     if not force:
         try:
@@ -4404,22 +4419,27 @@ def install_promptfoo(force=False):
         if not (NODE_BIN / "node").exists():
             _tools["msg"] = f"Downloading Node.js {NODE_VERSION}..."
             _install_node()
-        _tools["msg"] = f"Installing promptfoo {PROMPTFOO_VERSION}..."
-        _install_promptfoo_package()
+        if not PROMPTFOO_BIN.exists():
+            _tools["msg"] = f"Installing promptfoo {PROMPTFOO_VERSION}..."
+            _install_promptfoo_package()
+            print(f"Installed promptfoo {PROMPTFOO_VERSION} with Node.js {NODE_VERSION}", flush=True)
+        if not PYRIT_BACKEND.exists():
+            _tools["msg"] = f"Installing PyRIT {PYRIT_VERSION}..."
+            _install_pyrit_package()
+            print(f"Installed PyRIT {PYRIT_VERSION}", flush=True)
         _tools.update(state="", msg="")
         TOOLS_STATE_FILE.unlink(missing_ok=True)
-        print(f"Installed promptfoo {PROMPTFOO_VERSION} with Node.js {NODE_VERSION}", flush=True)
     except Exception as e:
         _tools.update(state="failed", msg=str(e)[-300:])
         TOOLS_STATE_FILE.write_text(json.dumps({"failed": time.time(), "error": str(e)[-300:]}), encoding="utf-8")
-        print(f"Could not install promptfoo: {e}", flush=True)
+        print(f"Could not install the red team tools: {e}", flush=True)
 
 
 def redteam_view():
     """(promptfoo status line, Start, Stop, Open link) for the current state."""
     if not promptfoo_installed():
         if _tools["state"] == "installing":
-            return (note_html(f"Installing promptfoo and Node.js (about 1.6 GB, once). {_tools['msg']}", "loading"),
+            return (note_html(f"Installing the red team tools (once). {_tools['msg']}", "loading"),
                     gr.update(visible=False), gr.update(visible=False), "")
         why = (f"The last attempt failed: {_tools['msg']} " if _tools["state"] == "failed" else
                "It installs on its own when LLM Scanner starts, or now with the button. ")
@@ -4446,7 +4466,7 @@ def start_promptfoo():
     """Start promptfoo's web interface and wait until it answers, or install it first if it's missing."""
     if not promptfoo_installed():
         if _tools["state"] != "installing":
-            threading.Thread(target=install_promptfoo, kwargs={"force": True}, daemon=True).start()
+            threading.Thread(target=install_red_team_tools, kwargs={"force": True}, daemon=True).start()
             time.sleep(0.5)
         while _tools["state"] == "installing":
             yield redteam_view()
@@ -4542,7 +4562,14 @@ def _pyrit_answers():
 def pyrit_view():
     """(PyRIT status line, Start, Stop, Open link) for the current state."""
     if not PYRIT_BACKEND.exists():
-        return "", gr.update(visible=False), gr.update(visible=False), ""
+        if _tools["state"] == "installing":
+            return (note_html(f"Installing the red team tools (once). {_tools['msg']}", "loading"),
+                    gr.update(visible=False), gr.update(visible=False), "")
+        why = (f"The last attempt failed: {_tools['msg']} " if _tools["state"] == "failed" else
+               "It installs on its own when LLM Scanner starts, or now with the button. ")
+        return (note_html(f"PyRIT isn't installed yet. {why}It goes into ~/.local/pyrit (about 0.8 GB).",
+                          "error" if _tools["state"] == "failed" else ""),
+                gr.update(value="Install PyRIT", visible=True, interactive=True), gr.update(visible=False), "")
     link = (f'<a class="pf-open" href="{PYRIT_URL}" target="_blank" rel="noopener">Open PyRIT</a>'
             f'<span class="pf-url">{PYRIT_URL}</span>')
     if _pyrit_ours():
@@ -4555,13 +4582,23 @@ def pyrit_view():
         return (note_html(f"Something else is already serving {PYRIT_URL}, probably PyRIT started from a terminal. "
                           "Open it, or stop it there to start it from here."),
                 gr.update(visible=True, interactive=False), gr.update(visible=False), link)
-    return (note_html("PyRIT is stopped. Nothing runs until you start it."), gr.update(visible=True, interactive=True),
-            gr.update(visible=False), "")
+    return (note_html("PyRIT is stopped. Nothing runs until you start it."),
+            gr.update(value="Start PyRIT", visible=True, interactive=True), gr.update(visible=False), "")
 
 
 def start_pyrit():
-    """Start PyRIT's web interface and show it starting until it answers (it loads for about half a minute)."""
-    if not PYRIT_BACKEND.exists() or _pyrit_ours() or _pyrit_answers():
+    """Start PyRIT's web interface and show it starting until it answers (it loads for about half a minute), or
+    install it first if it's missing."""
+    if not PYRIT_BACKEND.exists():
+        if _tools["state"] != "installing":
+            threading.Thread(target=install_red_team_tools, kwargs={"force": True}, daemon=True).start()
+            time.sleep(0.5)
+        while _tools["state"] == "installing":
+            yield pyrit_view()
+            time.sleep(2)
+        yield pyrit_view()
+        return
+    if _pyrit_ours() or _pyrit_answers():
         yield pyrit_view()
         return
     PYRIT_DATA.mkdir(parents=True, exist_ok=True)
@@ -5204,7 +5241,7 @@ if __name__ == "__main__":
             _resume["waiting"] = True  # set before the page can load, so it shows the pending resume
             threading.Thread(target=resume_interrupted_scan, daemon=True).start()
         threading.Thread(target=measure_probe_sizes, daemon=True).start()  # only does work after a garak update
-        threading.Thread(target=install_promptfoo, daemon=True).start()  # only does work where it's missing
+        threading.Thread(target=install_red_team_tools, daemon=True).start()  # only does work where it's missing
         threading.Thread(target=check_updates, daemon=True).start()  # once at startup; after that, on request
     ui.queue().launch(server_name="127.0.0.1", server_port=int(os.environ.get("LLM_SCANNER_PORT", 7861)),
                       inbrowser="--no-browser" not in sys.argv, allowed_paths=[str(GARAK_RUNS), str(ATTACH_DIR), str(IMAGES_DIR)],

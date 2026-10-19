@@ -1149,41 +1149,58 @@ class RedTeamTools(TempDataTest):
         super().setUp()
         for name, value in {"NODE_BIN": self.tmp / "node/bin", "PROMPTFOO_DIR": self.tmp / "promptfoo",
                             "PROMPTFOO_BIN": self.tmp / "promptfoo/node_modules/.bin/promptfoo",
-                            "TOOLS_STATE_FILE": self.tmp / "data/tools.json"}.items():
+                            "TOOLS_STATE_FILE": self.tmp / "data/tools.json",
+                            "PYRIT_BACKEND": self.tmp / "pyrit/bin/pyrit_backend",
+                            "PYRIT_PY": self.tmp / "pyrit/bin/python"}.items():
             self.enterContext(mock.patch.object(app, name, value))
         self.enterContext(mock.patch.dict(app._tools, {"state": "", "msg": ""}))
 
     def fake_install(self, *_):
-        for f in (app.NODE_BIN / "node", app.PROMPTFOO_BIN):
+        for f in (app.NODE_BIN / "node", app.PROMPTFOO_BIN, app.PYRIT_BACKEND):
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_text("")
 
     def test_installs_what_is_missing(self):
+        """New installs and updated copies end up with the same tools: promptfoo with Node.js, and PyRIT."""
         with mock.patch.object(app, "_install_node", side_effect=self.fake_install) as node, \
-                mock.patch.object(app, "_install_promptfoo_package") as pkg:
-            app.install_promptfoo()
+                mock.patch.object(app, "_install_promptfoo_package") as pkg, \
+                mock.patch.object(app, "_install_pyrit_package") as pyrit:
+            app.install_red_team_tools()
             node.assert_called_once()
-            pkg.assert_called_once()
-            app.install_promptfoo()
+            self.assertEqual(pkg.call_count + pyrit.call_count, 0, "already there once Node.js's step made them")
+            app.install_red_team_tools()
         self.assertEqual(node.call_count, 1, "nothing to do once it's there")
         self.assertTrue(app.promptfoo_installed())
+        app.PYRIT_BACKEND.unlink()
+        with mock.patch.object(app, "_install_node") as node, mock.patch.object(app, "_install_pyrit_package") as pyrit:
+            app.install_red_team_tools()
+        node.assert_not_called()
+        pyrit.assert_called_once()
+
+    def test_pyrit_install_command(self):
+        with mock.patch.object(app.subprocess, "run", return_value=mock.Mock(returncode=0)) as run, \
+                mock.patch.object(app, "PYRIT_BACKEND", mock.Mock(exists=lambda: True)):
+            app._install_pyrit_package()
+        venv, install = (c.args[0] for c in run.call_args_list)
+        self.assertEqual(venv[:3], [app.UV, "venv", str(app.PYRIT_PY.parent.parent)])
+        self.assertIn(f"pyrit=={app.PYRIT_VERSION}", install, "pinned, like every other part")
 
     def test_a_failed_install_waits_a_day_unless_asked(self):
         with mock.patch.object(app, "_install_node", side_effect=RuntimeError("no network")) as node:
-            app.install_promptfoo()
+            app.install_red_team_tools()
             self.assertEqual(app._tools["state"], "failed")
             status, start, *_ = app.redteam_view()
             self.assertIn("no network", status)
             self.assertEqual(start["value"], "Install promptfoo")
-            app.install_promptfoo()
+            app.install_red_team_tools()
             self.assertEqual(node.call_count, 1, "not retried on every start")
-            app.install_promptfoo(force=True)
+            app.install_red_team_tools(force=True)
             self.assertEqual(node.call_count, 2, "the Install button retries at once")
 
     def test_view_while_installing_and_when_stopped(self):
         app._tools.update(state="installing", msg="Downloading Node.js")
         status, start, stop, link = app.redteam_view()
-        self.assertIn("Installing promptfoo", status)
+        self.assertIn("Installing the red team tools", status)
         self.assertFalse(start["visible"])
         app._tools.update(state="", msg="")
         self.fake_install()
@@ -1204,9 +1221,12 @@ class PyritLauncher(TempDataTest):
         self.enterContext(mock.patch.object(app, "PYRIT_DATA", self.tmp / "data/pyrit"))
         self.enterContext(mock.patch.dict(app._pyrit, {"p": None}))
 
-    def test_hidden_when_not_installed(self):
-        status, start, stop, link = app.pyrit_view()
-        self.assertFalse(start["visible"], "no Start button without PyRIT installed")
+    def test_offers_to_install_when_missing(self):
+        with mock.patch.dict(app._tools, {"state": "", "msg": ""}):
+            status, start, stop, link = app.pyrit_view()
+        self.assertIn("installed yet", status)
+        self.assertEqual(start["value"], "Install PyRIT")
+        self.assertFalse(stop["visible"])
 
     def test_start_and_stop(self):
         self.backend.parent.mkdir(parents=True)

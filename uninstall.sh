@@ -32,6 +32,7 @@ APP_DIR="$HOME/llm-scanner"
 echo "This will permanently remove:"
 echo "  - the LLM Scanner and Ollama services, app menu entry and login startup"
 echo "  - $HOME/.local/ollama (Ollama) and $HOME/.local/sd-cpp (image engine)"
+echo "  - $HOME/.local/node, $HOME/.local/promptfoo and $HOME/.local/pyrit (red team tools)"
 if [ "$KEEP_DATA" = "1" ]; then
   echo "  - $APP_DIR, except its data folder"
 else
@@ -51,7 +52,7 @@ rm -f "$HOME/.local/share/applications/llm-scanner.desktop" "$HOME/.config/autos
 rm -f "$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop")/llm-scanner.desktop"
 rm -f "$HOME/.local/share/icons/hicolor/scalable/apps/llm-scanner.svg" \
       "$HOME/.local/share/icons/hicolor/256x256/apps/llm-scanner.png"
-rm -rf "$HOME/.local/ollama" "$HOME/.local/sd-cpp"
+rm -rf "$HOME/.local/ollama" "$HOME/.local/sd-cpp" "$HOME/.local/node" "$HOME/.local/promptfoo" "$HOME/.local/pyrit"
 rm -f "$HOME/.local/bin/ollama"
 
 if [ "$KEEP_DATA" = "1" ]; then
@@ -61,4 +62,5 @@ else
   rm -rf "$APP_DIR" "$HOME/.local/share/garak"
 fi
 [ "$REMOVE_MODELS" = "1" ] && rm -rf "$HOME/.ollama/models"
-echo "LLM Scanner has been removed. (uv in ~/.local/bin was left in place; delete it if you don't use it.)"
+echo "LLM Scanner has been removed. (uv in ~/.local/bin and PyRIT's own settings in ~/.pyrit were left in place;"
+echo "delete them if you don't use them.)"

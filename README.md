@@ -79,7 +79,7 @@ needs, plus Ollama), so expect 10 to 20 minutes. When it finishes, LLM Scanner o
 | stable-diffusion.cpp | Runs image models | `~/.local/sd-cpp` |
 | garak, Gradio, PyTorch | Scanner and app packages (exact pinned versions) | `~/llm-scanner/.venv` |
 | uv | Python and package installer | `~/.local/bin/uv` |
-| Node.js, promptfoo | Red team tools (installed by the app the first time it starts, about 1.6 GB) | `~/.local/node`, `~/.local/promptfoo` |
+| Node.js, promptfoo, PyRIT | Red team tools (installed by the app when it starts and they're missing, about 2.4 GB) | `~/.local/node`, `~/.local/promptfoo`, `~/.local/pyrit` |
 
 Installer options:
 
@@ -95,8 +95,8 @@ To install from a clone instead: `git clone https://github.com/Kadn0/llm-scanner
 ## Move to a new machine (optional)
 
 A fresh install starts empty: no models, chats, images, or reports. If you do want to bring your chats, images,
-probe groups, and scan reports along (models and your Hugging Face token are never copied), export them on the old
-machine:
+probe groups, scan reports and the red team tools' setup (promptfoo's data, and PyRIT's settings in `~/.pyrit` and
+`~/pyrit`) along (models and your Hugging Face token are never copied), export them on the old machine:
 
 ```bash
 ~/llm-scanner/export-data.sh
@@ -188,6 +188,11 @@ It lists what will be deleted and asks before doing anything.
 
 ## Changelog
 
+- **1.1.7**: New installs and updated copies end up with the same red team tools: PyRIT is now installed where it's
+  missing, like promptfoo and Node.js (an Install button on the Red team tools page does it right away), and
+  `uninstall.sh` removes all three. Moving to a new machine now carries the red team tools' setup too: `export-data.sh`
+  includes promptfoo's data and PyRIT's settings (`~/.pyrit`, `~/pyrit`), and `install.sh --data` restores them with
+  their paths changed to the new home folder. The export file is now readable only by you.
 - **1.1.6**: The Red team tools page can start and stop PyRIT's own web interface (when PyRIT is installed in
   `~/.local/pyrit`), on this computer only and with PyRIT's settings in `~/.pyrit`, so it is used without the command
   line. It shows PyRIT starting, links to it once it runs, and stops with LLM Scanner.

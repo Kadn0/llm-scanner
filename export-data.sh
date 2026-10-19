@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Export your LLM Scanner data to one file, to restore on another machine with: ./install.sh --data FILE
 # Includes chats (and their attachments), generated images, probe groups, the list of image models you added,
-# scan reports, and the names of your Ollama chat models. Model files themselves are NOT included, and neither is
-# settings.json: it holds your Hugging Face token, which should not travel in a data archive.
+# scan reports, the names of your Ollama chat models, and the red team tools' setup: promptfoo's data and PyRIT's
+# settings (~/.pyrit and ~/pyrit, as they are). Model files themselves are NOT included, and neither is settings.json:
+# it holds your Hugging Face token, which should not travel in a data archive.
 set -euo pipefail
 
 OUT="$HOME/llm-scanner-data-$(date +%Y%m%d-%H%M).tar.gz"
@@ -24,13 +25,29 @@ for item in chats attachments images probe_groups.json image_models.json; do
 done
 rm -rf "$D/attachments/staging"
 if [ -d "$HOME/.local/share/garak/garak_runs" ]; then cp -r "$HOME/.local/share/garak/garak_runs" "$D/garak_runs"; fi
+if [ -d "$APP_DIR/data/promptfoo" ]; then
+  cp -r "$APP_DIR/data/promptfoo" "$D/promptfoo"
+  rm -rf "$D/promptfoo/logs" "$D/promptfoo/server.log"
+fi
+if [ -d "$HOME/.pyrit" ] || [ -d "$HOME/pyrit" ]; then
+  mkdir -p "$D/pyrit-settings"
+  echo "$HOME" > "$D/pyrit-settings/home.txt"  # paths inside are rewritten to the new home on restore
+  if [ -d "$HOME/.pyrit" ]; then cp -r "$HOME/.pyrit" "$D/pyrit-settings/dot-pyrit"; fi
+  if [ -d "$HOME/pyrit" ]; then cp -r "$HOME/pyrit" "$D/pyrit-settings/pyrit"; fi
+  find "$D/pyrit-settings" -name __pycache__ -type d -prune -exec rm -rf {} +
+fi
 if "$HOME/.local/bin/ollama" list >/dev/null 2>&1; then
   "$HOME/.local/bin/ollama" list | awk 'NR > 1 {print $1}' > "$D/ollama-models.txt"
 fi
 
 count() { find "$D/$1" -name "$2" 2>/dev/null | wc -l; }
 echo "Exporting: $(count chats '*.json') chats, $(count images '*.png') images, $(count garak_runs '*.report.jsonl') scan reports," \
-     "$(wc -l < "$D/ollama-models.txt" 2>/dev/null || echo 0) chat model names"
+     "$(if [ -f "$D/ollama-models.txt" ]; then wc -l < "$D/ollama-models.txt"; else echo 0; fi) chat model names"
+if [ -d "$D/promptfoo" ]; then echo "Including promptfoo's data"; fi
+if [ -d "$D/pyrit-settings" ]; then
+  echo "Including PyRIT's settings (~/.pyrit, ~/pyrit). They can hold API keys, so keep this file private."
+fi
 tar -czf "$OUT" -C "$STAGE" llm-scanner-data
+chmod 600 "$OUT"
 echo "Saved $OUT ($(du -h "$OUT" | cut -f1))"
 echo "On the new machine: ./install.sh --data $(basename "$OUT")   (add --pull-models to re-download chat models)"
