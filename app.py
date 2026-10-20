@@ -7,6 +7,7 @@ import codecs
 import concurrent.futures
 import csv
 import functools
+import glob
 import hashlib
 import html
 import importlib.metadata
@@ -14,6 +15,7 @@ import importlib.util
 import json
 import os
 import platform
+import random
 import re
 import shutil
 import signal
@@ -391,7 +393,10 @@ def pump_output(p, on_text, on_exit):
                 pass
         p.stdout.close()
         p.wait()
-        on_exit()
+        try:
+            on_exit()
+        except Exception as e:  # logged rather than lost: the saved job still lets the scan be resumed
+            print(f"Error after a background process ended: {e!r}", flush=True)
 
     reader = threading.Thread(target=run, daemon=True)
     reader.start()
@@ -3349,11 +3354,19 @@ def run_scan(model, scan_type, selected, generations, timeout, thinking=False):
     if _image_proc.get("p") and _image_proc["p"].poll() is None:
         yield "An image is being generated on the GPU. Start the scan once it finishes.", *_UNCHANGED
         return
+    if (halted := _load_scan_job()) and halted.get("halted"):  # starting over would lose its place
+        yield (f"A halted scan of {halted['model']} is waiting. Press Continue or Skip probe to finish it, or Stop to "
+               "end it, before starting a new scan.", gr.update(), gr.update(interactive=True), *_UNCHANGED[2:])
+        return
+    if problem := _disk_problem():
+        yield f"Can't start the scan: {problem.split('. ')[0]}. Free up space first.", *_UNCHANGED
+        return
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", model)
     job = {"model": model, "scan_type": scan_type, "requested": probes or [], "queue": [], "done": [], "failed": [],
            "skipped": [], "generations": int(generations), "timeout": int(timeout), "thinking": bool(thinking),
-           "prefix": f"{safe}_{time.strftime('%Y%m%d-%H%M%S')}", "parts": 1, "stalls": 0}
-    _save_scan_job(job)  # (replaces a halted scan, whose finished parts stay in Reports)
+           "prefix": f"{safe}_{time.strftime('%Y%m%d-%H%M%S')}", "parts": 1, "stalls": 0,
+           "seed": random.randrange(1, 2 ** 31)}
+    _save_scan_job(job)
     _launch_scan(job)
     yield from follow_scan()
 
@@ -3366,8 +3379,16 @@ def run_scan(model, scan_type, selected, generations, timeout, thinking=False):
 # those forever without printing anything), or no progress at all. The first time a probe gets stuck the scan
 # restarts from that probe; if the same probe gets stuck again the scan halts with "halted" in SCAN_JOB, keeping
 # its progress, until the user presses Continue, Skip probe or Stop (also after LLM Scanner restarts).
+#
+# No answer from the model is lost along the way: garak_runner.py saves each one the moment it arrives (in
+# <part>.responses.jsonl) and a later part reuses them, so an interrupted probe carries on where it was cut off
+# instead of starting over. A scan is never dropped on its own: whatever stops it from continuing (the model was
+# removed, Ollama doesn't start, the disk is full, it keeps getting interrupted) halts it with the reason, and Continue
+# picks it up again. Only Stop, or finishing, ends a scan.
 SCAN_JOB = DATA_DIR / "scan_job.json"
-MAX_STALLED_RESUMES = 3  # give up on a scan that is interrupted this many times in a row without finishing a probe
+MAX_STALLED_RESUMES = 3  # halt a scan that is interrupted this many times in a row without any progress
+DISK_START_MB = 500  # free space a scan needs to start or continue
+DISK_HALT_MB = 200  # a running scan halts below this, before garak fails to write its report
 OLLAMA_WAIT_SECS = 600  # after a reboot, how long a resume waits for Ollama to come up
 WATCH_SECS = 10  # how often the watchdog checks a running scan
 MODEL_CHECK_SECS = 30  # how often it makes sure the scan's model is still loaded
@@ -3384,18 +3405,90 @@ _scan_lock = threading.RLock()
 _resume = {"waiting": False}
 
 
+def _write_durably(path, text):
+    """Replace path with text so that a crash or power cut leaves either the old or the new file, never a broken one."""
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+    tmp.replace(path)
+    try:
+        fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(fd)  # the rename itself
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def _scan_job_backup():
+    """The second copy of SCAN_JOB, used if it is unreadable (next to it, wherever SCAN_JOB points)."""
+    return SCAN_JOB.with_name(SCAN_JOB.stem + ".backup.json")
+
+
 def _save_scan_job(job):
-    tmp = SCAN_JOB.with_suffix(".tmp")
-    tmp.write_text(json.dumps(job), encoding="utf-8")
-    tmp.replace(SCAN_JOB)
+    """Save the scan's progress, and a second copy. A failed write (full disk) is reported, never raised: it must not
+    end the thread that follows garak, and the scan keeps its progress in memory to save at the next chance."""
+    text = json.dumps(job)
+    try:
+        _write_durably(SCAN_JOB, text)
+        _write_durably(_scan_job_backup(), text)
+        return True
+    except OSError as e:
+        print(f"Could not save the scan's progress: {e}", flush=True)
+        return False
 
 
 def _load_scan_job():
-    try:
-        job = json.loads(SCAN_JOB.read_text(encoding="utf-8"))
-        return job if isinstance(job, dict) and job.get("model") else None
-    except (OSError, ValueError):
+    """The saved scan, or None when there is none. scan_job.json only goes away when the scan ends (Stop or done);
+    if it is there but unreadable, the backup copy saved alongside it is used."""
+    if not SCAN_JOB.exists():
         return None
+    for path in (SCAN_JOB, _scan_job_backup()):
+        try:
+            job = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(job, dict) and job.get("model"):
+                return job
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _clear_scan_job():
+    """The scan is over (finished or stopped): forget it."""
+    SCAN_JOB.unlink(missing_ok=True)
+    _scan_job_backup().unlink(missing_ok=True)
+
+
+def _responses_file(prefix):
+    return GARAK_RUNS / f"{prefix}.responses.jsonl"
+
+
+def _saved_answers(job):
+    """How many answers all parts of the scan have saved so far: progress even when no probe has finished."""
+    count = 0
+    for n in range(1, job["parts"] + 1):
+        try:
+            with _responses_file(_part_name(job, n)).open("rb") as fh:
+                count += sum(1 for _ in fh)
+        except OSError:
+            continue
+    return count
+
+
+def _disk_problem(limit_mb=DISK_START_MB):
+    """Why there isn't room to run a scan, or ''."""
+    try:
+        GARAK_RUNS.mkdir(parents=True, exist_ok=True)
+        free = shutil.disk_usage(GARAK_RUNS).free
+    except OSError:
+        return ""
+    if free >= limit_mb * 1024 * 1024:
+        return ""
+    return (f"the disk is almost full ({free / 1024 / 1024:.0f} MB free, at least {limit_mb} MB needed). Free up "
+            "space, then press Continue")
 
 
 def _remaining_probes(job):
@@ -3497,6 +3590,10 @@ def hf_reason(kind):
 
 def _launch_scan(job, note=""):
     """Start garak for the job's unfinished probes. Output goes to _scan so any open page can show it."""
+    while any(GARAK_RUNS.glob(glob.escape(_part_name(job, job["parts"])) + ".*")):
+        job["parts"] += 1  # garak overwrites a report it is pointed at: never hand it the name of an earlier part
+    job.setdefault("seed", random.randrange(1, 2 ** 31))  # (scans saved by older versions get one now)
+    _save_scan_job(job)
     prefix = _part_name(job, job["parts"])
     gen_opts = {"timeout": job["timeout"]}
     if job["thinking"]:
@@ -3508,7 +3605,10 @@ def _launch_scan(job, note=""):
     if remaining:
         cmd += ["--probes", ",".join(remaining)]
     env = os.environ | {"PYTHONUNBUFFERED": "1", "TERM": "dumb", "PYTHONIOENCODING": "utf-8",
-                        "LLM_SCANNER_THINK": "1" if job["thinking"] else "0", "LLM_SCANNER_MODEL": job["model"]}
+                        "LLM_SCANNER_THINK": "1" if job["thinking"] else "0", "LLM_SCANNER_MODEL": job["model"],
+                        "LLM_SCANNER_SEED": str(job["seed"]), "LLM_SCANNER_RESPONSES": str(_responses_file(prefix)),
+                        "LLM_SCANNER_REUSE": os.pathsep.join(str(_responses_file(_part_name(job, n)))
+                                                             for n in range(1, job["parts"]))}
     if not job.get("hf_online"):
         env.update(HF_HUB_OFFLINE="1", HF_DATASETS_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
     elif not job.get("hf_checked"):  # once per scan: a token Hugging Face rejects would break even public downloads
@@ -3602,7 +3702,7 @@ def _launch_scan(job, note=""):
             elif _scan["user_stop"]:
                 _scan["end"] = "Scan stopped."
             if not failed:
-                SCAN_JOB.unlink(missing_ok=True)
+                _clear_scan_job()
         if failed:  # garak failed or was killed (out of memory, ...): restart from this probe, or halt
             if rc < 0:
                 time.sleep(3)  # if LLM Scanner itself is being shut down, it is gone by now (the job resumes)
@@ -3693,6 +3793,9 @@ def _watch_scan(p):
         except Exception:
             pass
         samples = [s for s in samples if now - s[0] <= STALL_IDLE_SECS]
+        if _proc.get("p") is p and (reason := _disk_problem(DISK_HALT_MB)):
+            _scan_stuck(reason, halt_now=True)  # before garak fails to write and its last answers are lost
+            return
         if _proc.get("p") is p and (reason := _stall_reason(samples, now)):
             _scan_stuck(reason)
             return
@@ -3705,11 +3808,11 @@ def _stuck_probe(job):
     return next(iter(_remaining_probes(job)), None)
 
 
-def _scan_stuck(reason, manual=False, hf=None):
+def _scan_stuck(reason, manual=False, hf=None, halt_now=False):
     """The scan is stuck or garak died mid-scan. Restart garak from the probe it was on, keeping finished probes; if
     that probe was already restarted, halt instead and let the user decide. manual: the Restart probe button.
     hf: a Hugging Face file that isn't downloaded yet ("offline") or a refused download ("token", "rate", "access"),
-    handled without ever halting."""
+    handled without ever halting. halt_now: halt at once (the disk is full: a restart could not help)."""
     with _scan_lock:
         job = _scan["job"]
         if not job or _scan["action"] or _scan["user_stop"]:
@@ -3721,7 +3824,7 @@ def _scan_stuck(reason, manual=False, hf=None):
         else:
             count = job.get("stuck_count", 0) + 1 if job.get("stuck_on") == probe else 1
             job.update(stuck_on=probe, stuck_count=count)
-            halt = not manual and count > AUTO_RESTARTS
+            halt = halt_now or (not manual and count > AUTO_RESTARTS)
         _scan.update(action="halt" if halt else "restart", why=reason, manual=manual, hf=hf)
         if SCAN_JOB.exists():
             _save_scan_job(job)
@@ -3791,11 +3894,13 @@ def _recover_scan(job, halt):
         if _scan["user_stop"] or not SCAN_JOB.exists():  # Stop was pressed meanwhile
             _scan.update(action=None, end="Scan stopped.", ok=False)
             return
-        if halt or not ollama_up():
-            job["halted"] = why if halt else f"{why}; Ollama could not be restarted"
+        disk = "" if halt else _disk_problem()
+        if halt or disk or not ollama_up():
+            job["halted"] = why if halt else f"{why}; then {disk}" if disk else f"{why}; Ollama could not be restarted"
             _save_scan_job(job)
             _scan.update(action=None, ok=False, end=f"Scan halted on {probe or 'startup'}: "
-                                                     f"{job['halted'].rstrip('.')}. Finished probes are kept.")
+                                                     f"{job['halted'].rstrip('.')}. Nothing is lost: finished probes "
+                                                     "and every answer so far are kept.")
             return
         if hf == "offline":
             job["hf_online"] = True
@@ -3855,8 +3960,9 @@ def _halted_view(job):
     progress = _scan["progress"] if current else ScanProgress(job["queue"], job["done"], job["failed"],
                                                                job.get("skipped", []))
     notes = [f"Why: {job['halted']}.",
-             "Finished probes are kept. Continue retries this probe (if the model is slow, raise the Response timeout "
-             "under Advanced settings first), Skip probe moves on to the next one, and Stop ends the scan."]
+             "Finished probes and every answer so far are kept. Continue carries on from where the scan stopped (if "
+             "the model is slow, raise the Response timeout under Advanced settings first), Skip probe moves on to "
+             "the next one, and Stop ends the scan."]
     log = (_scan_log() + "\n\n" if current else "") + f"Scan halted on {job.get('stuck_on') or 'startup'}."
     return _scan_view(log, "halted", progress.html("halted", notes, job.get("stuck_on")), job)
 
@@ -3908,8 +4014,37 @@ def attach_scan():
         yield gr.update(), *_UNCHANGED
 
 
+def _end_orphaned_garak(job):
+    """A garak this scan started before LLM Scanner was cut short may still be running (when it wasn't started as a
+    service): end it before the scan continues, so two never write at once. Its answers are saved and reused."""
+    for proc in psutil.process_iter(["cmdline"]):
+        cmd = proc.info["cmdline"] or []
+        try:
+            prefix = cmd[cmd.index("--report_prefix") + 1]
+        except (ValueError, IndexError):
+            continue
+        if any(c.endswith("garak_runner.py") for c in cmd) and (
+                prefix == job["prefix"] or prefix.startswith(job["prefix"] + "_part")):
+            try:
+                print(f"Ending garak left running by the interrupted scan (pid {proc.pid}).", flush=True)
+                proc.terminate()
+                proc.wait(15)
+            except psutil.TimeoutExpired:
+                proc.kill()
+            except psutil.Error:
+                pass
+
+
+def _halt_job(job, why):
+    """Keep the scan, waiting for Continue, Skip probe or Stop, with the reason it can't go on by itself."""
+    job["halted"] = why
+    _save_scan_job(job)
+    print(f"Interrupted scan halted: {why}.", flush=True)
+
+
 def resume_interrupted_scan():
-    """Continue a scan that LLM Scanner's stop, a crash or a shutdown cut short (runs once at startup)."""
+    """Continue a scan that LLM Scanner's stop, a crash or a shutdown cut short (runs once at startup). If it can't
+    continue by itself, it is halted with the reason and kept for Continue: never dropped."""
     _resume["waiting"] = True
     try:
         job = _load_scan_job()
@@ -3917,36 +4052,44 @@ def resume_interrupted_scan():
             return
         remaining = _remaining_probes(job)
         if job["queue"] and not remaining:
-            SCAN_JOB.unlink(missing_ok=True)  # every probe finished; only the exit was missed
+            _clear_scan_job()  # every probe finished; only the exit was missed
             return
+        _end_orphaned_garak(job)
         deadline = time.time() + OLLAMA_WAIT_SECS
         while not ollama_up():
             if not SCAN_JOB.exists():  # Stop was pressed while waiting
                 return
             if time.time() > deadline:
-                print("Interrupted scan not resumed: Ollama did not start. It will be tried again next start.", flush=True)
+                _halt_job(job, f"Ollama did not start within {OLLAMA_WAIT_SECS // 60} minutes after LLM Scanner "
+                               "started. Start it at the top of the page, then press Continue")
                 return
             time.sleep(5)
         if not SCAN_JOB.exists():  # Stop was pressed while waiting
             return
         if job["model"] not in model_names():
-            print(f"Interrupted scan dropped: {job['model']} is no longer installed.", flush=True)
-            SCAN_JOB.unlink(missing_ok=True)
+            _halt_job(job, f"{job['model']} is no longer installed. Install it again and press Continue, or press "
+                           "Stop to end the scan")
             return
-        job["stalls"] = job["stalls"] + 1 if len(job["done"]) == job.get("done_at_resume", -1) else 0
+        if problem := _disk_problem():
+            _halt_job(job, problem)
+            return
+        answers = _saved_answers(job)
+        moved = len(job["done"]) != job.get("done_at_resume", -1) or answers != job.get("answers_at_resume", -1)
+        job["stalls"] = 0 if moved else job["stalls"] + 1
         if job["stalls"] >= MAX_STALLED_RESUMES:
-            print(f"Interrupted scan dropped: it stopped {job['stalls']} times in a row without progress.", flush=True)
-            SCAN_JOB.unlink(missing_ok=True)
+            _halt_job(job, f"it was interrupted {job['stalls']} times in a row without getting any further. Press "
+                           "Continue to try again, or Skip probe to move on")
             return
         job["parts"] += 1
-        job["done_at_resume"] = len(job["done"])
+        job.update(done_at_resume=len(job["done"]), answers_at_resume=answers)
         _save_scan_job(job)
         left = (f"{len(remaining)} of {len(job['queue'])} probes left" if job["queue"]
                 else "garak had not started probing yet, so the scan starts over")
         earlier = ", ".join(_part_name(job, n) for n in range(1, job["parts"]))
         note = (f"Resumed after LLM Scanner was stopped: {left}. Results from before the interruption are in "
                 f"{'report' if job['parts'] == 2 else 'reports'} {earlier}; this part is saved as "
-                f"{_part_name(job, job['parts'])}.\n")
+                f"{_part_name(job, job['parts'])}." + (f" The {answers} answers the model gave before are reused, "
+                                                       "not asked again." if answers else "") + "\n")
         print(note.strip(), flush=True)
         _launch_scan(job, note)
     finally:
@@ -3964,8 +4107,14 @@ def _continue_halted(job, timeout, note):
     if _image_proc.get("p") and _image_proc["p"].poll() is None:
         yield "An image is being generated on the GPU. Continue once it finishes.", *_UNCHANGED
         return
+    if (names := model_names()) and job["model"] not in names:  # (an empty list may be Ollama still starting)
+        yield f"{job['model']} is not installed. Install it on the Models tab, then press Continue.", *_UNCHANGED
+        return
+    if problem := _disk_problem():
+        yield f"Can't continue: {problem}.", *_UNCHANGED
+        return
     if job["queue"] and not _remaining_probes(job):
-        SCAN_JOB.unlink(missing_ok=True)
+        _clear_scan_job()
         yield _scan_view(note + "No probes are left to run. Open Reports to view the results.", "done",
                          IDLE_PROGRESS)
         return
@@ -3974,7 +4123,7 @@ def _continue_halted(job, timeout, note):
         note += f"Response timeout changed from {job['timeout']}s to {int(timeout)}s. "
         job["timeout"] = int(timeout)
     job["parts"] += 1
-    job["done_at_resume"] = len(job["done"])
+    job.update(done_at_resume=len(job["done"]), answers_at_resume=_saved_answers(job), stalls=0)
     _save_scan_job(job)
     _launch_scan(job, note + f"This part is saved as {_part_name(job, job['parts'])}.\n")
     yield from follow_scan()
@@ -4031,7 +4180,7 @@ def stop_scan():
 def _stop_scan():
     _scan["user_stop"] = True
     job = _load_scan_job()
-    SCAN_JOB.unlink(missing_ok=True)  # also cancels a resume that is still waiting for Ollama, or a halted scan
+    _clear_scan_job()  # also cancels a resume that is still waiting for Ollama, or a halted scan
     p = _proc.get("p")
     if p and p.poll() is None:
         if _scan.get("paused"):  # a suspended process cannot act on SIGTERM until it is allowed to run again

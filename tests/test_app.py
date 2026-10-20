@@ -3,9 +3,11 @@
 Nothing here touches real data, models or the network: every path the code writes to is redirected to a
 temporary folder, and HTTP calls to Ollama or Hugging Face are replaced with fakes."""
 
+import importlib.util
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -1806,19 +1808,102 @@ class ScanResume(TempDataTest):
         app.stop_scan()
         self.assertFalse(app.SCAN_JOB.exists(), "Stop must cancel a pending resume")
 
-    def test_gives_up_on_missing_model_or_repeated_stalls(self):
+    def test_missing_model_or_repeated_stalls_halt_instead_of_dropping_the_scan(self):
         job = {"model": "m", "scan_type": "x", "requested": [], "queue": ["a.A", "b.B"], "done": ["a.A"],
                "failed": [], "generations": 1, "timeout": 60, "thinking": False, "prefix": "m_1", "parts": 2,
-               "stalls": 0, "done_at_resume": 1}
+               "stalls": 0, "done_at_resume": 1, "answers_at_resume": 0}
         app._save_scan_job(job)
         self.assertEqual(self.resume(installed=()), [])
-        self.assertFalse(app.SCAN_JOB.exists())
+        self.assertIn("m is no longer installed", app._load_scan_job()["halted"], "kept for Continue, not dropped")
         for attempt in range(app.MAX_STALLED_RESUMES - 1):
             app._save_scan_job(dict(job, stalls=attempt))
             self.assertEqual(len(self.resume()), 1)
         app._save_scan_job(dict(job, stalls=app.MAX_STALLED_RESUMES - 1))
         self.assertEqual(self.resume(), [], "a scan that keeps dying on the same probe must not loop forever")
-        self.assertFalse(app.SCAN_JOB.exists())
+        self.assertIn("interrupted 3 times in a row", app._load_scan_job()["halted"])
+        app._save_scan_job(dict(job, stalls=app.MAX_STALLED_RESUMES - 1))
+        app._responses_file("m_1_part2").write_text('{"probe": "b.B", "prompt": "[]", "outputs": []}\n')
+        self.assertEqual(len(self.resume()), 1, "answers saved since the last resume are progress")
+
+    def test_resume_halts_when_ollama_never_starts(self):
+        app._save_scan_job({"model": "m", "scan_type": "x", "requested": [], "queue": ["a.A", "b.B"], "done": [],
+                            "failed": [], "generations": 1, "timeout": 60, "thinking": False, "prefix": "m_1",
+                            "parts": 1, "stalls": 0})
+        with mock.patch.object(app, "ollama_up", return_value=""), mock.patch.object(app, "OLLAMA_WAIT_SECS", 0), \
+                mock.patch.object(app, "_launch_scan") as launch:
+            app.resume_interrupted_scan()
+        launch.assert_not_called()
+        self.assertIn("Ollama did not start", app._load_scan_job()["halted"], "waits for Continue, not the next start")
+
+    def test_resume_ends_a_garak_left_running_by_the_interrupted_scan(self):
+        ours = mock.Mock(pid=11, info={"cmdline": [sys.executable, "/x/garak_runner.py", "--report_prefix", "m_1_part2"]})
+        other = mock.Mock(pid=12, info={"cmdline": [sys.executable, "/x/garak_runner.py", "--report_prefix", "m_10"]})
+        app._save_scan_job({"model": "m", "scan_type": "x", "requested": [], "queue": ["a.A"], "done": [],
+                            "failed": [], "generations": 1, "timeout": 60, "thinking": False, "prefix": "m_1",
+                            "parts": 2, "stalls": 0})
+        with mock.patch.object(app.psutil, "process_iter", return_value=[ours, other]):
+            self.assertEqual(len(self.resume()), 1)
+        ours.terminate.assert_called_once()
+        other.terminate.assert_not_called()
+
+    def test_resume_halts_instead_of_starting_on_a_full_disk(self):
+        app._save_scan_job({"model": "m", "scan_type": "x", "requested": [], "queue": ["a.A"], "done": [],
+                            "failed": [], "generations": 1, "timeout": 60, "thinking": False, "prefix": "m_1",
+                            "parts": 1, "stalls": 0})
+        with mock.patch.object(app.shutil, "disk_usage", return_value=mock.Mock(free=50 * 1024 * 1024)):
+            self.assertEqual(self.resume(), [])
+        self.assertIn("disk is almost full (50 MB free", app._load_scan_job()["halted"])
+
+    def test_running_scan_halts_before_the_disk_fills(self):
+        app._scan.update(job={"stuck_on": None}, action=None, user_stop=False)
+        p = mock.Mock(pid=1)
+        p.poll.return_value = None
+        with mock.patch.dict(app._proc, {"p": p}), mock.patch.object(app, "WATCH_SECS", 0), \
+                mock.patch.object(app, "_work_secs", return_value={}), \
+                mock.patch.object(app.shutil, "disk_usage", return_value=mock.Mock(free=10 * 1024 * 1024)), \
+                mock.patch.object(app, "_scan_stuck") as stuck:
+            app._watch_scan(p)
+        self.assertIn("disk is almost full", stuck.call_args.args[0])
+        self.assertTrue(stuck.call_args.kwargs["halt_now"], "a restart can't help, so it halts at once")
+
+    def test_new_scan_refused_while_a_halted_one_waits(self):
+        app._save_scan_job({"model": "old", "halted": "stuck", "queue": [], "done": [], "parts": 1, "prefix": "o"})
+        with mock.patch.object(app, "ollama_up", return_value="1"), mock.patch.object(app, "list_models", return_value=[]), \
+                mock.patch.object(app, "resolve_scan", return_value=(["a.A"], None)), \
+                mock.patch.object(app, "_launch_scan") as launch:
+            msg, *_ = next(app.run_scan("m", "Quick check", [], 1, 60))
+        launch.assert_not_called()
+        self.assertIn("A halted scan of old is waiting", msg)
+        self.assertEqual(app._load_scan_job()["model"], "old", "the halted scan keeps its place")
+
+    def test_job_file_survives_a_broken_write_and_full_disk(self):
+        job = {"model": "m", "queue": ["a.A"], "done": [], "parts": 1, "prefix": "m_1"}
+        self.assertTrue(app._save_scan_job(job))
+        app.SCAN_JOB.write_text('{"model": "m", "qu')  # a power cut in the middle of a write
+        self.assertEqual(app._load_scan_job(), job, "the backup copy is used")
+        with mock.patch.object(app, "_write_durably", side_effect=OSError(28, "No space left on device")):
+            self.assertFalse(app._save_scan_job(dict(job, done=["a.A"])), "reported, not raised")
+        app._clear_scan_job()
+        self.assertIsNone(app._load_scan_job(), "a finished or stopped scan does not come back from the backup")
+        self.assertEqual(list(app.SCAN_JOB.parent.glob("scan_job*")), [])
+
+    def test_launch_never_reuses_a_part_name_and_hands_garak_the_saved_answers(self):
+        job = {"model": "m", "scan_type": "x", "requested": [], "queue": ["a.A", "b.B"], "done": ["a.A"],
+               "failed": [], "generations": 1, "timeout": 60, "thinking": False, "prefix": "m_1", "parts": 2,
+               "stalls": 0, "seed": 42}
+        (app.GARAK_RUNS / "m_1_part2.report.jsonl").write_text("{}\n")  # e.g. a job file older than the reports
+        with mock.patch.object(app.subprocess, "Popen") as popen, mock.patch.object(app, "pump_output"), \
+                mock.patch.object(app.threading, "Thread"):
+            popen.return_value.pid = 1
+            app._launch_scan(job)
+        app._proc["p"] = None
+        cmd, env = popen.call_args.args[0], popen.call_args.kwargs["env"]
+        self.assertEqual(cmd[cmd.index("--report_prefix") + 1], "m_1_part3", "garak would overwrite part 2")
+        self.assertEqual(app._load_scan_job()["parts"], 3)
+        self.assertEqual(env["LLM_SCANNER_RESPONSES"], str(app.GARAK_RUNS / "m_1_part3.responses.jsonl"))
+        self.assertEqual(env["LLM_SCANNER_REUSE"].split(os.pathsep),
+                         [str(app.GARAK_RUNS / "m_1.responses.jsonl"), str(app.GARAK_RUNS / "m_1_part2.responses.jsonl")])
+        self.assertEqual(env["LLM_SCANNER_SEED"], "42", "the same prompts are picked in every part")
 
     def test_stall_reasons(self):
         now = time.time()
@@ -1972,6 +2057,44 @@ class ScanResume(TempDataTest):
 
 
 # ---------------------------------------------------------------- reports
+@unittest.skipUnless(importlib.util.find_spec("garak"), "garak is not installed")
+class GarakRunnerKeepsAnswers(unittest.TestCase):
+    """garak_runner.py with real garak and its echo generator (no model needed): each answer is saved as it arrives,
+    and the next part of a scan gets saved answers back instead of asking the model again."""
+
+    def run_part(self, tmp, prefix, reuse=""):
+        env = os.environ | {"XDG_DATA_HOME": str(tmp / "xdg"), "XDG_CACHE_HOME": str(tmp / "cache"),
+                            "HF_HUB_OFFLINE": "1", "LLM_SCANNER_SEED": "7", "LLM_SCANNER_REUSE": reuse,
+                            "LLM_SCANNER_RESPONSES": str(tmp / f"{prefix}.responses.jsonl")}
+        r = subprocess.run([sys.executable, str(APP_DIR / "garak_runner.py"), "--target_type", "test.Repeat",
+                            "--probes", "test.Test", "--generations", "2", "--report_prefix", prefix],
+                           env=env, capture_output=True, text=True, timeout=300)
+        self.assertEqual(r.returncode, 0, r.stdout[-2000:] + r.stderr[-2000:])
+        self.assertNotIn("failed to load probe", r.stdout)
+        report = tmp / "xdg" / "garak" / "garak_runs" / f"{prefix}.report.jsonl"
+        scored = [json.loads(line) for line in report.read_text().splitlines()]
+        return r.stdout, [a for a in scored if a.get("entry_type") == "attempt" and a["status"] == 2]
+
+    def test_answers_are_saved_and_reused_after_an_interruption(self):
+        tmp = Path(tempfile.mkdtemp(prefix="llm-scanner-runner-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        _, first = self.run_part(tmp, "p1")
+        saved = [json.loads(line) for line in (tmp / "p1.responses.jsonl").read_text().splitlines()]
+        self.assertEqual(len(saved), len(first), "one saved line per prompt")
+        for i, r in enumerate(saved[:3]):  # the interruption came after three answers
+            for o in r["outputs"]:
+                o["text"] = f"SAVED-{i}"
+        (tmp / "p1.responses.jsonl").write_text("".join(json.dumps(r) + "\n" for r in saved[:3]) + '{"probe": "te')
+        out, second = self.run_part(tmp, "p2", reuse=str(tmp / "p1.responses.jsonl"))
+        self.assertIn("LLM Scanner: reusing answers saved before the interruption for test.Test", out)
+        texts = [[o["text"] for o in a["outputs"]] for a in second]
+        self.assertEqual(texts[:3], [["SAVED-0"] * 2, ["SAVED-1"] * 2, ["SAVED-2"] * 2],
+                         "the same prompts, in the same order, get their saved answers back")
+        self.assertTrue(all("SAVED" not in t for ts in texts[3:] for t in ts), "the rest are asked for real")
+        self.assertEqual(len((tmp / "p2.responses.jsonl").read_text().splitlines()), len(second),
+                         "the new part holds every answer, reused ones too")
+
+
 def write_run(folder, prefix, *, complete=True, evals=True, hits=True):
     lines = [{"entry_type": "start_run setup", "plugins.target_type": "ollama.OllamaGeneratorChat",
               "plugins.target_name": "m", "run.generations": 1, "plugins.probe_spec": "dan.DanInTheWild"},

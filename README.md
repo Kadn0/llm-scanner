@@ -15,8 +15,11 @@ security weaknesses with [garak](https://github.com/NVIDIA/garak). It runs entir
   with a gallery. Image models can be found through Hugging Face search too.
 - **Scanning**: garak probes, saved probe groups, a live progress bar, and a security-analyst report with OWASP
   LLM Top 10 mapping, evidence, remediation, the raw garak data, and a results table (CSV) with one row per model
-  response: probe, prompt, response, pass or fail, and each detector's score. Scans can be paused, a stuck probe is
-  detected and restarted, and finished probes are never lost.
+  response: probe, prompt, response, pass or fail, and each detector's score. Scans can be paused, and nothing a
+  scan has done is lost when something goes wrong: every model answer is saved to disk as it arrives, and after
+  a crash, a restart, a power cut or a stuck probe the scan carries on where it was cut off, reusing the saved
+  answers instead of asking again. A scan that can't go on by itself (model removed, Ollama down, disk full) is
+  halted with the reason and kept for Continue, never dropped.
 - **Red team tools**: start and stop the own web interfaces of promptfoo (evals and red-team runs) and PyRIT from
   the app, on this computer only, with your installed models listed as promptfoo targets.
 - **Housekeeping**: models load only while in use, a live GPU/RAM status bar, start at boot, and one-click
@@ -191,6 +194,13 @@ It lists what will be deleted and asks before doing anything.
 
 ## Changelog
 
+- **1.1.12**: Nothing a scan has done is lost when something goes wrong. Every model answer is saved to disk the
+  moment it arrives, and after a crash, a restart, a power cut or a stuck probe the scan carries on where it was
+  cut off, reusing the saved answers instead of asking the model again (each probe picks the same prompts every
+  time). A scan that can't go on by itself (the model was removed, Ollama doesn't start, the disk is almost full,
+  it keeps getting interrupted) is halted with the reason and kept for Continue instead of being dropped, and a
+  new scan can't replace a halted one. The scan's progress file is written safely with a backup copy, a garak
+  left running by a crash is ended before the scan continues, and an earlier part's report is never overwritten.
 - **1.1.11**: The results table (CSV) is a real table now: one row per model response, with the probe, prompt,
   response, Pass, Fail or Not scored (garak's own threshold), and each detector's score in its own column. It is
   saved in the garak_runs folder as soon as a scan ends (also a stopped one), with the text copy, and runs from
