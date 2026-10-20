@@ -3685,6 +3685,7 @@ def _launch_scan(job, note=""):
 
     def on_exit():  # also runs if the page was closed during the scan
         save_report_copies(prefix)  # whatever garak wrote, also when the scan stopped or garak failed
+        save_combined_copies(prefix)
         with _scan_lock:
             if _proc["p"] is p:
                 _proc["p"] = None
@@ -4206,23 +4207,183 @@ def scan_controls_after_stop():
 
 
 # ---------------------------------------------------------------- reports
-def reports():
-    """(label, name) per scan run, newest first. A run is named by its garak HTML report; a scan that was
-    stopped partway has no HTML report, only report.jsonl, and is listed as stopped."""
+PART_RE = re.compile(r"(.+)_part([2-9]|[1-9]\d+)")  # a scan continued after an interruption: <prefix>_part2, ...
+COMBINED = ".combined"  # <prefix>.combined.*: the reports of every part of such a scan, merged into one
+
+
+def _report_runs():
+    """(prefix, [prefix of each part, first to last], newest mtime) per scan run, newest first. A scan that was
+    interrupted and continued wrote each part as a report of its own (<prefix>, <prefix>_part2, ...): one run."""
     if not GARAK_RUNS.exists():
         return []
-    runs = {}
+    found = {}
     for f in GARAK_RUNS.iterdir():
         for suffix in (".report.html", ".report.jsonl"):
             if f.name.endswith(suffix) and len(f.name) > len(suffix):
                 prefix = f.name[:-len(suffix)]
-                runs[prefix] = max(runs.get(prefix, 0), f.stat().st_mtime)
+                if not prefix.endswith(COMBINED):
+                    found[prefix] = max(found.get(prefix, 0), f.stat().st_mtime)
+    runs = {}
+    for prefix, mtime in found.items():
+        m = PART_RE.fullmatch(prefix)
+        run = runs.setdefault(m[1] if m else prefix, {"parts": {}, "mtime": 0})
+        run["parts"][int(m[2]) if m else 1] = prefix
+        run["mtime"] = max(run["mtime"], mtime)
+    return sorted(((prefix, [r["parts"][n] for n in sorted(r["parts"])], r["mtime"]) for prefix, r in runs.items()),
+                  key=lambda r: r[2], reverse=True)
+
+
+def _run_parts(prefix):
+    return next((parts for p, parts, _ in _report_runs() if p == prefix), [prefix])
+
+
+def reports():
+    """(label, name) per scan run, newest first. A run is named by its garak HTML report; a scan that was
+    stopped partway has no HTML report, only report.jsonl, and is listed as stopped. A scan that ran in parts is
+    listed once, under the name of its first part."""
     out = []
-    for prefix, mtime in sorted(runs.items(), key=lambda r: r[1], reverse=True):
+    for prefix, parts, mtime in _report_runs():
         label = re.sub(r"_(\d{8}-\d{6})$", "", prefix).replace("hf.co_", "")
-        stopped = "" if (GARAK_RUNS / f"{prefix}.report.html").exists() else "   (stopped)"
-        out.append((f"{label}   {time.strftime('%b %d, %H:%M', time.localtime(mtime))}{stopped}", prefix + ".report.html"))
+        label += f"   {time.strftime('%b %d, %H:%M', time.localtime(mtime))}"
+        if len(parts) > 1:
+            label += f"   ({len(parts)} parts)"
+        if not (GARAK_RUNS / f"{parts[-1]}.report.html").exists():
+            label += "   (stopped)"
+        out.append((label, prefix + ".report.html"))
     return out
+
+
+def _report_records(path):
+    """(line, record) for each record of a garak JSONL file; unreadable lines (a scan stopped mid-write) are left
+    out."""
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(d, dict):
+                    yield line.rstrip("\n"), d
+    except OSError:
+        return
+
+
+def _stat(f):
+    try:
+        return f.stat()
+    except OSError:
+        return None
+
+
+def _probe_key(name):
+    return str(name).replace("probes.", "")  # garak names a probe with or without this prefix in different records
+
+
+_combine_lock = threading.Lock()  # a part's end and the Reports page may merge the same scan at once
+
+
+def combine_parts(prefix, parts):
+    """Merge the reports of a scan that ran in several parts into <prefix>.combined.report.jsonl and
+    .combined.hitlog.jsonl, which its security summary, findings CSV and results table are made from. A probe
+    interrupted in one part runs again in the next, so each probe's records come from the part where it finished
+    (the one with its eval records), or for a probe that never finished, from the last part that ran it. The parts
+    themselves are left as they are: scan recovery reads them. Rebuilt only when a part has changed since, also one
+    written to while this ran."""
+    out = GARAK_RUNS / f"{prefix}{COMBINED}.report.jsonl"
+    hitlog = GARAK_RUNS / f"{prefix}{COMBINED}.hitlog.jsonl"
+    jsonls = [GARAK_RUNS / f"{p}.report.jsonl" for p in parts]
+    hitlogs = [GARAK_RUNS / f"{p}.hitlog.jsonl" for p in parts]
+    with _combine_lock:
+        sources = [[f.name, st.st_size, st.st_mtime_ns] for f in jsonls + hitlogs for st in [_stat(f)] if st]
+        try:
+            with out.open(encoding="utf-8") as fh:
+                head = json.loads(fh.readline())  # which part files, as they were then, it was made from
+        except (OSError, ValueError):
+            head = {}
+        if not (hitlog.exists() and isinstance(head, dict) and head.get("sources") == sources):
+            _write_combined(parts, jsonls, hitlogs, sources, out, hitlog)
+    return out
+
+
+def _write_combined(parts, jsonls, hitlogs, sources, out, hitlog):
+    setup = init = cache = completion = None
+    owner, finished, digests = {}, {}, []
+    for i, f in enumerate(jsonls):
+        for _, d in _report_records(f):
+            kind = d.get("entry_type")
+            if kind == "start_run setup":
+                setup = setup or d
+            elif kind == "init":
+                init = init or d
+            elif kind == "plugin_cache" and isinstance(d.get("plugin_cache"), dict):
+                probes = {**((cache or {}).get("plugin_cache", {}).get("probes") or {}),
+                          **(d["plugin_cache"].get("probes") or {})}
+                cache = dict(d, plugin_cache=dict(d["plugin_cache"], probes=probes))
+            elif kind == "completion":
+                completion = d if i == len(jsonls) - 1 else completion  # only a finished last part ends the scan
+            elif kind == "digest" and isinstance(d.get("eval"), dict):
+                digests.append((i, d))
+            elif kind in ("eval", "probe_summary"):
+                finished[_probe_key(d.get("probe"))] = i
+            elif kind == "attempt":
+                owner[_probe_key(d.get("probe_classname"))] = i
+    owner.update(finished)
+    tmp, tmp_hits = out.with_name(out.name + ".tmp"), hitlog.with_name(hitlog.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as w:
+        for d in ({"entry_type": "llm_scanner.parts", "parts": parts, "sources": sources}, setup, init, cache):
+            if d:
+                w.write(json.dumps(d, ensure_ascii=False) + "\n")
+        for i, f in enumerate(jsonls):
+            for line, d in _report_records(f):
+                if d.get("entry_type") in ("attempt", "eval", "probe_summary") and \
+                        owner.get(_probe_key(d.get("probe_classname") or d.get("probe")), i) == i:
+                    w.write(line + "\n")
+        if completion:
+            w.write(json.dumps(completion, ensure_ascii=False) + "\n")
+        if digests:
+            groups = {}
+            for i, d in digests:
+                for group, probes in d["eval"].items():
+                    for probe, entry in (probes.items() if isinstance(probes, dict) else ()):
+                        if probe == "_summary" or owner.get(_probe_key(probe), i) == i:
+                            groups.setdefault(group, {})[probe] = entry
+            groups = {g: probes for g, probes in groups.items() if set(probes) - {"_summary"}}
+            w.write(json.dumps(dict(digests[-1][1], eval=groups), ensure_ascii=False) + "\n")
+    with tmp_hits.open("w", encoding="utf-8") as w:
+        for i, f in enumerate(hitlogs):
+            for line, d in _report_records(f):
+                if owner.get(_probe_key(d.get("probe")), i) == i:
+                    w.write(line + "\n")
+    tmp_hits.replace(hitlog)
+    tmp.replace(out)
+
+
+def run_files(name):
+    """The files the Reports tab shows for a listed run: report_paths of the run, or for a scan that ran in parts,
+    of its merged copy (<prefix>.combined.*). "parts" holds the garak HTML report of each part."""
+    prefix = name[:-len(".report.html")]
+    parts = _run_parts(prefix)
+    if len(parts) < 2:
+        paths = report_paths(name)
+        return dict(paths, parts=[paths["garak"]])
+    combine_parts(prefix, parts)
+    return dict(report_paths(f"{prefix}{COMBINED}.report.html"), parts=[GARAK_RUNS / f"{p}.report.html" for p in parts])
+
+
+def save_combined_copies(prefix):
+    """After a part of a scan ends: the merged report of all its parts and that report's copies, so they are in the
+    garak_runs folder without opening the report first."""
+    m = PART_RE.fullmatch(prefix)
+    prefix = m[1] if m else prefix
+    parts = _run_parts(prefix)
+    if len(parts) > 1:
+        try:
+            combine_parts(prefix, parts)
+        except Exception as e:  # a full disk or an odd report must never break a scan or the Reports page
+            print(f"Could not merge the parts of {prefix}: {e}", flush=True)
+            return
+        save_report_copies(prefix + COMBINED)
 
 
 def _known_report(name):
@@ -4274,7 +4435,8 @@ def report_paths(name):
     prefix = name[:-len(".report.html")]
     return {"garak": f, "jsonl": f.with_name(prefix + ".report.jsonl"), "hitlog": f.with_name(prefix + ".hitlog.jsonl"),
             "analyst": f.with_name(prefix + ".analyst.html"), "csv": f.with_name(prefix + ".findings.csv"),
-            "txt": f.with_name(prefix + ".report.txt"), "table": f.with_name(prefix + ".report.csv")}
+            "txt": f.with_name(prefix + ".report.txt"), "table": f.with_name(prefix + ".report.csv"),
+            "hits": f.with_name(prefix + ".hitlog.csv")}
 
 
 CSV_FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
@@ -4359,6 +4521,35 @@ def write_report_csv(jsonl, csv_path):
     tmp.replace(csv_path)
 
 
+HITLOG_CSV_HEAD = ["Probe", "Detector", "Score", "Attempt", "Generation", "Prompt", "Response", "Goal", "Triggers",
+                   "Attempt ID"]
+
+
+def write_hitlog_csv(hitlog, csv_path):
+    """The hitlog as a spreadsheet: one row per failing response and the detector that failed it, with its score, the
+    prompt and the response. Rewritten only when the hitlog has changed."""
+    if not hitlog.exists():
+        return
+    if csv_path.exists() and csv_path.stat().st_mtime >= hitlog.stat().st_mtime:
+        with csv_path.open(encoding="utf-8-sig") as fh:
+            if fh.readline().startswith(",".join(HITLOG_CSV_HEAD)):
+                return
+    tmp = csv_path.with_name(csv_path.name + ".tmp")
+    with tmp.open("w", newline="", encoding="utf-8-sig") as out:  # the BOM makes Excel read the text as UTF-8
+        w = csv.writer(out)
+        w.writerow(HITLOG_CSV_HEAD)
+        for _, h in _report_records(hitlog):
+            triggers = h.get("triggers") or []
+            triggers = "; ".join(map(str, triggers)) if isinstance(triggers, list) else str(triggers)
+            idx = h.get("attempt_idx")
+            w.writerow([_csv_cell(v) for v in [
+                h.get("probe"), h.get("detector"), h.get("score"), h.get("attempt_seq"),
+                idx + 1 if isinstance(idx, int) else "", _csv_prompt(h.get("prompt")),
+                _turn_text(h["output"]) if h.get("output") is not None else "", h.get("goal"), triggers,
+                h.get("attempt_id")]])
+    tmp.replace(csv_path)
+
+
 def write_report_text(jsonl, txt):
     """The raw report as a text file any editor opens: every record of report.jsonl, laid out over indented lines
     and numbered, nothing left out. Rewritten only when the report has changed."""
@@ -4380,37 +4571,49 @@ def write_report_text(jsonl, txt):
 
 
 def save_report_copies(prefix):
-    """Save a run's results table (CSV) and text copy next to its report.jsonl, so they are in the garak_runs folder
-    without opening the report first. Each is rewritten only when the report has changed."""
-    jsonl = GARAK_RUNS / f"{prefix}.report.jsonl"
-    for write, suffix in ((write_report_text, ".report.txt"), (write_report_csv, ".report.csv")):
+    """Save a run's results table (CSV), text copy and hitlog table (CSV) next to its report.jsonl, so they are in the
+    garak_runs folder without opening the report first. Each is rewritten only when its source has changed."""
+    for write, source, suffix in ((write_report_text, ".report.jsonl", ".report.txt"),
+                                  (write_report_csv, ".report.jsonl", ".report.csv"),
+                                  (write_hitlog_csv, ".hitlog.jsonl", ".hitlog.csv")):
         try:
-            write(jsonl, GARAK_RUNS / f"{prefix}{suffix}")
+            write(GARAK_RUNS / f"{prefix}{source}", GARAK_RUNS / f"{prefix}{suffix}")
         except Exception as e:  # a full disk or an odd report must never break a scan or the Reports page
             print(f"Could not save {prefix}{suffix}: {e}", flush=True)
 
 
 def save_all_report_copies():
-    """At startup: the copies for every run that is missing them, or whose report changed since."""
-    for _, name in reports():
-        save_report_copies(name[:-len(".report.html")])
+    """At startup: the copies for every run that is missing them, or whose report changed since; for a scan that ran
+    in parts, for each part and for the merged report."""
+    for prefix, parts, _ in _report_runs():
+        for part in parts:
+            save_report_copies(part)
+        save_combined_copies(prefix)
 
 
 RAW_FULL, RAW_HITLOG, RAW_TABLE = "Full report (report.jsonl)", "Hitlog (failing responses)", "Results table (CSV)"
+RAW_HITS = "Hitlog table (CSV)"
+RAW_KINDS = {RAW_HITLOG: "hitlog", RAW_TABLE: "table", RAW_HITS: "hits"}  # anything else: the full report
 
 
 def read_raw(name, which):
     if not _known_report(name):
         return ""
-    kind = {RAW_HITLOG: "hitlog", RAW_TABLE: "table"}.get(which, "jsonl")
-    p = report_paths(name)[kind]
-    if kind == "table":
-        try:
-            write_report_csv(report_paths(name)["jsonl"], p)
-        except OSError:
-            pass
+    kind = RAW_KINDS.get(which, "jsonl")
+    paths = run_files(name)
+    p = paths[kind]
+    try:
+        if kind == "table":
+            write_report_csv(paths["jsonl"], p)
+        elif kind == "hits":
+            write_hitlog_csv(paths["hitlog"], p)
+    except OSError:
+        pass
+    hitlog = _stat(paths["hitlog"])
+    if kind in ("hitlog", "hits") and not (hitlog and hitlog.st_size):
+        return "No failing responses were recorded for this run."  # also a merged scan's hitlog when nothing failed
     if not p.exists():
-        return "No failing responses were recorded for this run." if kind == "hitlog" else "File not found."
+        return "File not found."
     text = p.read_text(encoding="utf-8-sig", errors="replace")
     if len(text) > RAW_LIMIT:
         text = text[:RAW_LIMIT] + f"\n\n[Truncated: showing {RAW_LIMIT:,} of {len(text):,} characters. Download the file for the rest.]"
@@ -4422,7 +4625,7 @@ def raw_file_link(name, which):
     viewer itself may hold a cut-short copy, and would save it as file.txt). Read by static/app.js."""
     if not _known_report(name):
         return ""
-    p = report_paths(name)[{RAW_HITLOG: "hitlog", RAW_TABLE: "table"}.get(which, "jsonl")]
+    p = run_files(name)[RAW_KINDS.get(which, "jsonl")]
     if not p.exists():
         return ""
     return (f'<span class="raw-file-data" data-href="/gradio_api/file={html.escape(urllib.parse.quote(str(p)))}" '
@@ -4433,29 +4636,46 @@ def show_report(name, which=RAW_FULL):
     empty = '<div class="empty">No reports yet. Run a scan to create one.</div>'
     if not _known_report(name):
         return empty, empty, "", None
-    paths = report_paths(name)
+    try:
+        paths = run_files(name)
+    except OSError as e:  # a full disk while merging the parts of a scan
+        error = f'<div class="empty">Could not read this report: {html.escape(str(e))}</div>'
+        return error, error, "", None
     try:
         analyst_report.build(paths["garak"])
         summary = f'<iframe class="report dark" srcdoc="{html.escape(paths["analyst"].read_text(encoding="utf-8"))}"></iframe>'
     except Exception as e:
         summary = f'<div class="empty">Could not build the security summary: {html.escape(str(e))}</div>'
-    if paths["garak"].exists():
-        garak_view = f'<iframe class="report" srcdoc="{html.escape(paths["garak"].read_text(encoding="utf-8"))}"></iframe>'
+    parts = paths["parts"]
+    if len(parts) > 1:
+        garak_view = [f'<p class="report-parts">This scan was interrupted and continued, so it ran in {len(parts)} '
+                      'parts. garak wrote a report for each part, covering the probes that part ran; the security '
+                      'summary and raw data combine them.</p>']
+        for n, f in enumerate(parts, 1):
+            garak_view.append(f'<h3 class="report-part">Part {n} <span>{html.escape(f.name)}</span></h3>')
+            garak_view.append(f'<iframe class="report" srcdoc="{html.escape(f.read_text(encoding="utf-8"))}"></iframe>'
+                              if f.exists() else '<div class="empty">This part was stopped before garak wrote its '
+                                                 'report.</div>')
+        garak_view = "".join(garak_view)
+    elif parts[0].exists():
+        garak_view = f'<iframe class="report" srcdoc="{html.escape(parts[0].read_text(encoding="utf-8"))}"></iframe>'
     else:
         garak_view = ('<div class="empty">This scan was stopped before garak wrote its report. The security summary '
                       'and raw data show the results collected before it stopped.</div>')
-    save_report_copies(name[:-len(".report.html")])
-    files = [str(paths[k]) for k in ("analyst", "csv", "garak", "jsonl", "table", "txt", "hitlog") if paths[k].exists()]
+    save_report_copies(paths["jsonl"].name[:-len(".report.jsonl")])
+    files = [str(paths[k]) for k in ("analyst", "csv") if paths[k].exists()] + [str(f) for f in parts if f.exists()]
+    files += [str(paths[k]) for k in ("jsonl", "table", "txt", "hitlog", "hits") if paths[k].exists()]
     return summary, garak_view, read_raw(name, which), files
 
 
 def _delete_run(name):
-    """Every file of one scan run: garak report, raw JSONL and its text copy, results table, hitlog, summary, findings
-    CSV. Returns how many were deleted."""
-    prefix = name[:-len(".report.html")]
+    """Every file of one scan run: garak report, raw JSONL and its text copy, results table, hitlog and its table,
+    summary, findings CSV, for each part of a scan that ran in parts and for their merged report. Returns how many
+    were deleted."""
+    starts = tuple(p + "." for p in _run_parts(name[:-len(".report.html")]))
     removed = 0
     for f in list(GARAK_RUNS.iterdir()):
-        if f.is_file() and f.name.startswith(prefix + "."):
+        if f.is_file() and f.name.startswith(starts):
             f.unlink()
             removed += 1
     return removed
@@ -4476,12 +4696,13 @@ def delete_reports(names, confirmed, shown, which):
 
 def open_report(name):
     if _known_report(name):
-        p = report_paths(name)["analyst"]
+        paths = dict(report_paths(name), parts=[GARAK_RUNS / name])
         try:
-            analyst_report.build(GARAK_RUNS / name)
+            paths = run_files(name)
+            analyst_report.build(paths["garak"])
         except Exception:
             pass
-        target = p if p.exists() else GARAK_RUNS / name
+        target = paths["analyst"] if paths["analyst"].exists() else paths["parts"][-1]
         if not target.exists():
             return
         threading.Thread(target=webbrowser.open, args=(target.as_uri(),), daemon=True).start()
@@ -5311,7 +5532,7 @@ with gr.Blocks(title="LLM Scanner") as ui:
                 rep_picked = gr.State([])                                   # what is ticked, to spot new ticks
                 rep_shown = gr.State(_reports[0][1] if _reports else None)  # the report the tabs below display
                 with gr.Accordion("Download files (summary HTML, findings CSV, results table CSV, garak HTML, raw JSONL, "
-                                  "raw report as text)", open=False):
+                                  "raw report as text, hitlog CSV)", open=False):
                     rep_files = gr.File(show_label=False, file_count="multiple")
             with gr.Tabs(elem_classes="subtabs"):
                 with gr.Tab("Security summary"):
@@ -5320,7 +5541,7 @@ with gr.Blocks(title="LLM Scanner") as ui:
                     rep_view = gr.HTML()
                 with gr.Tab("Raw data"):
                     with gr.Column(elem_classes="card"):
-                        raw_pick = gr.Radio([RAW_FULL, RAW_TABLE, RAW_HITLOG],
+                        raw_pick = gr.Radio([RAW_FULL, RAW_TABLE, RAW_HITLOG, RAW_HITS],
                                             value=RAW_FULL, show_label=False, elem_classes="segmented")
                         raw_view = gr.Code(show_label=False, language=None, lines=30, max_lines=30, elem_classes="log")
                         raw_link = gr.HTML(elem_classes="raw-file")  # the file the viewer's Download button saves

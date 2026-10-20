@@ -363,7 +363,7 @@ class AppPages(unittest.TestCase):
         self.assertIn("LLM security assessment", summary)  # ticking a report also shows it
         self.assertIn("iframe", garak_view)
         self.assertIn("start_run setup", raw)
-        self.assertEqual(len(files), 7)  # summary, findings CSV, garak HTML, JSONL, its CSV and text copies, hitlog
+        self.assertEqual(len(files), 8)  # summary, findings CSV, garak HTML, JSONL + CSV + text copy, hitlog + CSV
         self.assertIn("evil", self.call("/read_raw", hitlog))
 
         summary, garak_view, *_ = self.call("/reports_ticked", [complete, stopped], full)

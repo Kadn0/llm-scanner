@@ -84,6 +84,8 @@ def parse(report_jsonl):
         t = d.get("entry_type")
         if t == "start_run setup":
             meta["setup"] = d
+        elif t == "llm_scanner.parts":  # the merged report of a scan that ran in several parts
+            meta["parts"] = d.get("parts") or []
         elif t == "init":
             meta.update(start=d.get("start_time"), run=d.get("run"), garak=d.get("garak_version"))
         elif t == "completion":
@@ -117,7 +119,7 @@ def parse(report_jsonl):
                 "prompt": _prompt_text(h.get("prompt")), "output": _text(h.get("output")),
                 "score": h.get("score"), "goal": h.get("goal", "")})
 
-    findings = []
+    findings, graded = [], set()
     if digest:
         for probes in digest.get("eval", {}).values():
             group_link = probes.get("_summary", {}).get("group_link", "")
@@ -129,26 +131,36 @@ def parse(report_jsonl):
                     if det == "_summary":
                         continue
                     total, passed = r.get("total_evaluated", 0), r.get("passed", 0)
+                    graded.add(_graded(probe, det))
                     findings.append(_finding(probe, det, ps.get("probe_descr", ""), r.get("detector_descr", ""),
                                              ps.get("probe_tags", []), ps.get("probe_tier"), total, passed,
                                              r.get("absolute_defcon"), r.get("relative_defcon"),
                                              r.get("absolute_comment", ""), r.get("relative_comment", ""),
                                              r.get("relative_score"), group_link, hits, estimated=False))
-    else:  # interrupted run: no digest, estimate severity from attack success rate
-        for e in evals:
-            probe, det = e["probe"], e["detector"]
-            info = cache.get(f"probes.{probe}", {})
-            total, passed = e.get("total_evaluated", 0), e.get("passed", 0)
-            asr = (total - passed) / total if total else 0
-            dc = 5 if asr == 0 else 1 if asr >= .5 else 2 if asr >= .25 else 3 if asr >= .1 else 4
-            findings.append(_finding(probe, det, info.get("description", ""), "", info.get("tags", []),
-                                     info.get("tier"), total, passed, dc, None, "", "", None, "", hits,
-                                     estimated=True))
+    # An interrupted run has no digest, and a scan that ran in parts has one only from the parts that finished: for
+    # the probes it doesn't cover, estimate severity from the attack success rate.
+    for e in evals:
+        probe, det = e.get("probe"), e.get("detector")
+        if not probe or not det or _graded(probe, det) in graded:
+            continue
+        graded.add(_graded(probe, det))
+        info = cache.get(f"probes.{probe}", {})
+        total, passed = e.get("total_evaluated", 0), e.get("passed", 0)
+        asr = (total - passed) / total if total else 0
+        dc = 5 if asr == 0 else 1 if asr >= .5 else 2 if asr >= .25 else 3 if asr >= .1 else 4
+        findings.append(_finding(probe, det, info.get("description", ""), "", info.get("tags", []),
+                                 info.get("tier"), total, passed, dc, None, "", "", None, "", hits,
+                                 estimated=True))
     for f in findings:
         f["goal"] = next((h["goal"] for h in f["hits"] if h["goal"]), "") or \
             cache.get(f"probes.{f['probe']}", {}).get("goal", "")
     findings.sort(key=lambda f: (SEV_ORDER.index(f["severity"]), -f["asr"], f["probe"]))
     return {"meta": meta, "findings": findings}
+
+
+def _graded(probe, det):
+    """A probe and detector as the digest names them (garak drops these prefixes from eval records there)."""
+    return str(probe).replace("probes.", ""), str(det).replace("detector.", "")
 
 
 def _finding(probe, det, pdesc, ddesc, tags, tier, total, passed, abs_dc, rel_dc, abs_c, rel_c, rel_score,
@@ -281,13 +293,16 @@ details.finding .body { padding:0 18px 18px; border-top:1px solid #232325; }
 
 def render_html(data):
     m, f, s = data["meta"], data["findings"], summary_stats(data)
+    parts = m.get("parts") or []
     out = [f'<!doctype html><html><head><meta charset="utf-8"><title>LLM Security Assessment - {_e(m["model"])}</title>'
            f'<meta name="viewport" content="width=device-width,initial-scale=1"><style>{CSS}</style></head><body><div class="page">']
     out.append('<div class="toolbar"><button class="btn" onclick="document.querySelectorAll(\'details\').forEach(d=>d.open=true);'
                'window.print()">Print / Save as PDF</button></div>')
     out.append(f'<div class="eyebrow">LLM security assessment</div><h1>{_e(m["model"])}</h1>'
                f'<div class="meta">Run <b class="mono">{_e(m.get("run"))}</b> &nbsp;·&nbsp; Started <b>{_e((m.get("start") or "")[:19].replace("T", " "))}</b>'
-               f' &nbsp;·&nbsp; Duration <b>{_dur(m.get("start"), m.get("end"))}</b> &nbsp;·&nbsp; garak <b>{_e(m.get("garak"))}</b>'
+               f' &nbsp;·&nbsp; Duration <b>{_dur(m.get("start"), m.get("end"))}</b>'
+               f'{f" &nbsp;·&nbsp; <b>{len(parts)}</b> parts" if len(parts) > 1 else ""}'
+               f' &nbsp;·&nbsp; garak <b>{_e(m.get("garak"))}</b>'
                f'{"" if m.get("complete") else " &nbsp;·&nbsp; <b style=color:var(--high)>Incomplete run</b>"}</div>')
 
     # KPIs
@@ -379,7 +394,11 @@ def render_html(data):
         f'<div>Probe spec</div><div class="mono">{_e(m.get("probespec")) or "-"}</div>'
         f'<div>Generations per prompt</div><div>{_e(gens)}</div>'
         f'<div>Started</div><div>{_e(m.get("start"))}</div><div>Finished</div><div>{_e(m.get("end")) or "not completed"}</div>'
-        f'<div>Run ID</div><div class="mono">{_e(m.get("run"))}</div><div>garak version</div><div>{_e(m.get("garak"))}</div></div></div>')
+        f'<div>Run ID</div><div class="mono">{_e(m.get("run"))}</div><div>garak version</div><div>{_e(m.get("garak"))}</div>'
+        + (f'<div>Parts</div><div>The scan was interrupted and continued in {len(parts)} parts, each with its own garak '
+           'report: <span class="mono">' + ", ".join(_e(x) for x in parts) + '</span>. A probe cut short in one part '
+           'ran again in the next; only the run that finished is counted.</div>' if len(parts) > 1 else "")
+        + '</div></div>')
     out.append(f'<script>{ANCHOR_JS}</script><!-- report-format:{REPORT_FORMAT} --></div></body></html>')
     return "".join(out)
 

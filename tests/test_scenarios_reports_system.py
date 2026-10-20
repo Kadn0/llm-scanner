@@ -219,7 +219,7 @@ class ReportFiles(RunsTest):
         self.assertEqual({k: v.name for k, v in p.items()},
                          {"garak": "x_1.report.html", "jsonl": "x_1.report.jsonl", "hitlog": "x_1.hitlog.jsonl",
                           "analyst": "x_1.analyst.html", "csv": "x_1.findings.csv", "txt": "x_1.report.txt",
-                          "table": "x_1.report.csv"})
+                          "table": "x_1.report.csv", "hits": "x_1.hitlog.csv"})
         self.assertTrue(all(v.parent == self.runs for v in p.values()))
 
     def test_report_paths_keep_dots_inside_the_prefix(self):
@@ -307,7 +307,8 @@ class ShowReport(RunsTest):
         self.assertIn("stopped before garak wrote its report", garak_view)
         p = "m_20260917-110000"
         self.assertEqual([Path(f).name for f in files], [f"{p}.analyst.html", f"{p}.findings.csv", f"{p}.report.jsonl",
-                                                         f"{p}.report.csv", f"{p}.report.txt", f"{p}.hitlog.jsonl"])
+                                                         f"{p}.report.csv", f"{p}.report.txt", f"{p}.hitlog.jsonl",
+                                                         f"{p}.hitlog.csv"])
         self.assertIn("evil", raw)
 
     def test_show_report_survives_a_record_that_is_not_an_object(self):
@@ -362,13 +363,13 @@ class DeleteAndOpenReports(RunsTest):
 
     def test_deleting_the_last_report_empties_the_viewer(self):
         name = self.make_run("m_20260917-100000")
-        app.show_report(name)  # the summary, findings CSV and the report's CSV and text copies now exist too
+        app.show_report(name)  # the summary, findings CSV and every CSV and text copy now exist too
         out = app.delete_reports([name], True, name, HITLOG_PICK)
         self.assertEqual(len(out), 10)
         self.assertIsNone(out[4])
         self.assertIn("No reports yet", out[5])
         self.assertIsNone(out[8])
-        self.assertIn("Deleted 1 report (7 files).", out[9])
+        self.assertIn("Deleted 1 report (8 files).", out[9])
         self.assertFalse(out[1]["value"])
         self.assertEqual(list(self.runs.iterdir()), [])
 

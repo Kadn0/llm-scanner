@@ -202,6 +202,10 @@ button.card-gear:hover { opacity:1; background-color:#232325 !important; }
 .gradio-container .wrap.default .meta-text-center { color:#a1a1a6 !important; font-size:12px !important; }
 .report { width:100%; height:80vh; border:1px solid #2d2d2f; border-radius:14px; background:#fff; }
 .report.dark { background:#000; }
+.report-parts { color:#a1a1a6; font-size:14px; line-height:1.5; margin:0 0 4px; }
+.report-part { color:#f5f5f7; font-size:15px; font-weight:600; margin:20px 0 8px; }
+.report-part span { color:#86868b; font-weight:400; font-size:12.5px; margin-left:8px;
+       font-family:"JetBrains Mono","SF Mono",ui-monospace,monospace; overflow-wrap:anywhere; }
 .subtabs .tab-wrapper { margin-bottom:14px !important; }
 /* full-screen table / components: solid background so the page behind doesn't show through */
 :fullscreen, .fullscreen, [class*="fullscreen"]:not(button):not(svg) { background:#000 !important; }

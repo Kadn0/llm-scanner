@@ -3,6 +3,7 @@
 Nothing here touches real data, models or the network: every path the code writes to is redirected to a
 temporary folder, and HTTP calls to Ollama or Hugging Face are replaced with fakes."""
 
+import html
 import importlib.util
 import json
 import os
@@ -2216,6 +2217,45 @@ class Reports(TempDataTest):
         self.assertIn('data-name="m_20260917-100000.report.jsonl"', app.raw_file_link(name, app.RAW_FULL))
         self.assertIn('data-name="m_20260917-100000.hitlog.jsonl"', app.raw_file_link(name, app.RAW_HITLOG))
         self.assertEqual(app.raw_file_link("../x.report.html", app.RAW_TABLE), "")
+        self.assertIn('data-name="m_20260917-100000.hitlog.csv"', app.raw_file_link(name, app.RAW_HITS))
+
+    def test_hitlog_table_has_a_row_per_failing_response(self):
+        write_run(app.GARAK_RUNS, "m_20260917-100000", hits=False)
+        hit = {"probe": "dan.DanInTheWild", "detector": "mitigation.MitigationBypass", "score": 1.0,
+               "prompt": {"turns": [{"role": "user", "content": {"text": "=cmd()"}}]}, "goal": "disregard the prompt",
+               "attempt_id": "u1", "attempt_seq": 4, "attempt_idx": 1, "triggers": ["pwned", "PWNED"]}
+        hitlog = app.GARAK_RUNS / "m_20260917-100000.hitlog.jsonl"
+        hitlog.write_text(json.dumps(dict(hit, output={"text": "sure, \"here\"\nit is"})) + "\n{garbled\n"
+                          + json.dumps(dict(hit, detector="dan.DAN", score=0.7, attempt_idx=0, triggers=None,
+                                            output={"text": "@x"})) + "\n")
+        name = "m_20260917-100000.report.html"
+        *_, files = app.show_report(name)
+        table = app.GARAK_RUNS / "m_20260917-100000.hitlog.csv"
+        self.assertIn(str(table), files, "offered for download next to the hitlog")
+        self.assertTrue(table.read_bytes().startswith(b"\xef\xbb\xbfProbe,Detector,"), "a BOM so Excel reads UTF-8")
+        first, second = self.read_csv(table)
+        self.assertEqual(list(first), app.HITLOG_CSV_HEAD)
+        self.assertEqual((first["Probe"], first["Detector"], first["Score"], first["Attempt"], first["Generation"]),
+                         ("dan.DanInTheWild", "mitigation.MitigationBypass", "1.0", "4", "2"))
+        self.assertEqual((first["Prompt"], first["Response"], first["Triggers"], first["Attempt ID"]),
+                         ("'=cmd()", 'sure, "here"\nit is', "pwned; PWNED", "u1"), "formulas stay text, quotes survive")
+        self.assertEqual((second["Detector"], second["Score"], second["Generation"], second["Response"],
+                          second["Triggers"]), ("dan.DAN", "0.7", "1", "'@x", ""))
+        self.assertTrue(app.read_raw(name, app.RAW_HITS).startswith("Probe,Detector,Score,"))
+        before = table.stat().st_mtime_ns
+        app.show_report(name)
+        self.assertEqual(table.stat().st_mtime_ns, before, "not rewritten while the hitlog is unchanged")
+
+    def test_hitlog_table_of_a_run_where_nothing_failed(self):
+        write_run(app.GARAK_RUNS, "m_20260917-100000", hits=False)
+        name = "m_20260917-100000.report.html"
+        *_, files = app.show_report(name)
+        self.assertFalse((app.GARAK_RUNS / "m_20260917-100000.hitlog.csv").exists())
+        self.assertEqual(app.read_raw(name, app.RAW_HITS), "No failing responses were recorded for this run.")
+        self.assertEqual(app.raw_file_link(name, app.RAW_HITS), "")
+        (app.GARAK_RUNS / "m_20260917-100000.hitlog.jsonl").write_text("")  # as a merged scan's, when nothing failed
+        for pick in (app.RAW_HITS, app.RAW_HITLOG):
+            self.assertEqual(app.read_raw(name, pick), "No failing responses were recorded for this run.")
 
     def test_startup_saves_missing_copies_for_every_run(self):
         write_run(app.GARAK_RUNS, "m_20260917-100000")
@@ -2223,7 +2263,130 @@ class Reports(TempDataTest):
         app.save_all_report_copies()
         for prefix in ("m_20260917-100000", "m_20260917-110000"):
             self.assertTrue((app.GARAK_RUNS / f"{prefix}.report.csv").exists(), prefix)
+            self.assertTrue((app.GARAK_RUNS / f"{prefix}.hitlog.csv").exists(), prefix)
             self.assertTrue((app.GARAK_RUNS / f"{prefix}.report.txt").exists(), prefix)
+
+    def write_parts(self, prefix="m_20260917-100000"):
+        """A scan interrupted during probe B and continued: part 1 finished A and has B's first, unscored answer;
+        part 2 ran B again from the start and finished."""
+        setup = {"entry_type": "start_run setup", "plugins.target_name": "m", "run.generations": 1,
+                 "plugins.probe_spec": "a.A,b.B"}
+        a_done = self.attempt("a1", 0, 2, ["sure"], {"d.X": [1.0]}, probe="a.A")
+        self.write_jsonl(prefix, [
+            setup, {"entry_type": "init", "start_time": "2026-09-17T10:00:00", "run": "r1", "garak_version": "0.17.0"},
+            {"entry_type": "plugin_cache", "plugin_cache": {"probes": {"probes.a.A": {"tags": ["owasp:llm01"]}}}},
+            self.attempt("a1", 0, 1, ["sure"], probe="a.A"), a_done,
+            {"entry_type": "eval", "probe": "a.A", "detector": "d.X", "total_evaluated": 1, "passed": 0},
+            self.attempt("b1", 0, 1, ["cut short"], probe="b.B")])
+        self.write_jsonl(f"{prefix}_part2", [
+            dict(setup, **{"plugins.probe_spec": "b.B"}),
+            {"entry_type": "init", "start_time": "2026-09-17T11:00:00", "run": "r2", "garak_version": "0.17.0"},
+            {"entry_type": "plugin_cache", "plugin_cache": {"probes": {"probes.b.B": {"tags": ["owasp:llm06"]}}}},
+            self.attempt("b2", 0, 2, ["no"], {"d.X": [0.0]}, probe="b.B"),
+            self.attempt("b3", 1, 2, ["leak"], {"d.X": [1.0]}, probe="b.B"),
+            {"entry_type": "eval", "probe": "b.B", "detector": "d.X", "total_evaluated": 2, "passed": 1},
+            {"entry_type": "completion", "end_time": "2026-09-17T11:10:00"},
+            {"entry_type": "digest", "meta": {}, "eval": {"b": {
+                "_summary": {"group_link": "https://example.com/b"},
+                "b.B": {"_summary": {"probe_descr": "B", "probe_tags": ["owasp:llm06"]},
+                        "d.X": {"total_evaluated": 2, "passed": 1, "absolute_defcon": 3, "relative_defcon": 2}}}}}])
+        (app.GARAK_RUNS / f"{prefix}_part2.report.html").write_text("<html>garak part 2</html>")
+        hit = {"detector": "d.X", "score": 1.0, "prompt": {"turns": [{"role": "user", "content": {"text": "p"}}]}}
+        (app.GARAK_RUNS / f"{prefix}.hitlog.jsonl").write_text(
+            json.dumps(dict(hit, probe="a.A", output={"text": "sure"})) + "\n"
+            + json.dumps(dict(hit, probe="b.B", output={"text": "interrupted hit"})) + "\n")
+        (app.GARAK_RUNS / f"{prefix}_part2.hitlog.jsonl").write_text(
+            json.dumps(dict(hit, probe="b.B", output={"text": "leak"})) + "\n")
+        return prefix + ".report.html"
+
+    def test_scan_in_parts_is_listed_as_one_run(self):
+        name = self.write_parts()
+        write_run(app.GARAK_RUNS, "m_20260917-100000x")  # another run whose name only starts the same
+        listed = dict((n, lbl) for lbl, n in app.reports())
+        self.assertEqual(sorted(listed), [name, "m_20260917-100000x.report.html"])
+        self.assertTrue(listed[name].endswith("   (2 parts)"), listed[name])
+        self.assertFalse(app._known_report("m_20260917-100000_part2.report.html"), "the part is not listed by itself")
+        (app.GARAK_RUNS / "m_20260917-100000_part3.report.jsonl").write_text("")  # continued again, still running
+        label = dict((n, lbl) for lbl, n in app.reports())[name]
+        self.assertTrue(label.endswith("   (3 parts)   (stopped)"), label)
+
+    def test_scan_in_parts_has_one_summary_and_results_table(self):
+        name = self.write_parts()
+        part_files = {f.name: f.read_bytes() for f in app.GARAK_RUNS.iterdir()}
+        summary, garak_view, raw, files = app.show_report(name)
+        combined = app.GARAK_RUNS / "m_20260917-100000.combined"
+        findings = {r["probe"]: r for r in self.read_csv(f"{combined}.findings.csv")}
+        self.assertEqual(sorted(findings), ["a.A", "b.B"], "probes from both parts")
+        self.assertEqual((findings["b.B"]["fails"], findings["b.B"]["total"], findings["b.B"]["relative_defcon"]),
+                         ("1", "2", "2"), "B as it finished in part 2, graded by garak")
+        self.assertEqual((findings["a.A"]["fails"], findings["a.A"]["total"]), ("1", "1"))
+        data = analyst_report.parse(f"{combined}.report.jsonl")
+        self.assertEqual({f["probe"]: f["estimated"] for f in data["findings"]}, {"a.A": True, "b.B": False})
+        self.assertEqual({f["probe"]: f["owasp"] for f in data["findings"]}, {"a.A": ["llm01"], "b.B": ["llm06"]},
+                         "probe tags from each part's plugin cache")
+        self.assertEqual([h["output"] for f in data["findings"] if f["probe"] == "b.B" for h in f["hits"]], ["leak"],
+                         "the interrupted run's hits are not counted")
+        self.assertEqual(data["meta"]["parts"], ["m_20260917-100000", "m_20260917-100000_part2"])
+        self.assertEqual((data["meta"]["run"], data["meta"]["probespec"], data["meta"]["end"]),
+                         ("r1", "a.A,b.B", "2026-09-17T11:10:00"), "started with part 1, ended with part 2")
+        self.assertTrue(data["meta"]["complete"])
+        self.assertIn("2</b> parts", html.unescape(summary))
+        rows = self.read_csv(f"{combined}.report.csv")
+        self.assertEqual([(r["Probe"], r["Attempt ID"], r["Result"]) for r in rows],
+                         [("a.A", "a1", "Fail"), ("b.B", "b2", "Pass"), ("b.B", "b3", "Fail")],
+                         "every part, without the answer cut short in part 1")
+        self.assertNotIn("cut short", raw, "the raw view shows the merged report too")
+        self.assertEqual([r["Response"] for r in self.read_csv(f"{combined}.hitlog.csv")], ["sure", "leak"],
+                         "the hitlog table of every part, without the interrupted run's hit")
+        self.assertIn("garak part 2", html.unescape(garak_view))
+        self.assertIn("This part was stopped before garak wrote its report", garak_view)
+        self.assertEqual([Path(f).name for f in files],
+                         ["m_20260917-100000.combined.analyst.html", "m_20260917-100000.combined.findings.csv",
+                          "m_20260917-100000_part2.report.html", "m_20260917-100000.combined.report.jsonl",
+                          "m_20260917-100000.combined.report.csv", "m_20260917-100000.combined.report.txt",
+                          "m_20260917-100000.combined.hitlog.jsonl", "m_20260917-100000.combined.hitlog.csv"])
+        self.assertTrue(all(app.GARAK_RUNS.joinpath(n).read_bytes() == b for n, b in part_files.items()),
+                        "the parts are left as they were: recovery reads them")
+        self.assertTrue(app.read_raw(name, app.RAW_TABLE).startswith("Probe,Attempt,"))
+        self.assertIn('data-name="m_20260917-100000.combined.report.csv"', app.raw_file_link(name, app.RAW_TABLE))
+
+    def test_scan_in_parts_is_merged_again_only_when_a_part_changes(self):
+        name = self.write_parts()
+        app.show_report(name)
+        merged = app.GARAK_RUNS / "m_20260917-100000.combined.report.jsonl"
+        before = merged.stat().st_mtime_ns
+        app.show_report(name)
+        self.assertEqual(merged.stat().st_mtime_ns, before, "not rewritten while no part has changed")
+        with (app.GARAK_RUNS / "m_20260917-100000_part2.report.jsonl").open("a") as fh:
+            fh.write(json.dumps(self.attempt("b4", 2, 1, ["late"], probe="b.B")) + "\n")
+        app.show_report(name)
+        self.assertIn("b4", merged.read_text())
+        self.assertIn("late", app.read_raw(name, app.RAW_TABLE))
+
+    def test_probe_that_never_finished_comes_from_its_last_part(self):
+        self.write_jsonl("m_1", [self.attempt("c1", 0, 1, ["first try"], probe="c.C")])
+        self.write_jsonl("m_1_part2", [self.attempt("c2", 0, 1, ["second try"], probe="c.C")])
+        app.combine_parts("m_1", ["m_1", "m_1_part2"])
+        app.write_report_csv(app.GARAK_RUNS / "m_1.combined.report.jsonl", app.GARAK_RUNS / "m_1.combined.report.csv")
+        rows = self.read_csv(app.GARAK_RUNS / "m_1.combined.report.csv")
+        self.assertEqual([(r["Attempt ID"], r["Result"]) for r in rows], [("c2", "Not scored")])
+
+    def test_deleting_a_scan_in_parts_removes_every_part(self):
+        name = self.write_parts()
+        write_run(app.GARAK_RUNS, "m_20260917-100000x")
+        app.show_report(name)
+        (app.GARAK_RUNS / "m_20260917-100000_part2.responses.jsonl").write_text("{}\n")
+        app.delete_reports([name], True, name, app.RAW_FULL)
+        self.assertEqual(sorted(f.name for f in app.GARAK_RUNS.iterdir() if "100000x" not in f.name), [])
+        self.assertEqual([n for _, n in app.reports()], ["m_20260917-100000x.report.html"])
+
+    def test_startup_saves_the_merged_copies_of_a_scan_in_parts(self):
+        self.write_parts()
+        app.save_all_report_copies()
+        for name in ("m_20260917-100000.report.csv", "m_20260917-100000_part2.report.csv",
+                     "m_20260917-100000.combined.report.csv", "m_20260917-100000.combined.report.txt",
+                     "m_20260917-100000.combined.hitlog.csv"):
+            self.assertTrue((app.GARAK_RUNS / name).exists(), name)
 
     def test_raw_report_as_text(self):
         write_run(app.GARAK_RUNS, "m_20260917-100000")
@@ -2279,7 +2442,7 @@ class Reports(TempDataTest):
         self.assertTrue(choices[0][0].startswith("x_m "))
         summary, garak_view, raw, files = app.show_report(choices[0][1])
         self.assertIn("iframe", summary)
-        self.assertEqual(len(files), 7)  # summary, findings CSV, garak HTML, JSONL, its CSV and text copies, hitlog
+        self.assertEqual(len(files), 8)  # summary, findings CSV, garak HTML, JSONL + CSV + text copy, hitlog + CSV
         self.assertIn("evil", app.read_raw(choices[0][1], "Hitlog (failing responses)"))
 
     def test_stopped_scan_with_results_is_listed(self):
