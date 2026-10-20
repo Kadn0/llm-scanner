@@ -194,6 +194,12 @@ It lists what will be deleted and asks before doing anything.
 
 ## Changelog
 
+- **1.1.13**: A scan that was interrupted and continued is one report again. The Reports tab lists it once, and
+  its security summary, findings CSV, results table and raw data cover every part, counting each probe from the
+  part where it finished, not the copy that was cut short. The garak report tab shows each part's own garak report,
+  and Delete removes all of them. The parts' own files are kept as they are. The hitlog (failing responses) is also
+  saved as a spreadsheet (CSV), one row per failing response with the detector and its score, shown as Hitlog table
+  under Raw data and offered in Download files.
 - **1.1.12**: Nothing a scan has done is lost when something goes wrong. Every model answer is saved to disk the
   moment it arrives, and after a crash, a restart, a power cut or a stuck probe the scan carries on where it was
   cut off, reusing the saved answers instead of asking the model again (each probe picks the same prompts every
