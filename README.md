@@ -14,8 +14,8 @@ security weaknesses with [garak](https://github.com/NVIDIA/garak). It runs entir
 - **Images**: text-to-image with Z-Image, FLUX.1, and Stable Diffusion 1.5 / XL through stable-diffusion.cpp,
   with a gallery. Image models can be found through Hugging Face search too.
 - **Scanning**: garak probes, saved probe groups, a live progress bar, and a security-analyst report with OWASP
-  LLM Top 10 mapping, evidence, remediation, and the raw garak data, also as a spreadsheet (CSV) with every value
-  of every record in its own column. Scans can be paused, a stuck probe is
+  LLM Top 10 mapping, evidence, remediation, the raw garak data, and a results table (CSV) with one row per model
+  response: probe, prompt, response, pass or fail, and each detector's score. Scans can be paused, a stuck probe is
   detected and restarted, and finished probes are never lost.
 - **Red team tools**: start and stop the own web interfaces of promptfoo (evals and red-team runs) and PyRIT from
   the app, on this computer only, with your installed models listed as promptfoo targets.
@@ -191,6 +191,11 @@ It lists what will be deleted and asks before doing anything.
 
 ## Changelog
 
+- **1.1.11**: The results table (CSV) is a real table now: one row per model response, with the probe, prompt,
+  response, Pass, Fail or Not scored (garak's own threshold), and each detector's score in its own column. It is
+  saved in the garak_runs folder as soon as a scan ends (also a stopped one), with the text copy, and runs from
+  earlier versions get theirs at startup. The Download button of the Raw data viewer saves the whole file under its
+  own name (.csv for the table, .jsonl for the reports) instead of a cut-short file.txt.
 - **1.1.10**: The raw garak report is also saved as a spreadsheet (CSV): one row per record, every value in its own
   column named by its path, offered in Download files and as a view under Raw data. Text that a spreadsheet would
   run as a formula is kept as plain text. Clearer setting explanations, primary button hover and Extreme tags, a

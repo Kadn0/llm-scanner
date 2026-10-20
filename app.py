@@ -3584,6 +3584,7 @@ def _launch_scan(job, note=""):
                 cur[0] += c
 
     def on_exit():  # also runs if the page was closed during the scan
+        save_report_copies(prefix)  # whatever garak wrote, also when the scan stopped or garak failed
         with _scan_lock:
             if _proc["p"] is p:
                 _proc["p"] = None
@@ -4127,66 +4128,85 @@ def report_paths(name):
             "txt": f.with_name(prefix + ".report.txt"), "table": f.with_name(prefix + ".report.csv")}
 
 
-CSV_LIST_LIMIT = 50  # a list longer than this (rare: long config lists) stays together in one cell, as JSON
 CSV_FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
+CSV_HEAD = ["Probe", "Attempt", "Generation", "Result", "Prompt", "Response"]  # then one score column per detector
+CSV_TAIL = ["Goal", "Triggers", "Attempt ID"]
 
 
 def _csv_cell(value):
-    """A scalar as a spreadsheet cell. Text that a spreadsheet would run as a formula (attack prompts and model
+    """A value as a spreadsheet cell. Text that a spreadsheet would run as a formula (attack prompts and model
     replies can start with "=") gets a leading apostrophe, which spreadsheets show as plain text."""
     if value is None:
         return ""
-    if isinstance(value, bool):
-        return "true" if value else "false"
     if isinstance(value, str) and value.startswith(CSV_FORMULA_START):
         return "'" + value
     return value
 
 
-def _flatten_record(value, key, out):
-    """Every value of a record in its own column, named by its path: {"prompt": {"turns": [{"role": "user"}]}} gives
-    the column prompt.turns.0.role."""
-    if isinstance(value, dict) and value:
-        for k, v in value.items():
-            _flatten_record(v, f"{key}.{k}" if key else str(k), out)
-    elif isinstance(value, list) and value and len(value) <= CSV_LIST_LIMIT:
-        for i, v in enumerate(value):
-            _flatten_record(v, f"{key}.{i}" if key else str(i), out)
-    elif isinstance(value, (dict, list)):
-        out[key or "value"] = json.dumps(value, ensure_ascii=False) if value else ""
-    else:
-        out[key or "value"] = _csv_cell(value)
+def _turn_text(turn):
+    content = turn.get("content", turn) if isinstance(turn, dict) else turn
+    if isinstance(content, dict):
+        return content.get("text") or ""
+    return "" if content is None else str(content)
+
+
+def _csv_prompt(prompt):
+    """The prompt as one cell: its text, or for a conversation every turn on its own line as "role: text"."""
+    turns = (prompt.get("turns") if isinstance(prompt, dict) else None) or []
+    if len(turns) == 1:
+        return _turn_text(turns[0])
+    return "\n".join(f'{t.get("role", "")}: {_turn_text(t)}' for t in turns if isinstance(t, dict))
 
 
 def write_report_csv(jsonl, csv_path):
-    """The raw report as a spreadsheet: one row per record of report.jsonl, one column per value, nothing left out.
-    The first columns are the record's line number and its entry_type; the rest follow in the order they first
-    appear. A line that isn't JSON (a scan stopped mid-write) is kept whole in the column "unparsed". Rewritten only
-    when the report has changed."""
-    if not jsonl.exists() or (csv_path.exists() and csv_path.stat().st_mtime >= jsonl.stat().st_mtime):
+    """The scan's results as a spreadsheet: one row per model response, with the probe, the prompt, the response,
+    whether it passed, and each detector's score in its own column. garak counts a response as failed when a
+    detector scores it at or above the run's eval threshold (0.5 unless set otherwise); a response no detector has
+    scored yet (the scan stopped first) is "Not scored". garak writes an attempt again once its detectors have run,
+    so only the latest copy of each attempt is kept. Rewritten only when the report has changed."""
+    if not jsonl.exists():
         return
-    columns = {"record": None, "entry_type": None}
-
-    def rows():
-        with jsonl.open(encoding="utf-8", errors="replace") as src:
-            for i, line in enumerate(src, 1):
-                line = line.strip()
-                if not line:
-                    continue
-                row = {"record": i}
-                try:
-                    _flatten_record(json.loads(line), "", row)
-                except ValueError:
-                    row["unparsed"] = _csv_cell(line)
-                yield row
-
-    for row in rows():  # first pass: every column any record has, so each value lands under its own heading
-        columns.update(dict.fromkeys(row))
+    if csv_path.exists() and csv_path.stat().st_mtime >= jsonl.stat().st_mtime:
+        with csv_path.open(encoding="utf-8-sig") as fh:
+            if fh.readline().startswith(",".join(CSV_HEAD)):  # an older version of this file had other columns
+                return
+    threshold, attempts = 0.5, {}
+    with jsonl.open(encoding="utf-8", errors="replace") as src:
+        for line in src:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue  # a scan stopped mid-write
+            if not isinstance(d, dict):
+                continue
+            if d.get("entry_type") == "start_run setup" and isinstance(d.get("run.eval_threshold"), (int, float)):
+                threshold = d["run.eval_threshold"]
+            elif d.get("entry_type") == "attempt":
+                key = d.get("uuid") or len(attempts)
+                if (d.get("status") or 0) >= (attempts.get(key, {}).get("status") or 0):
+                    attempts[key] = d  # keeps its first place in the order, with the newest content
+    detectors = list(dict.fromkeys(det for a in attempts.values() if isinstance(a.get("detector_results"), dict)
+                                   for det in a["detector_results"]))
     tmp = csv_path.with_name(csv_path.name + ".tmp")
-    with tmp.open("w", newline="", encoding="utf-8") as out:
-        w = csv.DictWriter(out, fieldnames=list(columns), restval="")
-        w.writeheader()
-        w.writerows(rows())
+    with tmp.open("w", newline="", encoding="utf-8-sig") as out:  # the BOM makes Excel read the text as UTF-8
+        w = csv.writer(out)
+        w.writerow(CSV_HEAD + [f"Score: {det}" for det in detectors] + CSV_TAIL)
+        for a in attempts.values():
+            results = a.get("detector_results") if isinstance(a.get("detector_results"), dict) else {}
+            notes = a.get("notes") if isinstance(a.get("notes"), dict) else {}
+            triggers = notes.get("triggers") or []
+            triggers = "; ".join(map(str, triggers)) if isinstance(triggers, list) else str(triggers)
+            prompt = _csv_prompt(a.get("prompt"))
+            for i, output in enumerate(a.get("outputs") or [None]):
+                scores = []
+                for det in detectors:
+                    s = results.get(det) or []
+                    scores.append(s[i] if i < len(s) and isinstance(s[i], (int, float)) else None)
+                scored = [s for s in scores if s is not None]
+                result = "Not scored" if not scored else "Fail" if max(scored) >= threshold else "Pass"
+                w.writerow([_csv_cell(v) for v in [a.get("probe_classname"), a.get("seq"), i + 1, result, prompt,
+                                                    _turn_text(output) if output is not None else "", *scores,
+                                                    a.get("goal"), triggers, a.get("uuid")]])
     tmp.replace(csv_path)
 
 
@@ -4210,7 +4230,24 @@ def write_report_text(jsonl, txt):
     tmp.replace(txt)
 
 
-RAW_FULL, RAW_HITLOG, RAW_TABLE = "Full report (report.jsonl)", "Hitlog (failing responses)", "Full report as CSV (columns)"
+def save_report_copies(prefix):
+    """Save a run's results table (CSV) and text copy next to its report.jsonl, so they are in the garak_runs folder
+    without opening the report first. Each is rewritten only when the report has changed."""
+    jsonl = GARAK_RUNS / f"{prefix}.report.jsonl"
+    for write, suffix in ((write_report_text, ".report.txt"), (write_report_csv, ".report.csv")):
+        try:
+            write(jsonl, GARAK_RUNS / f"{prefix}{suffix}")
+        except Exception as e:  # a full disk or an odd report must never break a scan or the Reports page
+            print(f"Could not save {prefix}{suffix}: {e}", flush=True)
+
+
+def save_all_report_copies():
+    """At startup: the copies for every run that is missing them, or whose report changed since."""
+    for _, name in reports():
+        save_report_copies(name[:-len(".report.html")])
+
+
+RAW_FULL, RAW_HITLOG, RAW_TABLE = "Full report (report.jsonl)", "Hitlog (failing responses)", "Results table (CSV)"
 
 
 def read_raw(name, which):
@@ -4225,10 +4262,22 @@ def read_raw(name, which):
             pass
     if not p.exists():
         return "No failing responses were recorded for this run." if kind == "hitlog" else "File not found."
-    text = p.read_text(encoding="utf-8", errors="replace")
+    text = p.read_text(encoding="utf-8-sig", errors="replace")
     if len(text) > RAW_LIMIT:
         text = text[:RAW_LIMIT] + f"\n\n[Truncated: showing {RAW_LIMIT:,} of {len(text):,} characters. Download the file for the rest.]"
     return text
+
+
+def raw_file_link(name, which):
+    """Where the Download button of the raw viewer gets its file: the whole file on disk under its own name (the
+    viewer itself may hold a cut-short copy, and would save it as file.txt). Read by static/app.js."""
+    if not _known_report(name):
+        return ""
+    p = report_paths(name)[{RAW_HITLOG: "hitlog", RAW_TABLE: "table"}.get(which, "jsonl")]
+    if not p.exists():
+        return ""
+    return (f'<span class="raw-file-data" data-href="/gradio_api/file={html.escape(urllib.parse.quote(str(p)))}" '
+            f'data-name="{html.escape(p.name)}"></span>')
 
 
 def show_report(name, which=RAW_FULL):
@@ -4246,18 +4295,14 @@ def show_report(name, which=RAW_FULL):
     else:
         garak_view = ('<div class="empty">This scan was stopped before garak wrote its report. The security summary '
                       'and raw data show the results collected before it stopped.</div>')
-    try:
-        write_report_text(paths["jsonl"], paths["txt"])
-        write_report_csv(paths["jsonl"], paths["table"])
-    except OSError:
-        pass
+    save_report_copies(name[:-len(".report.html")])
     files = [str(paths[k]) for k in ("analyst", "csv", "garak", "jsonl", "table", "txt", "hitlog") if paths[k].exists()]
     return summary, garak_view, read_raw(name, which), files
 
 
 def _delete_run(name):
-    """Every file of one scan run: garak report, raw JSONL and its text and CSV copies, hitlog, summary, CSV. Returns how many
-    were deleted."""
+    """Every file of one scan run: garak report, raw JSONL and its text copy, results table, hitlog, summary, findings
+    CSV. Returns how many were deleted."""
     prefix = name[:-len(".report.html")]
     removed = 0
     for f in list(GARAK_RUNS.iterdir()):
@@ -5116,8 +5161,8 @@ with gr.Blocks(title="LLM Scanner") as ui:
                 rep_confirm = gr.Checkbox(value=False, visible=False)
                 rep_picked = gr.State([])                                   # what is ticked, to spot new ticks
                 rep_shown = gr.State(_reports[0][1] if _reports else None)  # the report the tabs below display
-                with gr.Accordion("Download files (summary HTML, findings CSV, garak HTML, raw JSONL, raw report as "
-                                  "CSV and as text)", open=False):
+                with gr.Accordion("Download files (summary HTML, findings CSV, results table CSV, garak HTML, raw JSONL, "
+                                  "raw report as text)", open=False):
                     rep_files = gr.File(show_label=False, file_count="multiple")
             with gr.Tabs(elem_classes="subtabs"):
                 with gr.Tab("Security summary"):
@@ -5129,6 +5174,7 @@ with gr.Blocks(title="LLM Scanner") as ui:
                         raw_pick = gr.Radio([RAW_FULL, RAW_TABLE, RAW_HITLOG],
                                             value=RAW_FULL, show_label=False, elem_classes="segmented")
                         raw_view = gr.Code(show_label=False, language=None, lines=30, max_lines=30, elem_classes="log")
+                        raw_link = gr.HTML(elem_classes="raw-file")  # the file the viewer's Download button saves
 
         # ---------------- Red team tools
         with gr.Tab("Red team tools"):
@@ -5272,6 +5318,7 @@ with gr.Blocks(title="LLM Scanner") as ui:
     rep_all.input(select_all_reports, [rep_all, rep_shown, raw_pick],
                   [rep_list, rep_delete, rep_picked, rep_shown, *view_outputs], show_progress="hidden")
     raw_pick.change(read_raw, [rep_shown, raw_pick], raw_view, show_progress="hidden")
+    raw_view.change(raw_file_link, [rep_shown, raw_pick], raw_link, show_progress="hidden")
     rep_open.click(open_report, rep_shown, show_progress="hidden")
     rep_view_btn.click(view_report, [rep_view_label, rep_shown, raw_pick], [rep_shown, *view_outputs],
                        show_progress="hidden")
@@ -5377,6 +5424,7 @@ if __name__ == "__main__":
             _resume["waiting"] = True  # set before the page can load, so it shows the pending resume
             threading.Thread(target=resume_interrupted_scan, daemon=True).start()
         threading.Thread(target=measure_probe_sizes, daemon=True).start()  # only does work after a garak update
+        threading.Thread(target=save_all_report_copies, daemon=True).start()  # for runs from older versions
         try:
             restore_pyrit_settings()  # from a data export in the home folder, if PyRIT has no settings yet
         except Exception as e:

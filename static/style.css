@@ -655,3 +655,6 @@ a.mt-model-name:hover { color:#2997ff !important; text-decoration:underline !imp
 .pf-url { color:#86868b; font-size:13px; font-family:"JetBrains Mono","SF Mono",ui-monospace,monospace; }
 .pf-targets { margin:6px 0 0; padding-left:18px; color:#d1d1d6; font-size:13.5px; }
 .pf-targets li { margin:3px 0; }
+
+/* holds the address of the file the raw viewer's Download button saves (static/app.js); never shown */
+.raw-file { display:none !important; }

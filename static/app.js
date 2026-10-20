@@ -500,6 +500,21 @@
     if (b) b.title = b.classList.contains('docs-only')
       ? "Attach documents and text files (this model can't view images)" : 'Attach images, documents, or text files';
   }, 1500);
+  // The raw viewer's Download button would save what the viewer holds as file.txt (cut short for a big report).
+  // It saves the whole file instead, under its own name: the results table as .csv, the reports as .jsonl.
+  document.addEventListener('click', (e) => {
+    const btn = e.target.closest('.log .download-link, .log button[aria-label="Download"]');
+    const data = btn && document.querySelector('.raw-file .raw-file-data');
+    if (!data) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const a = document.createElement('a');
+    a.href = data.dataset.href;
+    a.download = data.dataset.name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }, true);
   // Saved chat names are cut with an ellipsis in the sidebar: hovering one shows the whole name.
   const titleChats = () => document.querySelectorAll('.chat-item-row button.chat-item').forEach((b) => {
     const t = b.innerText.trim();
