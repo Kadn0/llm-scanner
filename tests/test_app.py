@@ -1790,7 +1790,7 @@ class ScanResume(TempDataTest):
             popen.return_value.pid = 1
             app._launch_scan(job, "Resumed\n")
         cmd = popen.call_args[0][0]
-        self.assertEqual(cmd[cmd.index("--probes") + 1], "b.B,c.C")
+        self.assertEqual(cmd[cmd.index("--spec") + 1], "probes.b.B,probes.c.C")
         self.assertEqual(cmd[cmd.index("--report_prefix") + 1], "m_1_part2")
         app._scan["progress"].feed("queue of probes: b.B, c.C")
         self.assertEqual(len(app._scan["progress"].probes), 3, "progress must count the whole scan, not just this part")
@@ -1966,12 +1966,12 @@ class ScanResume(TempDataTest):
         self.assertTrue(start["interactive"] and stop["interactive"] and not pause["interactive"])
         self.assertIn("Scan halted", app.activity_html())
         cmd = cmds[1]
-        self.assertEqual(cmd[cmd.index("--probes") + 1], "b.B,c.C")
+        self.assertEqual(cmd[cmd.index("--spec") + 1], "probes.b.B,probes.c.C")
         self.assertEqual(cmd[cmd.index("--report_prefix") + 1].rsplit("_", 1)[1], "part2")
 
         *_, (log, start, stop, progress, pause, cont, skip) = app.skip_stuck_probe(90)
         cmd = cmds[2]
-        self.assertEqual(cmd[cmd.index("--probes") + 1], "c.C", "the stuck probe is skipped")
+        self.assertEqual(cmd[cmd.index("--spec") + 1], "probes.c.C", "the stuck probe is skipped")
         self.assertIn('"timeout": 90', cmd[cmd.index("--generator_options") + 1], "Continue uses the new timeout")
         self.assertIn("Response timeout changed from 60s to 90s", log)
         self.assertIn("Skipped because they got stuck: b.B", log)
@@ -2007,7 +2007,7 @@ class ScanResume(TempDataTest):
         list(app.run_scan("m", "Quick check", [], 1, 60))
         *_, (log, *_rest) = app.recover_scan(60)
         cmd = cmds[2]
-        self.assertEqual(cmd[cmd.index("--probes") + 1], "b.B,c.C")
+        self.assertEqual(cmd[cmd.index("--spec") + 1], "probes.b.B,probes.c.C")
         self.assertIn("Continuing the scan from b.B", log)
 
     def test_restart_probe_button(self):
@@ -2068,7 +2068,7 @@ class GarakRunnerKeepsAnswers(unittest.TestCase):
                             "HF_HUB_OFFLINE": "1", "LLM_SCANNER_SEED": "7", "LLM_SCANNER_REUSE": reuse,
                             "LLM_SCANNER_RESPONSES": str(tmp / f"{prefix}.responses.jsonl")}
         r = subprocess.run([sys.executable, str(APP_DIR / "garak_runner.py"), "--target_type", "test.Repeat",
-                            "--probes", "test.Test", "--generations", "2", "--report_prefix", prefix],
+                            "--spec", "probes.test.Test", "--generations", "2", "--report_prefix", prefix],
                            env=env, capture_output=True, text=True, timeout=300)
         self.assertEqual(r.returncode, 0, r.stdout[-2000:] + r.stderr[-2000:])
         self.assertNotIn("failed to load probe", r.stdout)
@@ -2270,7 +2270,8 @@ class Reports(TempDataTest):
         """A scan interrupted during probe B and continued: part 1 finished A and has B's first, unscored answer;
         part 2 ran B again from the start and finished."""
         setup = {"entry_type": "start_run setup", "plugins.target_name": "m", "run.generations": 1,
-                 "plugins.probe_spec": "a.A,b.B"}
+                 "run.spec": {"include": ["probes.a.A", "probes.b.B"], "exclude": []},
+                 "transient.active_probes": ["probes.a.A", "probes.b.B"]}
         a_done = self.attempt("a1", 0, 2, ["sure"], {"d.X": [1.0]}, probe="a.A")
         self.write_jsonl(prefix, [
             setup, {"entry_type": "init", "start_time": "2026-09-17T10:00:00", "run": "r1", "garak_version": "0.17.0"},
@@ -2279,7 +2280,8 @@ class Reports(TempDataTest):
             {"entry_type": "eval", "probe": "a.A", "detector": "d.X", "total_evaluated": 1, "passed": 0},
             self.attempt("b1", 0, 1, ["cut short"], probe="b.B")])
         self.write_jsonl(f"{prefix}_part2", [
-            dict(setup, **{"plugins.probe_spec": "b.B"}),
+            dict(setup, **{"run.spec": {"include": ["probes.b.B"], "exclude": []},
+                           "transient.active_probes": ["probes.b.B"]}),
             {"entry_type": "init", "start_time": "2026-09-17T11:00:00", "run": "r2", "garak_version": "0.17.0"},
             {"entry_type": "plugin_cache", "plugin_cache": {"probes": {"probes.b.B": {"tags": ["owasp:llm06"]}}}},
             self.attempt("b2", 0, 2, ["no"], {"d.X": [0.0]}, probe="b.B"),
@@ -2412,6 +2414,15 @@ class Reports(TempDataTest):
         self.assertNotIn("<script>evil", html_out)
         self.assertIn("5m 30s", html_out)
         self.assertEqual(f["goal"], "disregard the system prompt")
+
+    def test_probespec_from_new_and_old_garak_reports(self):
+        new = {"run.spec": {"include": ["probes.dan.DAN_Jailbreak", "probes.test.Test"], "exclude": []}}
+        self.assertEqual(analyst_report._probespec(new), "dan.DAN_Jailbreak,test.Test", "garak 0.15.1+: run.spec")
+        self.assertEqual(analyst_report._probespec(dict(new, **{"transient.active_probes": ["probes.test.Test"]})),
+                         "test.Test", "the probes garak actually ran win over what was asked")
+        self.assertEqual(analyst_report._probespec({"plugins.probe_spec": "dan.DanInTheWild"}), "dan.DanInTheWild",
+                         "reports from older garak")
+        self.assertEqual(analyst_report._probespec({"run.spec": None, "transient.active_probes": None}), "")
 
     def test_interrupted_run_estimates_severity(self):
         write_run(app.GARAK_RUNS, "m_20260917-110000", complete=False)
