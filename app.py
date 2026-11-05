@@ -580,7 +580,7 @@ def _verify_garak():
     tmp.mkdir(exist_ok=True)
     prefix = tmp / f"selftest-{os.getpid()}"
     try:
-        run = subprocess.run([PY, "-m", "garak", "--target_type", "test.Blank", "--spec", "probes.test.Test",
+        run = subprocess.run([PY, "-m", "garak", "--target_type", "test.Blank", *_probe_selection(["test.Test"]),
                               "--report_prefix", str(prefix)], capture_output=True, text=True, timeout=300)
         listed = subprocess.run([PY, "-m", "garak", "--list_probes"], capture_output=True, text=True, timeout=300)
         version = subprocess.run([PY, "-c", "import importlib.metadata as m; print(m.version('garak'))"],
@@ -3557,6 +3557,14 @@ def _remaining_probes(job):
     return [p for p in (job["queue"] or job["requested"]) if p not in skip]
 
 
+def _probe_selection(probes):
+    """garak's arguments for running these probes. garak 0.15.1 replaced --probes (now deprecated) with --spec, whose
+    selectors carry the "probes." prefix. An older garak (only if someone downgraded it by hand) gets --probes."""
+    if GARAK_VERSION != "not installed" and _version_tuple(GARAK_VERSION) < (0, 15, 1):
+        return ["--probes", ",".join(probes)]
+    return ["--spec", ",".join(f"probes.{p}" for p in probes)]
+
+
 def _part_name(job, n):
     return job["prefix"] + (f"_part{n}" if n > 1 else "")
 
@@ -3662,8 +3670,7 @@ def _launch_scan(job, note=""):
            "--generator_options", json.dumps({"ollama": {"OllamaGeneratorChat": gen_opts}})]
     remaining = _remaining_probes(job)
     if remaining:
-        # garak 0.15.1+ selects probes with --spec (--probes is deprecated); its selectors carry the "probes." prefix
-        cmd += ["--spec", ",".join(f"probes.{p}" for p in remaining)]
+        cmd += _probe_selection(remaining)
     env = os.environ | {"PYTHONUNBUFFERED": "1", "TERM": "dumb", "PYTHONIOENCODING": "utf-8",
                         "LLM_SCANNER_THINK": "1" if job["thinking"] else "0", "LLM_SCANNER_MODEL": job["model"],
                         "LLM_SCANNER_SEED": str(job["seed"]), "LLM_SCANNER_RESPONSES": str(_responses_file(prefix)),
