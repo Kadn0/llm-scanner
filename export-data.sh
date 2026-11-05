@@ -20,7 +20,7 @@ trap 'rm -rf "$STAGE"' EXIT
 D="$STAGE/llm-scanner-data"
 mkdir -p "$D"
 
-for item in chats attachments images probe_groups.json image_models.json; do
+for item in chats attachments images probe_groups.json probe_group_attempts.json image_models.json; do
   if [ -e "$APP_DIR/data/$item" ]; then cp -r "$APP_DIR/data/$item" "$D/"; fi
 done
 rm -rf "$D/attachments/staging"

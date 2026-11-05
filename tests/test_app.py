@@ -66,7 +66,8 @@ class TempDataTest(unittest.TestCase):
             "DATA_DIR": data, "CHATS_DIR": data / "chats", "ATTACH_DIR": data / "attachments",
             "IMAGES_DIR": data / "images", "IMAGE_MODEL_DIR": data / "image-models",
             "SHARED_DIR": data / "image-models" / "shared", "CUSTOM_IMAGE_FILE": data / "image_models.json",
-            "GROUPS_FILE": data / "probe_groups.json", "DOWNLOADS_FILE": data / "downloads.json",
+            "GROUPS_FILE": data / "probe_groups.json",
+            "GROUP_ATTEMPTS_FILE": data / "probe_group_attempts.json", "DOWNLOADS_FILE": data / "downloads.json",
             "GARAK_RUNS": self.tmp / "garak_runs", "CHAT_INDEX": app.ChatIndex(), "SCAN_JOB": data / "scan_job.json",
             "OLLAMA_BLOBS": self.tmp / "ollama-blobs", "PULL_LAYERS_FILE": data / "pull_layers.json",
             "SETTINGS_FILE": data / "settings.json",
@@ -1417,6 +1418,30 @@ class ProbesAndGroups(TempDataTest):
         self.assertEqual(app.resolve_scan(app.GROUP_PREFIX + "g", []), ([probe], None))
         app.delete_group("g")
         self.assertEqual(app.resolve_scan(app.GROUP_PREFIX + "g", [])[1], "That group no longer exists.")
+
+    def test_group_keeps_its_attempts_per_prompt(self):
+        probe = next(iter(app.CATALOG))
+        self.assertIn("runs 6 attempts per prompt", app.save_group("deep", [probe], 6)[0])
+        app.save_group("plain", [probe])
+        self.assertEqual(json.loads(app.GROUPS_FILE.read_text()), {"deep": [probe], "plain": [probe]},
+                         "the groups file keeps its format, so older versions still read it")
+        self.assertEqual((app.group_attempts("deep"), app.group_attempts("plain")), (6, 3))
+        self.assertEqual(app.scan_type_attempts(app.GROUP_PREFIX + "deep")["value"], 6, "Scan tab follows the group")
+        self.assertEqual(app.scan_type_attempts(app.GROUP_PREFIX + "plain")["value"], 3)
+        self.assertEqual(app.scan_type_attempts("Quick check")["value"], 3, "presets run the default")
+        self.assertEqual(app.scan_type_attempts(app.CURRENT)["value"], 3)
+        self.assertEqual(app.picked_group_attempts("deep")["value"], 6, "Load puts it back on the Probes tab")
+        self.assertEqual(app.picked_group_attempts("Preset: Quick check")["value"], 3)
+        self.assertEqual(app.attempts_after_save(app.GROUP_PREFIX + "deep", " deep ")["value"], 6)
+        self.assertNotIn("value", app.attempts_after_save("Quick check", "deep"), "a hand-set slider is left alone")
+        app.save_group("deep", [probe], 99)
+        self.assertEqual(app.group_attempts("deep"), 10, "kept within the slider's range")
+        app.delete_group("deep")
+        self.assertNotIn("deep", app.load_group_attempts())
+        app.save_group("deep", [probe])
+        self.assertEqual(app.group_attempts("deep"), 3, "a group saved again under a deleted name starts fresh")
+        app.GROUP_ATTEMPTS_FILE.write_text("{oops")
+        self.assertEqual(app.group_attempts("plain"), 3, "an unreadable file falls back to the default")
 
     def test_resolve_scan(self):
         self.assertEqual(app.resolve_scan("Full scan", []), ([], None))

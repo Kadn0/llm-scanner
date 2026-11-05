@@ -218,7 +218,7 @@ fi
 # ---------------------------------------------------------------- your data
 if [ -n "$DATA_FILE" ]; then
   step "Restoring your data (chats, images, probe groups, reports, red team tools' setup)"
-  for item in chats attachments images probe_groups.json image_models.json; do
+  for item in chats attachments images probe_groups.json probe_group_attempts.json image_models.json; do
     if [ -e "$DATA_DIR_SRC/$item" ]; then
       cp -rn "$DATA_DIR_SRC/$item" "$APP_DIR/data/" 2>/dev/null || true
     fi
