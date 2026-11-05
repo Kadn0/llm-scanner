@@ -26,7 +26,7 @@ cryptography==50.0.1
 cuda-bindings==13.4.1
 cuda-pathfinder==1.8.1
 cuda-toolkit==13.0.3.0
-datasets==3.6.0
+datasets==5.1.0
 datetime==6.0
 deepl==1.17.0
 defusedxml==0.7.1
@@ -42,7 +42,7 @@ filelock==4.0.0
 frozenlist==1.8.0
 fsspec==2025.3.0
 ftfy==6.3.1
-garak==0.17.0
+garak==0.17.1
 google-api-core==2.37.0
 google-api-python-client==2.200.0
 google-auth==2.58.0
