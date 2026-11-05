@@ -1419,6 +1419,14 @@ class ProbesAndGroups(TempDataTest):
         app.delete_group("g")
         self.assertEqual(app.resolve_scan(app.GROUP_PREFIX + "g", [])[1], "That group no longer exists.")
 
+    def test_probe_selection_follows_the_garak_version(self):
+        with mock.patch.object(app, "GARAK_VERSION", "0.17.0"):
+            self.assertEqual(app._probe_selection(["a.A", "b.B"]), ["--spec", "probes.a.A,probes.b.B"])
+        with mock.patch.object(app, "GARAK_VERSION", "0.15.1"):
+            self.assertEqual(app._probe_selection(["a.A"]), ["--spec", "probes.a.A"])
+        with mock.patch.object(app, "GARAK_VERSION", "0.14.1"):
+            self.assertEqual(app._probe_selection(["a.A", "b.B"]), ["--probes", "a.A,b.B"], "garak before --spec")
+
     def test_group_keeps_its_attempts_per_prompt(self):
         probe = next(iter(app.CATALOG))
         self.assertIn("runs 6 attempts per prompt", app.save_group("deep", [probe], 6)[0])

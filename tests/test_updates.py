@@ -533,6 +533,9 @@ class UpgradeFromEarlierReleases(unittest.TestCase):
     def test_from_1_0_12(self):
         self.upgrade("v1.0.12")
 
+    def test_from_1_1_13(self):  # the last release that selected probes with --probes
+        self.upgrade("v1.1.13")
+
 
 if __name__ == "__main__":
     unittest.main()
