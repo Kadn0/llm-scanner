@@ -194,6 +194,12 @@ It lists what will be deleted and asks before doing anything.
 
 ## Changelog
 
+- **1.1.14**: Saved probe groups have their own attempts per prompt. Set it with the slider in the Groups card on
+  the Probes tab when you save a group, and every scan of that group uses it: on the Scan tab the attempts slider
+  shows the group's number and is locked. Presets, the current selection and groups saved before this version run
+  3 attempts, and their slider can still be changed. Scans select probes with garak's `--spec` option instead of
+  `--probes`, which garak has deprecated, so scans no longer print a deprecation warning. The security summary's
+  probe spec line shows the probes again (it had been blank since garak stopped recording it the old way).
 - **1.1.13**: A scan that was interrupted and continued is one report again. The Reports tab lists it once, and
   its security summary, findings CSV, results table and raw data cover every part, counting each probe from the
   part where it finished, not the copy that was cut short. The garak report tab shows each part's own garak report,
