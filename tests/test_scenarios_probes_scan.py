@@ -544,7 +544,7 @@ class SavingAndDeletingGroups(FakeCatalogTest):
 
     def test_save_group_strips_name_and_updates_both_menus(self):
         msg, groups, scans = app.save_group("  mine  ", ["alpha.One", "beta.Three"])
-        self.assertEqual(msg, 'Saved group "mine" with 2 probes. It is now available on the Scan tab.')
+        self.assertEqual(msg, 'Saved group "mine" with 2 probes. It is now available on the Scan tab and runs 3 attempts per prompt.')
         self.assertEqual(app.load_groups(), {"mine": ["alpha.One", "beta.Three"]})
         self.assertEqual(groups["value"], "mine")
         self.assertIn("mine", groups["choices"])
@@ -565,7 +565,7 @@ class SavingAndDeletingGroups(FakeCatalogTest):
         app.save_group("g", ["alpha.One"])
         app.save_group("h", ["gamma.Five"])
         msg = app.save_group("g", ["beta.Four", "beta.Three"])[0]
-        self.assertEqual(msg, 'Updated group "g" with 2 probes. It is now available on the Scan tab.')
+        self.assertEqual(msg, 'Updated group "g" with 2 probes. It is now available on the Scan tab and runs 3 attempts per prompt.')
         self.assertEqual(app.load_groups(), {"g": ["beta.Four", "beta.Three"], "h": ["gamma.Five"]})
 
     def test_save_group_without_selection_writes_nothing(self):

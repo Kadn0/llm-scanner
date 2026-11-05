@@ -45,6 +45,10 @@ HF_API = os.environ.get("LLM_SCANNER_HF_API") or "https://huggingface.co/api"  #
 OLLAMA_WEB = os.environ.get("LLM_SCANNER_OLLAMA_WEB", "https://ollama.com")  # overridable for tests
 GARAK_RUNS = Path(os.environ.get("LLM_SCANNER_GARAK_RUNS") or Path.home() / ".local/share/garak/garak_runs")
 GROUPS_FILE = DATA_DIR / "probe_groups.json"
+# Attempts per prompt saved with each group. Kept apart from GROUPS_FILE so that file's format (name -> probe list)
+# stays the same for older versions of LLM Scanner after a rollback.
+GROUP_ATTEMPTS_FILE = DATA_DIR / "probe_group_attempts.json"
+DEFAULT_ATTEMPTS = 3
 SETTINGS_FILE = DATA_DIR / "settings.json"  # saved preferences, including the Hugging Face token
 PY = sys.executable
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -3023,6 +3027,42 @@ def save_groups(groups):
     GROUPS_FILE.write_text(json.dumps(groups, indent=2, sort_keys=True))
 
 
+def _clamp_attempts(n):
+    try:
+        return min(10, max(1, int(n)))
+    except (TypeError, ValueError):
+        return DEFAULT_ATTEMPTS
+
+
+def load_group_attempts():
+    try:
+        saved = json.loads(GROUP_ATTEMPTS_FILE.read_text())
+    except Exception:
+        return {}
+    return {k: _clamp_attempts(v) for k, v in saved.items()} if isinstance(saved, dict) else {}
+
+
+def save_group_attempts(attempts):
+    GROUP_ATTEMPTS_FILE.write_text(json.dumps(attempts, indent=2, sort_keys=True))
+
+
+def group_attempts(name):
+    """Attempts per prompt saved with a group, or the default for presets and groups saved without one."""
+    return load_group_attempts().get(name, DEFAULT_ATTEMPTS) if name in load_groups() else DEFAULT_ATTEMPTS
+
+
+def picked_group_attempts(name):
+    """The Probes tab's Group menu: "Preset: X" for presets, plain names for saved groups."""
+    return gr.update(value=group_attempts(name or ""))
+
+
+def scan_type_attempts(scan_type):
+    """The Scan tab's attempts slider follows the scan type: a saved group's own setting, otherwise the default."""
+    if scan_type and scan_type.startswith(GROUP_PREFIX):
+        return gr.update(value=group_attempts(scan_type.removeprefix(GROUP_PREFIX)))
+    return gr.update(value=DEFAULT_ATTEMPTS)
+
+
 def probe_label(n):
     v = CATALOG[n]
     d = v["desc"] if len(v["desc"]) <= 110 else v["desc"][:107].rstrip() + "..."
@@ -3086,7 +3126,14 @@ def load_group(name, query, module, show_all):
     return new, gr.update(value=[n for n in new if n in visible]), selection_summary(new), gr.update(value=title)
 
 
-def save_group(name, selected):
+def attempts_after_save(scan_type, name):
+    """Re-saving the group the Scan tab has selected updates its attempts slider; anything else leaves it alone."""
+    if scan_type == GROUP_PREFIX + (name or "").strip():
+        return scan_type_attempts(scan_type)
+    return gr.update()
+
+
+def save_group(name, selected, attempts=DEFAULT_ATTEMPTS):
     name = (name or "").strip()
     if not name:
         return "Enter a name for the group.", gr.update(), gr.update()
@@ -3096,7 +3143,13 @@ def save_group(name, selected):
     verb = "Updated" if name in groups else "Saved"
     groups[name] = list(selected)
     save_groups(groups)
-    return (f"{verb} group \"{name}\" with {len(selected)} probes. It is now available on the Scan tab.",
+    attempts = _clamp_attempts(attempts)
+    saved = load_group_attempts()
+    saved[name] = attempts
+    save_group_attempts(saved)
+    each = f"{attempts} attempt{'s' if attempts != 1 else ''} per prompt"
+    return (f"{verb} group \"{name}\" with {len(selected)} probes. It is now available on the Scan tab and runs "
+            f"{each}.",
             gr.update(choices=group_choices(), value=name), gr.update(choices=scan_choices()))
 
 
@@ -3106,6 +3159,9 @@ def delete_group(name):
         return "Choose one of your saved groups to delete (presets can't be deleted).", gr.update(), gr.update()
     del groups[name]
     save_groups(groups)
+    saved = load_group_attempts()
+    if saved.pop(name, None) is not None:
+        save_group_attempts(saved)
     return f"Deleted group \"{name}\".", gr.update(choices=group_choices(), value=None), \
         gr.update(choices=scan_choices(), value="Quick check")
 
@@ -5476,6 +5532,9 @@ with gr.Blocks(title="LLM Scanner") as ui:
                     with gr.Row(equal_height=True):
                         group_name = gr.Textbox(label="Group name", placeholder="My jailbreak suite", scale=3, min_width=240)
                         save_btn = gr.Button("Save selection", variant="primary", scale=0, min_width=160)
+                    group_gens = gr.Slider(1, 10, value=DEFAULT_ATTEMPTS, step=1, label="Attempts per prompt",
+                                           info="Saved with the group and used whenever you scan it. "
+                                                f"Presets use {DEFAULT_ATTEMPTS}.")
                     group_status = gr.Markdown(elem_classes="note")
                     group_about = gr.HTML()
 
@@ -5493,8 +5552,9 @@ with gr.Blocks(title="LLM Scanner") as ui:
                 scan_desc = gr.HTML(scan_info("Quick check", []))
                 with gr.Accordion("Advanced settings", open=False):
                     with gr.Row():
-                        gens = gr.Slider(1, 10, value=3, step=1, label="Attempts per prompt",
-                                         info="More attempts give more reliable results but take longer.")
+                        gens = gr.Slider(1, 10, value=DEFAULT_ATTEMPTS, step=1, label="Attempts per prompt",
+                                         info="More attempts give more reliable results but take longer. A saved "
+                                              "group sets this to the number saved with it.")
                         tmo = gr.Slider(30, 1800, value=300, step=30, label="Response timeout (seconds)",
                                         info="Set automatically from the model size; increase if requests time out.")
                     thinking = gr.Checkbox(label="Let reasoning models think before answering",
@@ -5656,12 +5716,16 @@ with gr.Blocks(title="LLM Scanner") as ui:
     clear_btn.click(clear_selection, outputs=[selected, probe_list, sel_summary], show_progress="hidden")
     load_btn.click(load_group, [group_pick] + filters, [selected, probe_list, sel_summary, group_name],
                    show_progress="hidden")
-    save_btn.click(save_group, [group_name, selected], [group_status, group_pick, scan_type], show_progress="hidden")
+    load_btn.click(picked_group_attempts, group_pick, group_gens, show_progress="hidden")
+    save_btn.click(save_group, [group_name, selected, group_gens], [group_status, group_pick, scan_type],
+                   show_progress="hidden").then(attempts_after_save, [scan_type, group_name], gens,
+                                                show_progress="hidden")
     del_group_btn.click(delete_group, group_pick, [group_status, group_pick, scan_type], show_progress="hidden")
     selected.change(scan_info, [scan_type, selected], scan_desc, show_progress="hidden")
 
     # scan
     scan_type.change(scan_info, [scan_type, selected], scan_desc, show_progress="hidden")
+    scan_type.change(scan_type_attempts, scan_type, gens, show_progress="hidden")
     group_pick.change(group_info, [group_pick, selected], group_about, show_progress="hidden")
     ui.load(group_info, [group_pick, selected], group_about, show_progress="hidden")
     scan_model.change(model_hint, scan_model, [model_note, tmo], show_progress="hidden")
