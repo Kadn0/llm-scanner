@@ -4,6 +4,7 @@ executive summary, OWASP LLM Top 10 mapping, findings with evidence, remediation
 import csv
 import html
 import json
+import re
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -73,6 +74,20 @@ def _prompt_text(prompt):
     return _text(users[-1]) if users else ""
 
 
+def _probespec(setup):
+    """The probes a run selected, as "module.Class,...". garak 0.15.1+ records them as transient.active_probes and
+    run.spec ({"include": ["probes.x.Y", ...]}); older reports have plugins.probe_spec."""
+    def strip(names):
+        return ",".join(re.sub(r"^probes\.", "", n) for n in names if isinstance(n, str))
+    active = setup.get("transient.active_probes")
+    if isinstance(active, list) and active:
+        return strip(active)
+    spec = setup.get("run.spec")
+    if isinstance(spec, dict) and spec.get("include"):
+        return strip(spec["include"])
+    return setup.get("plugins.probe_spec") or ""
+
+
 def parse(report_jsonl):
     report_jsonl = Path(report_jsonl)
     meta, digest, evals, cache = {}, None, [], {}
@@ -101,7 +116,7 @@ def parse(report_jsonl):
     meta["target"] = f'{setup.get("plugins.target_type", "")} {setup.get("plugins.target_name", "")}'.strip()
     meta["model"] = setup.get("plugins.target_name", "")
     meta["generations"] = setup.get("run.generations")
-    meta["probespec"] = setup.get("plugins.probe_spec", "")
+    meta["probespec"] = _probespec(setup)
     meta["complete"] = bool(meta.get("end")) and digest is not None
     if digest:
         meta["calibration"] = digest.get("meta", {}).get("calibration", {})

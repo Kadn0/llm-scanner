@@ -576,7 +576,7 @@ def _verify_garak():
     tmp.mkdir(exist_ok=True)
     prefix = tmp / f"selftest-{os.getpid()}"
     try:
-        run = subprocess.run([PY, "-m", "garak", "--target_type", "test.Blank", "--probes", "test.Test",
+        run = subprocess.run([PY, "-m", "garak", "--target_type", "test.Blank", "--spec", "probes.test.Test",
                               "--report_prefix", str(prefix)], capture_output=True, text=True, timeout=300)
         listed = subprocess.run([PY, "-m", "garak", "--list_probes"], capture_output=True, text=True, timeout=300)
         version = subprocess.run([PY, "-c", "import importlib.metadata as m; print(m.version('garak'))"],
@@ -3603,7 +3603,8 @@ def _launch_scan(job, note=""):
            "--generator_options", json.dumps({"ollama": {"OllamaGeneratorChat": gen_opts}})]
     remaining = _remaining_probes(job)
     if remaining:
-        cmd += ["--probes", ",".join(remaining)]
+        # garak 0.15.1+ selects probes with --spec (--probes is deprecated); its selectors carry the "probes." prefix
+        cmd += ["--spec", ",".join(f"probes.{p}" for p in remaining)]
     env = os.environ | {"PYTHONUNBUFFERED": "1", "TERM": "dumb", "PYTHONIOENCODING": "utf-8",
                         "LLM_SCANNER_THINK": "1" if job["thinking"] else "0", "LLM_SCANNER_MODEL": job["model"],
                         "LLM_SCANNER_SEED": str(job["seed"]), "LLM_SCANNER_RESPONSES": str(_responses_file(prefix)),
