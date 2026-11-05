@@ -136,12 +136,15 @@ If the check fails, nothing changes. Ollama and garak updates work the same way,
 2. Bump the number in `VERSION` (for example `1.0.0` to `1.1.0`).
 3. If you changed Python packages, refresh the pins:
    `~/.local/bin/uv pip freeze --python .venv/bin/python > requirements.txt`
-4. Commit, push, and create a release whose tag matches the version:
+4. Add the version's entry at the top of the Changelog below (`- **1.1.0**: What changed`), then commit and push:
 
    ```bash
-   git commit -am "Describe the change" && git push
-   gh release create v1.1.0 --title "v1.1.0" --notes "What changed"
+   git commit -am "Release 1.1.0: what changed" && git push
    ```
+
+   The Release workflow (`.github/workflows/release.yml`) sees `VERSION` change on `main` and publishes release
+   `v1.1.0` on that commit, with the changelog entry as its notes. It never replaces a release that already exists.
+   To publish one by hand, run it from the Actions tab (Release, Run workflow), optionally naming a commit on `main`.
 
 Copies on 1.0.14 or later see it the next time they start or someone clicks Check for updates (1.0.7 to 1.0.13
 check every 5 minutes; older versions every 6 hours or after a restart).

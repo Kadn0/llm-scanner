@@ -1,0 +1,66 @@
+# Publishes the GitHub release that installed copies of LLM Scanner update from (they read releases/latest).
+# Runs by itself when a commit on main changes VERSION, or by hand (Actions > Release > Run workflow) for a commit
+# already on main. It never replaces a release: if the tag already exists it does nothing.
+# The updater never copies .github into an installed copy (KEEP_ON_UPDATE in app.py), so this file ships nowhere.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths: [VERSION]
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "Commit on main to release (leave empty for the latest commit on main)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+          fetch-depth: 0
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::VERSION must be x.y.z, found '$version'"
+            exit 1
+          fi
+          tag="v$version"
+          sha="$(git rev-parse HEAD)"
+          git fetch --quiet origin main
+          if ! git merge-base --is-ancestor "$sha" origin/main; then
+            echo "::error::$sha is not on main; only commits on main are released"
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null || gh release view "$tag" >/dev/null 2>&1; then
+            echo "$tag already exists, so there is nothing to publish."
+            exit 0
+          fi
+          # The release notes are this version's entry in the README changelog ("- **x.y.z**: ..." up to the next one).
+          notes="$(awk -v head="- **$version**: " '
+            index($0, head) == 1 { found = 1; print substr($0, length(head) + 1); next }
+            found && /^- \*\*/ { exit }
+            found && /^## / { exit }
+            found { sub(/^  /, ""); print }
+          ' README.md)"
+          if [ -z "$notes" ]; then
+            notes="LLM Scanner $version."
+          fi
+          gh release create "$tag" --target "$sha" --title "$tag" --notes "$notes"
+          echo "Published $tag at $sha."
