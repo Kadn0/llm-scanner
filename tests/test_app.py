@@ -1427,6 +1427,8 @@ class ProbesAndGroups(TempDataTest):
                          "the groups file keeps its format, so older versions still read it")
         self.assertEqual((app.group_attempts("deep"), app.group_attempts("plain")), (6, 3))
         self.assertEqual(app.scan_type_attempts(app.GROUP_PREFIX + "deep")["value"], 6, "Scan tab follows the group")
+        self.assertFalse(app.scan_type_attempts(app.GROUP_PREFIX + "deep")["interactive"], "locked for a group")
+        self.assertTrue(app.scan_type_attempts("Quick check")["interactive"], "free for anything else")
         self.assertEqual(app.scan_type_attempts(app.GROUP_PREFIX + "plain")["value"], 3)
         self.assertEqual(app.scan_type_attempts("Quick check")["value"], 3, "presets run the default")
         self.assertEqual(app.scan_type_attempts(app.CURRENT)["value"], 3)
@@ -1434,6 +1436,17 @@ class ProbesAndGroups(TempDataTest):
         self.assertEqual(app.picked_group_attempts("Preset: Quick check")["value"], 3)
         self.assertEqual(app.attempts_after_save(app.GROUP_PREFIX + "deep", " deep ")["value"], 6)
         self.assertNotIn("value", app.attempts_after_save("Quick check", "deep"), "a hand-set slider is left alone")
+        with mock.patch.object(app, "ollama_up", return_value="1"), \
+                mock.patch.object(app, "list_models", return_value=[]), \
+                mock.patch.object(app, "_disk_problem", return_value=None), \
+                mock.patch.object(app, "follow_scan", return_value=iter(())), \
+                mock.patch.object(app, "_launch_scan") as launch:
+            list(app.run_scan("m", app.GROUP_PREFIX + "deep", [], 1, 60))
+            self.assertEqual(launch.call_args[0][0]["generations"], 6, "the group's number wins over the slider")
+            app.SCAN_JOB.unlink()
+            list(app.run_scan("m", "Quick check", [], 5, 60))
+            self.assertEqual(launch.call_args[0][0]["generations"], 5, "other scan types use the slider")
+            app.SCAN_JOB.unlink()
         app.save_group("deep", [probe], 99)
         self.assertEqual(app.group_attempts("deep"), 10, "kept within the slider's range")
         app.delete_group("deep")

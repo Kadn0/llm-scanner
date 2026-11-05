@@ -3057,10 +3057,11 @@ def picked_group_attempts(name):
 
 
 def scan_type_attempts(scan_type):
-    """The Scan tab's attempts slider follows the scan type: a saved group's own setting, otherwise the default."""
+    """The Scan tab's attempts slider follows the scan type. A saved group's own setting always applies, so the slider
+    shows it locked; any other scan type starts from the default and can be changed."""
     if scan_type and scan_type.startswith(GROUP_PREFIX):
-        return gr.update(value=group_attempts(scan_type.removeprefix(GROUP_PREFIX)))
-    return gr.update(value=DEFAULT_ATTEMPTS)
+        return gr.update(value=group_attempts(scan_type.removeprefix(GROUP_PREFIX)), interactive=False)
+    return gr.update(value=DEFAULT_ATTEMPTS, interactive=True)
 
 
 def probe_label(n):
@@ -3399,6 +3400,8 @@ def run_scan(model, scan_type, selected, generations, timeout, thinking=False):
     if err:
         yield err, *_UNCHANGED
         return
+    if scan_type.startswith(GROUP_PREFIX):  # a saved group always runs its own attempts, whatever the slider sent
+        generations = group_attempts(scan_type.removeprefix(GROUP_PREFIX))
     if (_proc.get("p") and _proc["p"].poll() is None) or _scan["action"]:  # e.g. started before this page was reloaded
         yield ("A scan is already running. Wait for it to finish, or click Stop to end it.", gr.update(),
                gr.update(interactive=True), *_UNCHANGED[2:])
@@ -5533,7 +5536,7 @@ with gr.Blocks(title="LLM Scanner") as ui:
                         group_name = gr.Textbox(label="Group name", placeholder="My jailbreak suite", scale=3, min_width=240)
                         save_btn = gr.Button("Save selection", variant="primary", scale=0, min_width=160)
                     group_gens = gr.Slider(1, 10, value=DEFAULT_ATTEMPTS, step=1, label="Attempts per prompt",
-                                           info="Saved with the group and used whenever you scan it. "
+                                           info="Saved with the group and always used when you scan it. "
                                                 f"Presets use {DEFAULT_ATTEMPTS}.")
                     group_status = gr.Markdown(elem_classes="note")
                     group_about = gr.HTML()
@@ -5554,7 +5557,8 @@ with gr.Blocks(title="LLM Scanner") as ui:
                     with gr.Row():
                         gens = gr.Slider(1, 10, value=DEFAULT_ATTEMPTS, step=1, label="Attempts per prompt",
                                          info="More attempts give more reliable results but take longer. A saved "
-                                              "group sets this to the number saved with it.")
+                                              "group always uses the number saved with it; change it on the "
+                                              "Probes tab.")
                         tmo = gr.Slider(30, 1800, value=300, step=30, label="Response timeout (seconds)",
                                         info="Set automatically from the model size; increase if requests time out.")
                     thinking = gr.Checkbox(label="Let reasoning models think before answering",
