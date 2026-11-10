@@ -197,6 +197,10 @@ It lists what will be deleted and asks before doing anything.
 
 ## Changelog
 
+- **1.1.15**: garak 0.17.1 is now the version LLM Scanner installs (it was 0.17.0), the version the shipped probe
+  prompt counts were measured with. Probe time tags show from the first start instead of after about a minute of
+  counting, on copies that had not updated garak themselves. This update installs garak 0.17.1 and the datasets
+  package it needs (5.1.0) before switching over, so it takes a little longer than usual.
 - **1.1.14**: Saved probe groups have their own attempts per prompt. Set it with the slider in the Groups card on
   the Probes tab when you save a group, and every scan of that group uses it: on the Scan tab the attempts slider
   shows the group's number and is locked. Presets, the current selection and groups saved before this version run
